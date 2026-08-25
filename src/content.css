@@ -1,0 +1,42 @@
+.ldma-tombstone {
+  box-sizing: border-box;
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  list-style: none;
+  position: relative;
+  inset-block-start: var(--ldma-spacing-shift, 0px);
+}
+
+.ldma-tombstone__mount {
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+
+[data-ldma-native-replaced="true"] {
+  display: none !important;
+}
+
+.ldma-retained-deleted {
+  background: color-mix(in srgb, #f23f42 7%, transparent);
+}
+
+.ldma-retained-deleted [id^="message-content-"],
+.ldma-retained-deleted [class*="messageContent_"] {
+  color: #f23f42 !important;
+}
+
+.ldma-retained-deleted [id^="message-content-"] * {
+  color: inherit !important;
+}
+
+.ldma-retained-deleted [id^="message-content-"]::after {
+  content: "  • deleted";
+  color: #ff6b70;
+  font-size: 11px;
+  font-weight: 750;
+  text-transform: uppercase;
+}

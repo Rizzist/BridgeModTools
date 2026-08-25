@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Classifier Demo — BridgeModTools</title>
+  <link rel="stylesheet" href="demo.css">
+</head>
+<body>
+  <aside>
+    <div class="eyebrow">Deterministic fixture</div>
+    <h1>Removal classifier demo</h1>
+    <p>This page does not use Discord or extension storage. It feeds fixed signals into the same pure classifier used by the content script.</p>
+    <button id="delete-one" type="button">Remove one stationary message</button>
+    <button id="scroll-unload" type="button">Simulate scroll virtualization</button>
+    <button id="mass-remove" type="button">Simulate channel navigation</button>
+    <button id="reset" class="quiet" type="button">Reset fixture</button>
+    <output id="result">Ready.</output>
+  </aside>
+
+  <main>
+    <div class="channel-title"># product-updates</div>
+    <ol id="messages" class="messages">
+      <li data-id="101"><strong>DemoMod</strong><time>20:40</time><p>First visible rendered message.</p></li>
+      <li data-id="102"><strong>DemoMod</strong><time>20:42</time><p>Example message used by the deterministic classifier demo.</p></li>
+      <li data-id="103"><strong>River</strong><time>20:44</time><p>This message is the next stationary anchor.</p></li>
+      <li data-id="104"><strong>Sam</strong><time>20:46</time><p>A final rendered message.</p></li>
+    </ol>
+  </main>
+
+  <script src="../src/core.js"></script>
+  <script src="demo.js"></script>
+</body>
+</html>

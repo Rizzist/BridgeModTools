@@ -1,0 +1,42 @@
+{
+  "routes": [
+    {
+      "kind": "one_to_one_dm",
+      "pathname": "/channels/@me/111111111111111111",
+      "guildId": null,
+      "channelId": "111111111111111111"
+    },
+    {
+      "kind": "group_dm",
+      "pathname": "/channels/@me/222222222222222222",
+      "guildId": null,
+      "channelId": "222222222222222222"
+    },
+    {
+      "kind": "guild_channel",
+      "pathname": "/channels/333333333333333333/444444444444444444",
+      "guildId": "333333333333333333",
+      "channelId": "444444444444444444"
+    }
+  ],
+  "liveList": {
+    "tag": "OL",
+    "dataListId": "chat-messages",
+    "row": {
+      "tag": "LI",
+      "id": "chat-messages-444444444444444444-555555555555555555",
+      "article": {
+        "role": "article",
+        "dataListItemId": "chat-messages___444444444444444444-555555555555555555"
+      }
+    },
+    "expectedIdentity": {
+      "channelId": "444444444444444444",
+      "messageId": "555555555555555555"
+    }
+  },
+  "grouped": {
+    "firstUsernameId": "message-username-555555555555555555",
+    "secondRowAriaLabelledBy": "message-username-555555555555555555 message-content-666666666666666666"
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "minimum_chrome_version": "111",
+  "name": "BridgeModTools",
+  "version": "1.9.0",
+  "description": "Locally preserves rendered Discord messages and restores deleted rows in a Discord-style layout.",
+  "permissions": ["storage"],
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "action": {
+    "default_title": "BridgeModTools",
+    "default_popup": "popup/popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://discord.com/channels/*"],
+      "js": ["src/page-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://discord.com/channels/*"],
+      "js": ["src/core.js", "src/protocol.js", "src/content.js"],
+      "css": ["src/content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

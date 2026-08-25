@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BridgeModTools</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <div class="eyebrow">Local only</div>
+    <h1>Message archive</h1>
+    <p>Preserves rendered messages—including your own—in Discord's local MessageStore and marks deleted native rows red.</p>
+  </header>
+
+  <main>
+    <label class="pause-row" for="paused">
+      <span>
+        <strong>Pause capture</strong>
+        <small id="pause-help">Active on Discord channel pages</small>
+      </span>
+      <input id="paused" type="checkbox" role="switch" aria-label="Pause capture">
+    </label>
+
+    <section class="stats" aria-label="Archive statistics">
+      <div><strong id="record-count">0</strong><span>archived</span></div>
+      <div><strong id="deleted-count">0</strong><span>saved deleted</span></div>
+    </section>
+
+    <p id="health" class="health" data-state="starting">Reload Discord once after installing or reloading this unpacked extension.</p>
+    <p class="startup-note">After installing or reloading the unpacked extension, reload Discord once.</p>
+
+    <section class="saved-search" aria-labelledby="saved-search-title">
+      <div class="saved-search__heading">
+        <strong id="saved-search-title">Saved deleted messages</strong>
+        <span id="search-summary">0 saved</span>
+      </div>
+      <label class="search-label" for="search">Search saved messages</label>
+      <input id="search" type="search" placeholder="Content, author, channel…" autocomplete="off">
+      <div id="search-results" class="search-results" role="list"></div>
+      <p id="search-empty" class="search-empty">No saved deleted messages yet.</p>
+    </section>
+
+    <a class="primary" href="../history/history.html" target="_blank">Open full searchable history</a>
+    <button id="clear" class="danger" type="button">Clear local history</button>
+    <p id="status" class="status" aria-live="polite"></p>
+  </main>
+
+  <script src="../src/core.js"></script>
+  <script src="../src/protocol.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

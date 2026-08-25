@@ -1,0 +1,175 @@
+(function attachProtocol(root) {
+  "use strict";
+
+  const Core = root.LocalDiscordArchiveCore || (typeof require === "function" ? require("./core.js") : null);
+  const TYPES = Object.freeze({
+    GET_ARCHIVE: "LDMA_GET_ARCHIVE",
+    GET_RECORD: "LDMA_GET_RECORD",
+    UPSERT_RECORDS: "LDMA_UPSERT_RECORDS",
+    CONFIRM_DELETED: "LDMA_CONFIRM_DELETED",
+    INFER_DELETED: "LDMA_INFER_DELETED",
+    RETRACT_MESSAGE: "LDMA_RETRACT_MESSAGE",
+    SET_PAUSED: "LDMA_SET_PAUSED",
+    CLEAR_ARCHIVE: "LDMA_CLEAR_ARCHIVE",
+    DELETE_RECORD: "LDMA_DELETE_RECORD",
+    SET_HEALTH: "LDMA_SET_HEALTH"
+  });
+
+  function emptyArchive() {
+    return {
+      version: 3,
+      generation: 0,
+      revision: 0,
+      paused: false,
+      health: {
+        status: "starting",
+        detail: "Reload Discord once after installing or reloading this unpacked extension.",
+        updatedAt: 0
+      },
+      records: []
+    };
+  }
+
+  function normalizeArchive(value) {
+    const base = emptyArchive();
+    if (!value || !Array.isArray(value.records)) return base;
+    return Object.assign(base, value, {
+      version: 3,
+      generation: Number.isInteger(value.generation) ? value.generation : 0,
+      revision: Number.isInteger(value.revision) ? value.revision : 0,
+      paused: Boolean(value.paused),
+      records: Core.pruneRecords(value.records.map(Core.sanitizeRecordPresentation))
+    });
+  }
+
+  function stale(archive, command) {
+    return !Number.isInteger(command.generation) || command.generation !== archive.generation;
+  }
+
+  function changedArchive(archive, patch) {
+    return Object.assign({}, archive, patch, { revision: archive.revision + 1 });
+  }
+
+  function shouldApplyArchive(currentValue, incomingValue) {
+    const current = normalizeArchive(currentValue);
+    const incoming = normalizeArchive(incomingValue);
+    if (incoming.generation < current.generation) return false;
+    if (incoming.generation === current.generation && incoming.revision < current.revision) return false;
+    return true;
+  }
+
+  function applyCommand(current, command, nowValue) {
+    const archive = normalizeArchive(current);
+    const now = nowValue || Date.now();
+    const unchanged = (accepted, reason, data) => ({ archive, accepted, changed: false, reason, data });
+    if (!command || !command.type) return unchanged(false, "invalid-command");
+    if (command.type === TYPES.GET_ARCHIVE) return unchanged(true, "read", archive);
+    if (command.type === TYPES.GET_RECORD) {
+      const record = archive.records.find((item) => Core.recordKey(item) === String(command.key || "")) || null;
+      return unchanged(true, record ? "record-read" : "record-missing", record);
+    }
+
+    if (command.type === TYPES.SET_PAUSED) {
+      const next = changedArchive(archive, {
+        generation: archive.generation + 1,
+        paused: Boolean(command.paused)
+      });
+      return { archive: next, accepted: true, changed: true, reason: "pause-changed", data: next };
+    }
+    if (command.type === TYPES.CLEAR_ARCHIVE) {
+      const next = changedArchive(archive, {
+        generation: archive.generation + 1,
+        records: []
+      });
+      return { archive: next, accepted: true, changed: true, reason: "cleared", data: next };
+    }
+    if (command.type === TYPES.DELETE_RECORD) {
+      const next = changedArchive(archive, {
+        generation: archive.generation + 1,
+        records: archive.records.filter((record) => Core.recordKey(record) !== command.key)
+      });
+      return { archive: next, accepted: true, changed: true, reason: "record-deleted", data: next };
+    }
+    if (command.type === TYPES.SET_HEALTH) {
+      const next = changedArchive(archive, {
+        health: {
+          status: command.status || "degraded",
+          detail: command.detail || "Capture support is degraded.",
+          updatedAt: now
+        }
+      });
+      return { archive: next, accepted: true, changed: true, reason: "health-updated", data: next };
+    }
+
+    if (stale(archive, command)) return unchanged(false, "stale-generation", archive);
+    if (archive.paused && (command.type === TYPES.UPSERT_RECORDS || command.type === TYPES.CONFIRM_DELETED || command.type === TYPES.INFER_DELETED)) {
+      return unchanged(false, "paused", archive);
+    }
+
+    if (command.type === TYPES.UPSERT_RECORDS) {
+      const next = changedArchive(archive, {
+        records: Core.mergeRecords(archive.records, command.records || [], { now })
+      });
+      return { archive: next, accepted: true, changed: true, reason: "records-upserted", data: next };
+    }
+    if (command.type === TYPES.CONFIRM_DELETED) {
+      const deletions = (Array.isArray(command.deletions) ? command.deletions : []).slice(0, 200);
+      const existingByKey = new Map(archive.records.map((record) => [Core.recordKey(record), record]));
+      const confirmed = deletions.filter((item) => item && item.record &&
+        (existingByKey.has(Core.recordKey(item.record)) || item.source === "message_store_preserved"))
+        .map((item) => Object.assign({}, existingByKey.get(Core.recordKey(item.record)) || Core.sanitizeRecordPresentation(item.record), {
+        status: "confirmed_deleted",
+        confirmedDeletedAt: now,
+        deletionSource: item.source === "message_store_preserved" ? "message_store_preserved" : "discord_lifecycle",
+        inferredPreviousId: item.previousId || null,
+        inferredNextId: item.nextId || null,
+        inferredTail: Boolean(item.tail),
+        inferredListIdentity: item.listIdentity || null,
+        updatedAt: now
+        }));
+      if (!confirmed.length) return unchanged(false, "missing-records");
+      const next = changedArchive(archive, {
+        records: Core.mergeRecords(archive.records, confirmed, { now })
+      });
+      return { archive: next, accepted: true, changed: true, reason: "deletion-confirmed", data: next };
+    }
+    if (command.type === TYPES.INFER_DELETED) {
+      if (!command.record) return unchanged(false, "missing-record");
+      const deleted = Object.assign({}, command.record, {
+        status: "inferred_deleted",
+        inferredDeletedAt: now,
+        inferredPreviousId: command.previousId || null,
+        inferredNextId: command.nextId || null,
+        inferredTail: Boolean(command.tail),
+        inferredListIdentity: command.listIdentity || null,
+        updatedAt: now
+      });
+      const next = changedArchive(archive, {
+        records: Core.mergeRecords(archive.records, [deleted], { now })
+      });
+      return { archive: next, accepted: true, changed: true, reason: "deletion-inferred", data: next };
+    }
+    if (command.type === TYPES.RETRACT_MESSAGE) {
+      let found = false;
+      const records = archive.records.map((record) => {
+        if (Core.recordKey(record) !== command.key || record.status !== "inferred_deleted") return record;
+        found = true;
+        const next = Object.assign({}, record, { status: "seen", updatedAt: now });
+        delete next.inferredDeletedAt;
+        delete next.inferredPreviousId;
+        delete next.inferredNextId;
+        delete next.inferredTail;
+        delete next.inferredListIdentity;
+        return next;
+      });
+      if (!found) return unchanged(true, "nothing-to-retract", archive);
+      const next = changedArchive(archive, { records: Core.pruneRecords(records) });
+      return { archive: next, accepted: true, changed: true, reason: "deletion-retracted", data: next };
+    }
+    return unchanged(false, "unknown-command");
+  }
+
+  const api = Object.freeze({ TYPES, emptyArchive, normalizeArchive, shouldApplyArchive, applyCommand });
+  root.LocalDiscordArchiveProtocol = api;
+  if (typeof module !== "undefined" && module.exports) module.exports = api;
+})(typeof globalThis !== "undefined" ? globalThis : this);

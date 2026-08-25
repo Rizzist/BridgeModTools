@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Local Discord Message History</title>
+  <link rel="stylesheet" href="history.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">Stored only in this Chrome profile</div>
+      <h1>Local message history</h1>
+      <p>Only messages that were rendered while capture was active appear here.</p>
+    </div>
+    <div class="header-actions">
+      <button id="export" type="button">Export JSON</button>
+      <button id="clear" class="danger" type="button">Delete all</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="controls" aria-label="History filters">
+      <label>
+        <span>Search</span>
+        <input id="search" type="search" placeholder="Content, author, channel, attachment…" autofocus>
+      </label>
+      <label>
+        <span>Status</span>
+        <select id="status-filter">
+          <option value="all">All messages</option>
+          <option value="confirmed_deleted">Confirmed / retained deleted</option>
+          <option value="inferred_deleted">Suspected removed</option>
+          <option value="seen">Seen</option>
+        </select>
+      </label>
+      <div class="summary" id="summary">0 records</div>
+    </section>
+
+    <p class="notice"><strong>Important:</strong> “Retained deleted” means the extension kept the record in Discord's local MessageStore and marked its native row red. Other confirmed records use lifecycle/removal correlation. “Suspected removed” uses DOM observation only.</p>
+    <div id="records" class="records" aria-live="polite"></div>
+    <div id="empty" class="empty" hidden>No matching local records.</div>
+  </main>
+
+  <script src="../src/core.js"></script>
+  <script src="../src/protocol.js"></script>
+  <script src="history.js"></script>
+</body>
+</html>

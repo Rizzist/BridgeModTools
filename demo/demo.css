@@ -1,0 +1,23 @@
+:root { color-scheme: dark; font-family: system-ui, sans-serif; background: #1e1f22; color: #f2f3f5; }
+* { box-sizing: border-box; }
+body { display: grid; grid-template-columns: 310px minmax(400px, 760px); min-height: 100vh; margin: 0; }
+aside { padding: 28px; border-right: 1px solid #3f4147; background: #2b2d31; }
+.eyebrow { color: #8ea1e1; font-size: 11px; font-weight: 750; letter-spacing: .09em; text-transform: uppercase; }
+h1 { margin: 5px 0 8px; font-size: 22px; }
+aside p { margin: 0 0 20px; color: #b5bac1; font-size: 13px; line-height: 1.45; }
+button { width: 100%; margin: 0 0 8px; padding: 10px; border: 0; border-radius: 4px; background: #5865f2; color: white; font: 650 12px system-ui; cursor: pointer; }
+button:hover { background: #4752c4; }
+button.quiet { background: #4e5058; }
+output { display: block; min-height: 48px; margin-top: 12px; padding: 10px; border-radius: 4px; background: #1e1f22; color: #b5bac1; font-size: 12px; line-height: 1.4; }
+main { background: #313338; }
+.channel-title { padding: 18px 24px; border-bottom: 1px solid #222327; font-weight: 700; }
+.messages { margin: 0; padding: 18px 0; list-style: none; }
+.messages > li { position: relative; padding: 10px 28px 10px 72px; border-left: 3px solid transparent; }
+.messages > li:hover { background: #2e3035; }
+.messages strong { color: #f2b6bd; font-size: 14px; }
+.messages time { margin-left: 8px; color: #949ba4; font-size: 11px; }
+.messages p { margin: 5px 0 0; color: #dbdee1; font-size: 14px; }
+.messages .tombstone { margin: 2px 20px 2px 72px; padding: 10px 12px; border: 1px solid #806b3d; border-left: 3px solid #f0b232; border-radius: 6px; background: #39362f; }
+.tombstone b { display: block; color: #f0b232; font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+.tombstone span { display: block; margin-top: 5px; color: #dbdee1; font-size: 14px; }
+@media (max-width: 760px) { body { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #3f4147; } }
