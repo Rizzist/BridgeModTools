@@ -33,7 +33,7 @@ test("manifest is MV3 with bounded local-media permissions and a narrow Discord 
   assert.equal(manifest.content_scripts[0].world, "MAIN");
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/channels/*"]);
-  assert.equal(manifest.version, "2.2.0");
+  assert.equal(manifest.version, "2.2.2");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -86,6 +86,11 @@ test("content contains retraction and tombstone reconciliation hooks", () => {
   assert.match(content, /LDMA_BRIDGE_V1/);
   assert.match(content, /snapshotsByKey/);
   assert.match(content, /mountConfirmedFromSnapshots/);
+  assert.match(content, /function queueConfirmedMounts/);
+  assert.match(content, /function drainConfirmedMounts/);
+  assert.match(content, /pendingConfirmedMounts/);
+  assert.match(content, /\[0, 50, 150, 350, 750, 1500, 3000, 4500, 5100\]/);
+  assert.match(content, /snapshotUsable[\s\S]*currentActive/);
   assert.match(content, /incomingGeneration > state\.generation/);
   assert.match(content, /state\.snapshots = new WeakMap\(\)/);
   assert.match(content, /createTombstoneRenderer/);
@@ -111,7 +116,7 @@ test("content contains retraction and tombstone reconciliation hooks", () => {
   assert.match(content, /scheduleTombstoneSpacing/);
   assert.match(content, /Core\.balancedTombstoneShift/);
   assert.match(content, /pendingReleaseKeys/);
-  assert.match(content, /confirmRetainedDeletion[\s\S]*mountConfirmedFromSnapshots\(channelId, deletions\)/);
+  assert.match(content, /confirmRetainedDeletion[\s\S]*queueConfirmedMounts\(channelId, deletions\)/);
   assert.match(content, /Core\.tombstoneInRenderedRange/);
   assert.match(content, /outsideRenderedRange/);
   assert.match(content, /candidate !== element/);
@@ -162,7 +167,8 @@ test("persistent replacements use a Discord-style row and hide the retained nati
   assert.match(content, /function nativeRangeSignature/);
   assert.match(content, /function anchorlessMountIsCurrent/);
   assert.match(content, /const tailAuthorized = Boolean\(record\.inferredTail && atBottom && newestLiveId/);
-  assert.match(content, /if \(anchorlessAuthorized \|\| tailAuthorized \|\| replacementNode\)/);
+  assert.match(content, /if \(anchorlessAuthorized \|\| tailAuthorized \|\| replacementNode \|\| active\.confirmedMount\)/);
+  assert.match(content, /active\.confirmedMount \? "confirmed" : "range"/);
   assert.match(content, /element\.dataset\.ldmaAnchorlessEpoch = String\(state\.anchorlessEpoch\)/);
   assert.match(content, /element\.dataset\.ldmaAnchorlessRange = nativeRangeSignature\(active\)/);
   assert.match(content, /element\.dataset\.ldmaMountKind = active\.rows\.length === 0/);
@@ -296,6 +302,10 @@ test("media capture, cache broker, offscreen downloader, and local player are pa
   assert.match(background, /untrusted-command-sender/);
   assert.match(viewer, /URL\.createObjectURL/);
   assert.match(viewer, /URL\.revokeObjectURL/);
+  assert.match(viewer, /function beginRetryWindow/);
+  assert.match(viewer, /function scheduleRetry/);
+  assert.match(viewer, /retryable: !state \|\| state === "pending"/);
+  assert.match(viewer, /retryDeadline = Date\.now\(\) \+ 130000/);
   assert.match(viewer, /video\.controls = true/);
   assert.match(viewer, /audio\.controls = true/);
   assert.match(viewer, /video\.autoplay = false/);

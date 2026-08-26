@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "133",
   "name": "BridgeModTools",
-  "version": "2.2.0",
+  "version": "2.2.2",
   "description": "Locally preserves rendered Discord messages and cached media, then restores deleted rows in a Discord-style layout.",
   "permissions": ["storage", "offscreen", "unlimitedStorage"],
   "host_permissions": [

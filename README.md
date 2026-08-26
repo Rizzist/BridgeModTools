@@ -8,6 +8,8 @@ It is an unpacked Chrome Manifest V3 extension that records messages **only afte
 
 Version 2.2 preserves Discord message grouping: consecutive messages in the same captured author group render as compact continuations without repeating the avatar, author name, badges, or header timestamp. Replies, group/time boundaries, date dividers, and different authors start a full row. Older cached records without native grouping metadata use a conservative fallback that requires matching stable author identity, the same local day, and a seven-minute window.
 
+Version 2.2.2 fixes live deletion recovery for the entire archived row. If Discord replaces its virtual message list while deletion confirmation is in flight, Bridge Mod Tools remounts the deleted text, author presentation, replies, embeds, attachments, and media against the newest list without requiring a refresh. Already-mounted media players also recover if local caching completes before their one-time notification arrives.
+
 Version 2 also captures links and rendered upload/embed media. Discord-hosted images, videos, audio, voice messages, and files are downloaded immediately into an extension-owned local cache; direct third-party media can be enabled per site from the popup. Restored deleted rows and full history use the cached bytes, so supported media remains viewable or playable after the original message disappears.
 
 It does not read Chrome's ordinary disk cache. Message metadata stays in the bounded JSON archive; media bodies use a separate, explicit Cache Storage layer with an IndexedDB ownership/status index.

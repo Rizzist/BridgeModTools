@@ -12,6 +12,33 @@
   let currentIndex = 0;
   let renderSequence = 0;
   let currentPlayable = false;
+  let retryTimer = null;
+  let retryDelayMs = 250;
+  let retryDeadline = 0;
+
+  function clearRetryTimer() {
+    if (retryTimer !== null) clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+
+  function beginRetryWindow() {
+    clearRetryTimer();
+    retryDelayMs = 250;
+    // The downloader itself is bounded to two minutes. Keep checking slightly
+    // beyond that window so a cache-completion broadcast cannot be missed
+    // during iframe startup, service-worker wakeup, or an IndexedDB commit.
+    retryDeadline = Date.now() + 130000;
+  }
+
+  function scheduleRetry() {
+    if (retryTimer !== null || !capability || Date.now() >= retryDeadline) return;
+    const delay = Math.min(retryDelayMs, Math.max(0, retryDeadline - Date.now()));
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      retryDelayMs = Math.min(5000, retryDelayMs * 2);
+      renderCurrent().catch(() => {});
+    }, delay);
+  }
 
   function textElement(tag, className, text) {
     const element = document.createElement(tag);
@@ -80,7 +107,7 @@
 
     if (media.kind === "link" || !media.cacheable) {
       card.append(textElement("div", "asset__status", "Saved link — opens the original source."));
-      return { card, playable: false };
+      return { card, playable: false, retryable: false };
     }
 
     let cached;
@@ -95,7 +122,11 @@
       };
       card.append(textElement("div", `asset__status${state === "failed" ? " error" : ""}`,
         messages[state] || "Waiting for the local media cache…"));
-      return { card, playable: false };
+      return {
+        card,
+        playable: false,
+        retryable: !state || state === "pending"
+      };
     }
 
     const blobUrl = URL.createObjectURL(await cached.response.blob());
@@ -119,7 +150,7 @@
       details.append(summary, playable);
       card.append(details);
     } else card.append(playable);
-    return { card, playable: true };
+    return { card, playable: true, retryable: false };
   }
 
   function navigation() {
@@ -131,19 +162,28 @@
     previous.type = "button";
     previous.textContent = "Previous";
     previous.disabled = currentIndex === 0;
-    previous.addEventListener("click", () => { currentIndex -= 1; renderCurrent().catch(() => {}); });
+    previous.addEventListener("click", () => {
+      currentIndex -= 1;
+      beginRetryWindow();
+      renderCurrent().catch(() => {});
+    });
     const counter = textElement("span", "pager__counter", `${currentIndex + 1} of ${mediaItems.length}`);
     const next = document.createElement("button");
     next.type = "button";
     next.textContent = "Next";
     next.disabled = currentIndex >= mediaItems.length - 1;
-    next.addEventListener("click", () => { currentIndex += 1; renderCurrent().catch(() => {}); });
+    next.addEventListener("click", () => {
+      currentIndex += 1;
+      beginRetryWindow();
+      renderCurrent().catch(() => {});
+    });
     nav.append(previous, counter, next);
     return nav;
   }
 
   async function renderCurrent() {
     const sequence = ++renderSequence;
+    clearRetryTimer();
     revokeObjectUrls();
     currentPlayable = false;
     const media = mediaItems[currentIndex];
@@ -156,6 +196,7 @@
     currentPlayable = rendered.playable;
     const nav = navigation();
     root.replaceChildren(...(nav ? [nav, rendered.card] : [rendered.card]));
+    if (rendered.retryable) scheduleRetry();
   }
 
   async function redeemCapability(value) {
@@ -165,13 +206,18 @@
     currentRecord = Core.sanitizeRecordPresentation(response.record);
     mediaItems = Core.sanitizeMediaItems(currentRecord.media);
     currentIndex = Math.min(currentIndex, Math.max(0, mediaItems.length - 1));
+    beginRetryWindow();
     await renderCurrent();
   }
 
   function connectUpdates() {
     const port = chrome.runtime.connect({ name: "ldma-updates" });
     port.onMessage.addListener((message) => {
-      if (message.type === "LDMA_MEDIA_CHANGED" && !currentPlayable && capability) renderCurrent().catch(() => {});
+      if (message.type === "LDMA_MEDIA_CHANGED" && !currentPlayable && capability) {
+        retryDelayMs = 250;
+        retryDeadline = Math.max(retryDeadline, Date.now() + 5000);
+        renderCurrent().catch(() => {});
+      }
     });
     port.onDisconnect.addListener(() => setTimeout(connectUpdates, 500));
   }
@@ -182,7 +228,10 @@
       root.replaceChildren(textElement("p", "empty", "This cached-media view is not authorized."));
     });
   });
-  window.addEventListener("beforeunload", revokeObjectUrls);
+  window.addEventListener("beforeunload", () => {
+    clearRetryTimer();
+    revokeObjectUrls();
+  });
   connectUpdates();
   renderCurrent().catch(() => {});
 })();

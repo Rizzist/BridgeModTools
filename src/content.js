@@ -20,6 +20,7 @@
     snapshotsByKey: new Map(), pageHookStatus: "searching", pageHookDetail: "Waiting for Discord's deletion event dispatcher.",
     pendingRecords: new Map(), pendingRetractions: new Set(), recentRemovals: new Map(), pendingRetainedKeys: new Set(), pendingReleaseKeys: new Set(), flushTimer: null, flushPromise: null,
     healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), spacingFrame: 0,
+    pendingConfirmedMounts: new Map(),
     lastMediaRecoveryAt: -Infinity
   };
 
@@ -673,6 +674,7 @@
       state.snapshotsByKey.clear();
       state.recentRemovals.clear();
       state.pendingRetainedKeys.clear();
+      state.pendingConfirmedMounts.clear();
       state.pendingRecords.clear();
       state.signatures.clear();
     }
@@ -1267,14 +1269,16 @@
         catch (_error) { dropTombstoneRenderer(key); element.remove(); return false; }
       } else renderer(record);
     }
-    if (anchorlessAuthorized || tailAuthorized || replacementNode) {
+    if (anchorlessAuthorized || tailAuthorized || replacementNode || active.confirmedMount) {
       element.dataset.ldmaAnchorlessEpoch = String(state.anchorlessEpoch);
       element.dataset.ldmaAnchorlessRange = nativeRangeSignature(active);
       element.dataset.ldmaMountKind = active.rows.length === 0
         ? "empty"
         : replacementNode
           ? "retained"
-          : tailAuthorized ? "tail" : "range";
+          : tailAuthorized
+            ? "tail"
+            : active.confirmedMount ? "confirmed" : "range";
     } else {
       delete element.dataset.ldmaAnchorlessEpoch;
       delete element.dataset.ldmaAnchorlessRange;
@@ -1605,7 +1609,7 @@
     }
     const response = await send({ type: T.CONFIRM_DELETED, generation: state.generation, deletions });
     if (response.archive) applyArchive(response.archive);
-    if (response.ok) mountConfirmedFromSnapshots(channelId, deletions);
+    if (response.ok) queueConfirmedMounts(channelId, deletions);
     else if (retryAttempt < 3 && (response.reason === "broker-unavailable" || response.reason === "broker-error")) {
       setTimeout(() => confirmLifecycleDeletion(channelId, ids, retryAttempt + 1).catch(() => {}), 500);
     }
@@ -1642,7 +1646,7 @@
       // Discord can remove the rendered row even when its MessageStore record was
       // retained. Mount from the pre-delete snapshot immediately in that case;
       // the helper skips rows that are still native, so this cannot duplicate them.
-      mountConfirmedFromSnapshots(channelId, deletions);
+      queueConfirmedMounts(channelId, deletions);
     }
     if (!response.ok && retryAttempt < 3 && (response.reason === "broker-unavailable" || response.reason === "broker-error")) {
       setTimeout(() => confirmRetainedDeletion(channelId, ids, retryAttempt + 1).catch(() => {}), 500);
@@ -1654,24 +1658,87 @@
   }
 
   function mountConfirmedFromSnapshots(channelId, deletions) {
-    if (state.route?.channelId !== channelId) return;
+    if (state.route?.channelId !== channelId) return new Set();
+    const mountedKeys = new Set();
+    const currentActive = findActiveMessageList();
     for (const item of deletions) {
-      const snapshot = state.snapshotsByKey.get(Core.recordKey(item.record));
-      if (!snapshot?.listNode?.isConnected || !snapshot.parentNode?.isConnected) continue;
-      const rows = uniqueMessageNodes(snapshot.listNode, state.route);
-      const archived = state.archive.records.find((record) => Core.recordKey(record) === Core.recordKey(item.record));
+      const key = Core.recordKey(item.record);
+      const existing = findMountedTombstone(channelId, item.record.messageId);
+      if (existing) {
+        mountedKeys.add(key);
+        continue;
+      }
+      const snapshot = state.snapshotsByKey.get(key);
+      const archived = state.archive.records.find((record) => Core.recordKey(record) === key);
       if (!archived || archived.status !== "confirmed_deleted") continue;
+      const snapshotUsable = Boolean(snapshot?.listNode?.isConnected && snapshot.parentNode?.isConnected);
+      const active = snapshotUsable ? {
+        node: snapshot.listNode,
+        identity: snapshot.listIdentity,
+        rows: uniqueMessageNodes(snapshot.listNode, state.route),
+        route: state.route
+      } : currentActive;
+      if (!active?.node?.isConnected) continue;
+      const rows = active.rows;
       const nativeRow = findMessage(archived.messageId, rows);
       const placementRows = nativeRow ? rows.filter((row) => row !== nativeRow) : rows;
       const placement = {
-        node: snapshot.parentNode,
-        identity: snapshot.listIdentity,
+        node: snapshotUsable ? snapshot.parentNode : active.node,
+        identity: active.identity,
         rows: placementRows,
         route: state.route,
-        allowAnchorless: placementRows.length === 0
+        allowAnchorless: placementRows.length === 0,
+        confirmedMount: !nativeRow
       };
       const mounted = insertTombstone(archived, placement, nativeRow);
-      if (mounted && nativeRow) nativeRow.dataset.ldmaNativeReplaced = "true";
+      if (mounted) {
+        if (nativeRow) nativeRow.dataset.ldmaNativeReplaced = "true";
+        mountedKeys.add(key);
+      }
+    }
+    return mountedKeys;
+  }
+
+  function drainConfirmedMounts() {
+    if (!state.pendingConfirmedMounts.size) return;
+    const now = performance.now();
+    const byChannel = new Map();
+    for (const [key, pending] of [...state.pendingConfirmedMounts]) {
+      if (pending.expiresAt <= now || pending.anchorlessEpoch !== state.anchorlessEpoch ||
+        state.route?.channelId !== pending.channelId) {
+        state.pendingConfirmedMounts.delete(key);
+        continue;
+      }
+      if (!byChannel.has(pending.channelId)) byChannel.set(pending.channelId, []);
+      byChannel.get(pending.channelId).push(pending.item);
+    }
+    for (const [channelId, items] of byChannel) {
+      mountConfirmedFromSnapshots(channelId, items);
+    }
+  }
+
+  function queueConfirmedMounts(channelId, deletions) {
+    if (state.route?.channelId !== channelId) return;
+    const now = performance.now();
+    for (const item of deletions) {
+      const key = Core.recordKey(item.record);
+      state.pendingConfirmedMounts.set(key, {
+        channelId,
+        item,
+        anchorlessEpoch: state.anchorlessEpoch,
+        expiresAt: now + 5000
+      });
+      while (state.pendingConfirmedMounts.size > 500) {
+        state.pendingConfirmedMounts.delete(state.pendingConfirmedMounts.keys().next().value);
+      }
+    }
+    // Discord may replace a row, its parent group, or the entire virtual list
+    // while the confirmation round-trip is in flight. Retry against the latest
+    // connected list. Keep the short-lived latch even after the first success
+    // because Discord can replace that just-mounted parent/list a moment later.
+    // A direct user scroll changes anchorlessEpoch and cancels every retry.
+    for (const delayMs of [0, 50, 150, 350, 750, 1500, 3000, 4500, 5100]) {
+      setTimeout(drainConfirmedMounts, delayMs);
     }
   }
 
@@ -1706,6 +1773,7 @@
       state.recentRemovals.clear();
       state.pendingRetainedKeys.clear();
       state.pendingReleaseKeys.clear();
+      state.pendingConfirmedMounts.clear();
       state.activeList = null;
       state.listIdentity = null;
       removeTombstone();
