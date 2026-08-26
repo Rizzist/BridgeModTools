@@ -10,6 +10,7 @@
     scrollQuietMs: 1500,
     routeQuietMs: 1200,
     reappearanceGraceMs: 1400,
+    continuationWindowMs: 7 * 60 * 1000,
     maxRemovedMessages: 1,
     maxRemovedElements: 250,
     maxAddedMessages: 0,
@@ -76,7 +77,7 @@
     return { previousId, nextId };
   }
 
-  function anchorlessRestoreAllowed(messageId, rawRowIds, options) {
+  function tombstoneInRenderedRange(messageId, rawRowIds, options) {
     const settings = options || {};
     const ids = (Array.isArray(rawRowIds) ? rawRowIds : [])
       .map(parseMessageRowIdentity).filter(Boolean).map((identity) => identity.messageId);
@@ -88,9 +89,80 @@
     return withinRange || safeTail;
   }
 
+  function anchorlessRestoreAllowed(messageId, rawRowIds, options) {
+    return tombstoneInRenderedRange(messageId, rawRowIds, options);
+  }
+
   function messageUsernameLabelId(labelledBy) {
     return String(labelledBy || "").split(/\s+/)
       .find((id) => /^message-username-\d{15,25}$/.test(id)) || null;
+  }
+
+  function snowflakeValue(value) {
+    const text = String(value || "");
+    return /^\d{15,25}$/.test(text) ? text : null;
+  }
+
+  function avatarAuthorId(value) {
+    const safe = safeDiscordAssetUrl(value);
+    if (!safe) return null;
+    const pathname = new URL(safe).pathname;
+    const match = pathname.match(/^\/avatars\/(\d{15,25})\//) ||
+      pathname.match(/^\/guilds\/\d{15,25}\/users\/(\d{15,25})\/avatars\//);
+    return match ? match[1] : null;
+  }
+
+  function snowflakeTimestamp(value) {
+    const snowflake = snowflakeValue(value);
+    if (!snowflake) return null;
+    try {
+      return Number((BigInt(snowflake) >> 22n) + 1420070400000n);
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function sameContinuationAuthor(previous, current) {
+    if (!previous || !current) return false;
+    const previousId = snowflakeValue(previous.authorId) || avatarAuthorId(previous.avatarUrl);
+    const currentId = snowflakeValue(current.authorId) || avatarAuthorId(current.avatarUrl);
+    return Boolean(previousId && currentId && previousId === currentId);
+  }
+
+  function messageMoment(record) {
+    const timestamp = Date.parse(String(record?.messageTimestamp || ""));
+    if (Number.isFinite(timestamp)) return timestamp;
+    return snowflakeTimestamp(record?.messageId);
+  }
+
+  function sameLocalDay(leftValue, rightValue) {
+    const left = new Date(leftValue);
+    const right = new Date(rightValue);
+    return left.getFullYear() === right.getFullYear() &&
+      left.getMonth() === right.getMonth() && left.getDate() === right.getDate();
+  }
+
+  function messageContinues(previous, current, options) {
+    if (!previous || !current || current.replyPreview) return false;
+    const previousMessageId = snowflakeValue(previous?.messageId);
+    const currentMessageId = snowflakeValue(current?.messageId);
+    const previousGroupRoot = snowflakeValue(previous?.groupRootMessageId);
+    const currentGroupRoot = snowflakeValue(current?.groupRootMessageId);
+    if (currentGroupRoot && !options?.ignoreGroupRoot) {
+      // Native Discord grouping is authoritative when it was captured. A row
+      // whose group root is itself is an explicit full-row boundary (reply,
+      // time window, divider, or other Discord grouping decision).
+      if (currentGroupRoot === currentMessageId) return false;
+      return currentGroupRoot === (previousGroupRoot || previousMessageId);
+    }
+    if (!sameContinuationAuthor(previous, current)) return false;
+    const previousMoment = messageMoment(previous);
+    const currentMoment = messageMoment(current);
+    if (previousMoment === null || currentMoment === null) return Boolean(current?.sourceContinuation);
+    const windowMs = Number(options?.windowMs ?? DEFAULTS.continuationWindowMs);
+    const delta = currentMoment - previousMoment;
+    return Number.isFinite(windowMs) && windowMs >= 0 && delta >= 0 && delta <= windowMs &&
+      sameLocalDay(previousMoment, currentMoment);
   }
 
   function isAtScrollBottom(metrics, tolerancePx) {
@@ -176,6 +248,122 @@
     } catch (_error) {
       return null;
     }
+  }
+
+  const MEDIA_KINDS = new Set(["image", "video", "audio", "file", "link"]);
+  const MEDIA_SOURCES = new Set(["attachment", "embed", "link"]);
+
+  function privateNetworkHost(value) {
+    const host = String(value || "").toLocaleLowerCase().replace(/^\[|\]$/g, "").replace(/\.+$/, "");
+    if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) return true;
+    // Literal IPv6 hosts are unnecessary for captured provider/CDN media and
+    // include many alternate private/loopback encodings; reject them all.
+    if (host.includes(":")) return true;
+    const match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!match) return false;
+    const parts = match.slice(1).map(Number);
+    if (parts.some((part) => part > 255)) return true;
+    return parts[0] === 10 || parts[0] === 127 || parts[0] === 0 ||
+      (parts[0] === 169 && parts[1] === 254) ||
+      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+      (parts[0] === 192 && parts[1] === 168) ||
+      (parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127);
+  }
+
+  function safeMediaUrl(value) {
+    try {
+      const raw = String(value || "").trim();
+      if (!raw || raw.length > 4096 || /[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/.test(raw)) return null;
+      const url = new URL(raw);
+      if (url.protocol !== "https:" || url.username || url.password || url.port || privateNetworkHost(url.hostname)) return null;
+      url.hash = "";
+      return url.href;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function mediaIdentity(value) {
+    const safe = safeMediaUrl(value);
+    if (!safe) return null;
+    const url = new URL(safe);
+    const attachment = url.pathname.match(/^\/(?:ephemeral-)?attachments\/(\d{15,25})\/(\d{15,25})\//);
+    if (attachment && ["cdn.discordapp.com", "media.discordapp.net"].includes(url.hostname)) {
+      return `discord-attachment:${attachment[1]}:${attachment[2]}`;
+    }
+    if (["images-ext-1.discordapp.net", "images-ext-2.discordapp.net"].includes(url.hostname)) {
+      return `${url.hostname}:${url.pathname}`;
+    }
+    return safe;
+  }
+
+  function exportMediaUrl(value) {
+    const safe = safeMediaUrl(value);
+    if (!safe) return null;
+    const url = new URL(safe);
+    if (["cdn.discordapp.com", "media.discordapp.net", "images-ext-1.discordapp.net", "images-ext-2.discordapp.net"].includes(url.hostname)) {
+      url.search = "";
+    }
+    return url.href;
+  }
+
+  function mediaKindFromUrl(value) {
+    const url = safeMediaUrl(value);
+    if (!url) return "link";
+    let pathname = "";
+    try { pathname = decodeURIComponent(new URL(url).pathname).toLocaleLowerCase(); } catch (_error) { pathname = new URL(url).pathname.toLocaleLowerCase(); }
+    if (/\.(?:apng|avif|bmp|gif|jpe?g|png|svg|webp)(?:$|[/.])/.test(pathname)) return "image";
+    if (/\.(?:m4v|mkv|mov|mp4|ogv|webm)(?:$|[/.])/.test(pathname)) return "video";
+    if (/\.(?:aac|flac|m4a|mp3|oga|ogg|opus|wav)(?:$|[/.])/.test(pathname)) return "audio";
+    return "link";
+  }
+
+  function mediaKindFromMime(value, fallback) {
+    const mime = String(value || "").split(";", 1)[0].trim().toLocaleLowerCase();
+    if (mime.startsWith("image/")) return "image";
+    if (mime.startsWith("video/")) return "video";
+    if (mime.startsWith("audio/")) return "audio";
+    return MEDIA_KINDS.has(fallback) ? fallback : "file";
+  }
+
+  function safeMediaName(value) {
+    return normalizeText(String(value || "").replace(/[\\/\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/g, " ")).slice(0, 240);
+  }
+
+  function sanitizeMediaItems(value) {
+    const items = [];
+    const seen = new Set();
+    for (const raw of (Array.isArray(value) ? value : []).slice(0, 32)) {
+      if (!raw || typeof raw !== "object") continue;
+      const url = safeMediaUrl(raw.url);
+      const identity = mediaIdentity(url);
+      if (!url || !identity || seen.has(identity)) continue;
+      const inferred = mediaKindFromUrl(url);
+      const kind = MEDIA_KINDS.has(raw.kind) ? raw.kind : inferred;
+      const source = MEDIA_SOURCES.has(raw.source) ? raw.source : "link";
+      const item = {
+        url,
+        kind,
+        source,
+        name: safeMediaName(raw.name) || safeMediaName(new URL(url).pathname.split("/").pop()) || kind,
+        alt: normalizeText(raw.alt).slice(0, 500),
+        mimeType: String(raw.mimeType || "").split(";", 1)[0].trim().toLocaleLowerCase().slice(0, 120),
+        width: Math.max(0, Math.min(10000, Math.floor(Number(raw.width) || 0))),
+        height: Math.max(0, Math.min(10000, Math.floor(Number(raw.height) || 0))),
+        posterUrl: safeMediaUrl(raw.posterUrl),
+        cacheable: raw.cacheable !== false && kind !== "link",
+        spoiler: Boolean(raw.spoiler)
+      };
+      if (!item.alt) delete item.alt;
+      if (!item.mimeType) delete item.mimeType;
+      if (!item.width) delete item.width;
+      if (!item.height) delete item.height;
+      if (!item.posterUrl) delete item.posterUrl;
+      items.push(item);
+      seen.add(identity);
+      if (items.length >= 16) break;
+    }
+    return items;
   }
 
   function sanitizeAuthorAnimation(value) {
@@ -296,6 +484,14 @@
     if (legacyColor || style?.color) next.authorColor = legacyColor || style.color;
     else delete next.authorColor;
     next.avatarUrl = safeDiscordAssetUrl(record.avatarUrl);
+    const authorId = snowflakeValue(record.authorId);
+    if (authorId) next.authorId = authorId;
+    else delete next.authorId;
+    next.sourceContinuation = Boolean(record.sourceContinuation);
+    const groupRootMessageId = snowflakeValue(record.groupRootMessageId);
+    if (groupRootMessageId) next.groupRootMessageId = groupRootMessageId;
+    else delete next.groupRootMessageId;
+    next.media = sanitizeMediaItems(record.media);
     return next;
   }
 
@@ -396,7 +592,8 @@
           record.channelName,
           record.channelId,
           record.guildId,
-          ...(Array.isArray(record.attachments) ? record.attachments : [])
+          ...(Array.isArray(record.attachments) ? record.attachments : []),
+          ...(Array.isArray(record.media) ? record.media.flatMap((item) => [item.name, item.url, item.alt]) : [])
         ].join(" ").toLocaleLowerCase();
         return haystack.includes(needle);
       })
@@ -448,8 +645,13 @@
     parseMessageRowIdentity,
     rowBelongsToChannel,
     compareSnowflakeIds,
-    chronologicalNeighborIds, anchorlessRestoreAllowed,
+    chronologicalNeighborIds, tombstoneInRenderedRange, anchorlessRestoreAllowed,
     messageUsernameLabelId,
+    snowflakeValue,
+    avatarAuthorId,
+    snowflakeTimestamp,
+    sameContinuationAuthor,
+    messageContinues,
     isAtScrollBottom,
     chooseActiveList,
     tombstoneCleanupKeys,
@@ -458,6 +660,14 @@
     safePresentationColor,
     safePresentationGradient,
     safeDiscordAssetUrl,
+    privateNetworkHost,
+    safeMediaUrl,
+    mediaIdentity,
+    exportMediaUrl,
+    mediaKindFromUrl,
+    mediaKindFromMime,
+    safeMediaName,
+    sanitizeMediaItems,
     sanitizeAuthorAnimation,
     sanitizeAuthorStyle,
     sanitizeAuthorBadges,

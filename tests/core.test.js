@@ -180,9 +180,19 @@ test("author presentation sanitizer keeps Discord visuals and rejects executable
   assert.equal(record.authorBadges[0].kind, "image");
   assert.match(record.avatarUrl, /^https:/);
 
+  const grouped = Core.sanitizeRecordPresentation({
+    messageId: "222222222222222", channelId: "111111111111111",
+    authorId: "999999999999999", groupRootMessageId: "111111111111112", sourceContinuation: 1
+  });
+  assert.equal(grouped.authorId, "999999999999999");
+  assert.equal(grouped.groupRootMessageId, "111111111111112");
+  assert.equal(grouped.sourceContinuation, true);
+
   const hostile = Core.sanitizeRecordPresentation({
     messageId: "3",
     channelId: "2",
+    authorId: "not-a-user",
+    groupRootMessageId: "future<script>",
     avatarUrl: "https://example.com/avatars/1/a.png",
     authorStyle: {
       gradient: "linear-gradient(red, blue), var(--remote-image)",
@@ -196,6 +206,8 @@ test("author presentation sanitizer keeps Discord visuals and rejects executable
   assert.equal(hostile.avatarUrl, null);
   assert.equal(hostile.authorStyle, undefined);
   assert.deepEqual(hostile.authorBadges, []);
+  assert.equal(hostile.authorId, undefined);
+  assert.equal(hostile.groupRootMessageId, undefined);
 });
 
 test("tombstone gap balancing preserves natural layout and handles prior shifts", () => {
@@ -204,6 +216,79 @@ test("tombstone gap balancing preserves natural layout and handles prior shifts"
   assert.equal(Core.balancedTombstoneShift(17, 0, 0, 0), -8.5);
   assert.equal(Core.balancedTombstoneShift(0, 0, 0, 0), 0);
   assert.equal(Core.balancedTombstoneShift(0, 100, 0, 0), 0);
+});
+
+test("Discord continuation grouping prefers captured native roots and handles visible-run promotion", () => {
+  const root = {
+    channelId: "111111111111111", messageId: "300000000000000", groupRootMessageId: "300000000000000",
+    author: "Rizzist", messageTimestamp: "2026-08-26T06:56:00.000Z"
+  };
+  const second = Object.assign({}, root, {
+    messageId: "310000000000000", groupRootMessageId: root.messageId,
+    messageTimestamp: "2026-08-26T06:57:00.000Z"
+  });
+  const third = Object.assign({}, second, { messageId: "320000000000000" });
+  assert.equal(Core.messageContinues(root, second), true);
+  assert.equal(Core.messageContinues(second, third), true);
+  assert.equal(Core.messageContinues(null, second), false);
+  assert.equal(Core.messageContinues({ messageId: "305000000000000", groupRootMessageId: "305000000000000" }, second), false);
+  assert.equal(Core.messageContinues(root, Object.assign({}, second, { replyPreview: "reply" })), false);
+});
+
+test("legacy continuation fallback requires the same author, day, and seven-minute window", () => {
+  const base = {
+    channelId: "111111111111111", messageId: "300000000000000", author: "Rizzist",
+    avatarUrl: "https://cdn.discordapp.com/avatars/999999999999999/avatar.webp?size=80",
+    messageTimestamp: "2026-08-26T06:56:00.000Z"
+  };
+  const next = Object.assign({}, base, {
+    messageId: "310000000000000", messageTimestamp: "2026-08-26T07:02:59.000Z"
+  });
+  assert.equal(Core.messageContinues(base, next), true);
+  assert.equal(Core.messageContinues(base, Object.assign({}, next, { messageTimestamp: "2026-08-26T07:03:01.000Z" })), false);
+  assert.equal(Core.messageContinues(base, Object.assign({}, next, { author: "Someone else", avatarUrl: null })), false);
+  assert.equal(Core.messageContinues(base, Object.assign({}, next, { messageTimestamp: "2026-08-27T00:00:01.000Z" })), false);
+  assert.equal(Core.messageContinues(base, Object.assign({}, next, { groupRootMessageId: next.messageId })), false);
+  assert.equal(Core.avatarAuthorId("https://cdn.discordapp.com/guilds/888888888888888/users/999999999999999/avatars/hash.webp"), "999999999999999");
+});
+
+test("legacy continuation fallback fails closed without matching stable author identity", () => {
+  const base = {
+    channelId: "111111111111111", messageId: "300000000000000", author: "Same display name",
+    messageTimestamp: "2026-08-26T06:56:00.000Z"
+  };
+  const next = Object.assign({}, base, {
+    messageId: "310000000000000", messageTimestamp: "2026-08-26T06:57:00.000Z"
+  });
+  assert.equal(Core.messageContinues(base, next), false);
+  assert.equal(Core.messageContinues(
+    Object.assign({}, base, { avatarUrl: "https://cdn.discordapp.com/avatars/999999999999999/avatar.webp" }),
+    next
+  ), false);
+  assert.equal(Core.messageContinues(
+    Object.assign({}, base, { avatarUrl: "https://cdn.discordapp.com/embed/avatars/0.png" }),
+    Object.assign({}, next, { avatarUrl: "https://cdn.discordapp.com/embed/avatars/0.png" })
+  ), false);
+  assert.equal(Core.messageContinues(
+    Object.assign({}, base, { authorId: "999999999999999" }),
+    Object.assign({}, next, { authorId: "999999999999999" })
+  ), true);
+});
+
+test("strict fallback can reconcile a stale non-self root after native promotion", () => {
+  const promotedNative = {
+    messageId: "310000000000000", groupRootMessageId: "310000000000000",
+    authorId: "999999999999999", messageTimestamp: "2026-08-26T06:57:00.000Z"
+  };
+  const capturedBeforePromotion = {
+    messageId: "320000000000000", groupRootMessageId: "300000000000000",
+    authorId: "999999999999999", messageTimestamp: "2026-08-26T06:58:00.000Z"
+  };
+  assert.equal(Core.messageContinues(promotedNative, capturedBeforePromotion), false);
+  assert.equal(Core.messageContinues(promotedNative, capturedBeforePromotion, { ignoreGroupRoot: true }), true);
+  assert.equal(Core.messageContinues(promotedNative, Object.assign({}, capturedBeforePromotion, {
+    groupRootMessageId: capturedBeforePromotion.messageId
+  })), false);
 });
 
 test("row parsing and active-list selection reject another channel", () => {
@@ -256,6 +341,26 @@ test("anchorless restore stays inside the rendered range except for a safe at-bo
   assert.equal(Core.anchorlessRestoreAllowed("500000000000000", rows, { tail: true, atBottom: true }), true);
   assert.equal(Core.anchorlessRestoreAllowed("300000000000000", [], { allowEmpty: false }), false);
   assert.equal(Core.anchorlessRestoreAllowed("300000000000000", [], { allowEmpty: true }), true);
+});
+
+test("virtualized tombstones are retained only inside the current rendered snowflake window", () => {
+  const range = (oldest, newest) => [
+    `chat-messages-111111111111111-${oldest}`,
+    `chat-messages-111111111111111-${newest}`
+  ];
+  assert.equal(Core.tombstoneInRenderedRange("550000000000000", range("500000000000000", "600000000000000")), true);
+  assert.equal(Core.tombstoneInRenderedRange("550000000000000", range("300000000000000", "400000000000000")), false);
+  assert.equal(Core.tombstoneInRenderedRange("350000000000000", range("300000000000000", "400000000000000")), true);
+  assert.equal(Core.tombstoneInRenderedRange("350000000000000", range("100000000000000", "200000000000000")), false);
+  assert.equal(Core.tombstoneInRenderedRange("700000000000000", range("500000000000000", "600000000000000"), {
+    tail: true, atBottom: true
+  }), true);
+  const deleted = ["200000000000000", "400000000000000"];
+  const mounted = (rows, options) => deleted.filter((id) => Core.tombstoneInRenderedRange(id, rows, options));
+  assert.deepEqual(mounted(range("300000000000000", "500000000000000")), ["400000000000000"]);
+  assert.deepEqual(mounted([], { allowEmpty: false }), []);
+  assert.deepEqual(mounted(range("100000000000000", "300000000000000")), ["200000000000000"]);
+  assert.deepEqual(mounted([], { allowEmpty: true }), deleted);
 });
 
 test("one visible preferred Discord message list wins before fallback scoring", () => {

@@ -15,14 +15,22 @@
   const state = {
     archive: Protocol.emptyArchive(), generation: 0, paused: false,
     route: Core.parseDiscordRoute(location.pathname), lastRouteAt: performance.now(), lastScrollAt: -Infinity,
+    anchorlessEpoch: 0,
     activeList: null, listIdentity: null, snapshots: new WeakMap(), signatures: new Map(),
     snapshotsByKey: new Map(), pageHookStatus: "searching", pageHookDetail: "Waiting for Discord's deletion event dispatcher.",
     pendingRecords: new Map(), pendingRetractions: new Set(), recentRemovals: new Map(), pendingRetainedKeys: new Set(), pendingReleaseKeys: new Set(), flushTimer: null, flushPromise: null,
-    healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), spacingFrame: 0
+    healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), spacingFrame: 0,
+    lastMediaRecoveryAt: -Infinity
   };
 
   function send(command) {
     return chrome.runtime.sendMessage(command).catch(() => ({ ok: false, reason: "broker-unavailable" }));
+  }
+
+  function extensionFrameOrigin() {
+    // `use_dynamic_url` gives the iframe element a per-session UUID host, but
+    // Chrome commits the packaged document to the extension's real origin.
+    return `chrome-extension://${chrome.runtime.id}`;
   }
 
   function rawRowId(node) {
@@ -54,6 +62,21 @@
     if (!list || !route) return null;
     const marker = list.getAttribute("data-list-id") || list.getAttribute("aria-label") || list.getAttribute("role") || list.tagName;
     return `${route.routeKey}|${Core.normalizeText(marker).slice(0, 100)}`;
+  }
+
+  function nativeRangeSignature(active) {
+    if (!active) return "";
+    const ids = active.rows.map((row) => rowIdentity(row)?.messageId).filter(Boolean);
+    return `${active.identity || "unknown-list"}|${ids.join(",")}`;
+  }
+
+  function anchorlessMountIsCurrent(element, active) {
+    if (!element || !active || element.dataset.ldmaAnchorlessRange !== nativeRangeSignature(active)) return false;
+    // In a genuinely empty/all-deleted channel the restored rows are the only
+    // scrollable content. Scrolling those rows must not invalidate them. Tail
+    // and retained-row latches still expire on a user gesture.
+    return element.dataset.ldmaMountKind === "empty" ||
+      element.dataset.ldmaAnchorlessEpoch === String(state.anchorlessEpoch);
   }
 
   function findActiveMessageList() {
@@ -95,6 +118,13 @@
     });
     if (visible.length !== 1) return null;
     const list = visible[0];
+    const scroller = findChatScrollContainer(list);
+    const scrollQuiet = performance.now() - state.lastScrollAt >= Core.DEFAULTS.scrollQuietMs;
+    const emptyRestoreAllowed = Boolean(scroller && scrollQuiet && Core.isAtScrollBottom({
+      scrollTop: scroller.scrollTop,
+      scrollHeight: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight
+    }));
     return {
       node: list,
       identity: stableListIdentity(list, route),
@@ -104,7 +134,10 @@
       directParent: true,
       preferredList: true,
       intersectsViewport: true,
-      allowAnchorless: true
+      // Discord virtualization can expose a zero-row list while scrolling.
+      // Only a settled, genuinely empty bottom state may restore without live
+      // snowflake boundaries.
+      allowAnchorless: emptyRestoreAllowed
     };
   }
 
@@ -184,6 +217,30 @@
     return "";
   }
 
+  function groupRootFromNode(node, messageId) {
+    if (node.querySelector(`[id="message-username-${messageId}"]`)) return messageId;
+    const owners = [node, ...node.querySelectorAll("[aria-labelledby]")];
+    for (const owner of owners) {
+      const labelledBy = owner.getAttribute("aria-labelledby") || "";
+      if (!labelledBy.split(/\s+/).includes(`message-content-${messageId}`)) continue;
+      const usernameId = Core.messageUsernameLabelId(owner.getAttribute("aria-labelledby"));
+      const match = usernameId?.match(/^message-username-(\d{15,25})$/);
+      if (match && (match[1] === messageId || Core.compareSnowflakeIds(match[1], messageId) < 0)) return match[1];
+    }
+    return null;
+  }
+
+  function authorIdFromNode(node, authorElement, avatarUrl) {
+    let current = authorElement;
+    for (let depth = 0; current && node.contains(current) && depth < 5; depth += 1, current = current.parentElement) {
+      for (const attribute of ["data-author-id", "data-user-id"]) {
+        const value = Core.snowflakeValue(current.getAttribute?.(attribute));
+        if (value) return value;
+      }
+    }
+    return Core.avatarAuthorId(avatarUrl);
+  }
+
   function allContent(node, messageId) {
     const parts = [];
     const seen = new Set();
@@ -200,24 +257,117 @@
         if (!element.closest("[class*='repliedMessage_'], [class*='reply_']")) add(element);
       });
     }
-    node.querySelectorAll("[class*='embedDescription_']").forEach((element) => {
+    node.querySelectorAll([
+      "[class*='embedProvider_']", "[class*='embedAuthorName_']", "[class*='embedTitle_']",
+      "[class*='embedDescription_']", "[class*='embedFieldName_']", "[class*='embedFieldValue_']",
+      "[class*='embedFooterText_']"
+    ].join(",")).forEach((element) => {
+      if (!element.closest("[class*='repliedMessage_'], [class*='reply_']")) add(element);
+    });
+    node.querySelectorAll("[class*='actionRow_'] button, [class*='component_'] button, [class*='buttons_'] button").forEach((element) => {
       if (!element.closest("[class*='repliedMessage_'], [class*='reply_']")) add(element);
     });
     return parts.join("\n");
   }
 
-  function attachmentNames(node) {
-    const names = [];
+  function captureMedia(node, messageId) {
+    const items = [];
     const seen = new Set();
-    node.querySelectorAll("a[class*='fileNameLink_'], a[href*='/attachments/']").forEach((anchor) => {
-      let name = Core.normalizeText(anchor.textContent);
-      if (!name) {
-        try { name = decodeURIComponent(new URL(anchor.href).pathname.split("/").pop() || "attachment"); }
-        catch (_error) { name = "attachment"; }
-      }
-      if (!seen.has(name)) { seen.add(name); names.push(name); }
+    const replySelector = "[class*='repliedMessage_'], [class*='reply_']";
+    const mediaAncestorSelector = [
+      "[class*='attachment_']", "[class*='imageWrapper_']", "[class*='mosaicItem_']",
+      "[class*='oneByOneGrid_']", "[class*='video_']", "[class*='audioAttachment_']",
+      "[class*='embedMedia_']", "[class*='embedThumbnail_']", "[class*='embedWrapper_']",
+      "[class*='embedFull_']", "[class*='sticker_']", "[class*='stickerAsset_']", "[data-type='sticker']"
+    ].join(",");
+    const messageContent = node.querySelector(`[id="message-content-${messageId}"]`) ||
+      [...node.querySelectorAll("[class*='messageContent_']")].find((element) => !element.closest(replySelector));
+    const add = (raw) => {
+      const value = Core.sanitizeMediaItems([raw])[0];
+      if (!value || seen.has(value.url)) return;
+      seen.add(value.url);
+      items.push(value);
+    };
+    const nameFromUrl = (url, fallback) => {
+      try { return Core.safeMediaName(decodeURIComponent(new URL(url).pathname.split("/").pop() || fallback)); }
+      catch (_error) { return Core.safeMediaName(fallback); }
+    };
+
+    node.querySelectorAll("a[href]").forEach((anchor) => {
+      if (anchor.closest(replySelector)) return;
+      const url = Core.safeMediaUrl(anchor.href);
+      if (!url) return;
+      const pathname = new URL(url).pathname;
+      const attachment = /\/(?:ephemeral-)?attachments\/\d{15,25}\/\d{15,25}\//.test(pathname) ||
+        /\/(?:ephemeral-)?attachments\//.test(pathname);
+      const inEmbed = Boolean(anchor.closest("[class*='embedWrapper_'], [class*='embedFull_']"));
+      if (!attachment && !inEmbed && !(messageContent && messageContent.contains(anchor))) return;
+      let kind = Core.mediaKindFromUrl(url);
+      if (attachment && kind === "link") kind = "file";
+      const text = Core.normalizeText(anchor.textContent);
+      add({
+        url,
+        kind,
+        source: attachment ? "attachment" : inEmbed ? "embed" : "link",
+        name: text || nameFromUrl(url, kind),
+        alt: anchor.getAttribute("aria-label") || anchor.title,
+        cacheable: attachment || kind !== "link",
+        spoiler: Boolean(anchor.closest("[class*='spoiler']"))
+      });
     });
-    return names.slice(0, 12);
+
+    node.querySelectorAll("img, video, audio, source[src], source[srcset]").forEach((element) => {
+      if (element.closest(replySelector) || !element.closest(mediaAncestorSelector)) return;
+      if (element.closest("[class*='avatar_'], [class*='emoji'], [class*='reaction']")) return;
+      const tag = element.tagName.toLocaleLowerCase();
+      const parentMedia = tag === "source" ? element.closest("video, audio") : element;
+      const kind = parentMedia?.tagName === "VIDEO" ? "video" : parentMedia?.tagName === "AUDIO" ? "audio" : "image";
+      const attachmentAnchor = element.closest("a[href*='/attachments/'], a[href*='/ephemeral-attachments/']");
+      if (attachmentAnchor && seen.has(Core.safeMediaUrl(attachmentAnchor.href))) return;
+      const url = [
+        element.currentSrc,
+        element.getAttribute("src"),
+        ...String(element.getAttribute("srcset") || "").split(",")
+          .map((candidate) => candidate.trim().split(/\s+/, 1)[0]),
+        parentMedia?.currentSrc,
+        parentMedia?.getAttribute("src")
+      ].map((value) => Core.safeMediaUrl(value)).find(Boolean) || null;
+      const posterUrl = kind === "video" ? Core.safeMediaUrl(parentMedia?.poster) : null;
+      if (!url) {
+        // A video with child <source> nodes is captured by those source nodes;
+        // do not emit a duplicate poster-only image first.
+        if (posterUrl && parentMedia?.querySelector("source[src]")) return;
+        if (posterUrl) add({
+          url: posterUrl,
+          kind: "image",
+          source: "embed",
+          name: Core.safeMediaName(parentMedia?.getAttribute("aria-label")) || nameFromUrl(posterUrl, "Video preview"),
+          alt: parentMedia?.getAttribute("aria-label") || "Video preview",
+          cacheable: true,
+          spoiler: Boolean(element.closest("[class*='spoiler']"))
+        });
+        return;
+      }
+      add({
+        url,
+        kind,
+        source: /\/(?:ephemeral-)?attachments\//.test(new URL(url).pathname) ? "attachment" : "embed",
+        name: Core.safeMediaName(element.getAttribute("alt") || element.getAttribute("aria-label")) || nameFromUrl(url, kind),
+        alt: element.getAttribute("alt") || element.getAttribute("aria-label"),
+        posterUrl,
+        width: Number(element.naturalWidth || element.videoWidth || element.width || 0),
+        height: Number(element.naturalHeight || element.videoHeight || element.height || 0),
+        cacheable: true,
+        spoiler: Boolean(element.closest("[class*='spoiler']"))
+      });
+    });
+
+    node.querySelectorAll("iframe[src]").forEach((frame) => {
+      if (frame.closest(replySelector) || !frame.closest("[class*='embedWrapper_'], [class*='embedFull_']")) return;
+      const url = Core.safeMediaUrl(frame.src);
+      if (url) add({ url, kind: "link", source: "embed", name: frame.title || new URL(url).hostname, cacheable: false });
+    });
+    return Core.sanitizeMediaItems(items);
   }
 
   function visibleChannelName() {
@@ -400,8 +550,10 @@
     const authorStyle = captureAuthorStyle(authorElement);
     const presentationRow = authorElement?.closest(MESSAGE_SELECTOR) || node;
     const reply = node.querySelector("[class*='repliedMessage_'], [class*='reply_']");
+    const avatarUrl = safeAvatarUrl(presentationRow);
     return {
-      avatarUrl: safeAvatarUrl(presentationRow),
+      avatarUrl,
+      authorId: authorIdFromNode(presentationRow, authorElement, avatarUrl),
       authorColor: authorStyle?.color || null,
       authorStyle,
       authorBadges: captureAuthorBadges(authorElement),
@@ -414,16 +566,20 @@
     const route = Core.parseDiscordRoute(location.pathname);
     const identity = rowIdentity(node);
     if (!route || !identity || (identity.channelId && identity.channelId !== route.channelId)) return null;
-    const attachments = attachmentNames(node);
+    const media = captureMedia(node, identity.messageId);
+    const attachments = media.filter((item) => item.source === "attachment").map((item) => item.name).slice(0, 12);
     const content = allContent(node, identity.messageId);
-    if (!content && !attachments.length) return null;
+    if (!content && !attachments.length && !media.length) return null;
     const timeElement = node.querySelector("time[datetime]");
+    const groupRootMessageId = groupRootFromNode(node, identity.messageId);
     return Core.sanitizeRecordPresentation(Object.assign({
       messageId: identity.messageId, channelId: route.channelId, guildId: route.guildId,
       channelName: visibleChannelName(),
       author: visibleElementText(authorNameElement(node)) || firstText(node, AUTHOR_SELECTORS) ||
         authorFromAriaLabelledBy(node) || "Unknown author",
-      content, attachments, messageTimestamp: timeElement?.getAttribute("datetime") || null,
+      content, attachments, media, messageTimestamp: timeElement?.getAttribute("datetime") || null,
+      groupRootMessageId,
+      sourceContinuation: Boolean(groupRootMessageId && groupRootMessageId !== identity.messageId),
       capturedAt: now, updatedAt: now, status: "seen"
     }, presentationFromNode(node, timeElement)));
   }
@@ -431,8 +587,9 @@
   function recordSignature(record) {
     return JSON.stringify([
       record.author, record.content, record.messageTimestamp, record.channelName, record.attachments,
-      record.avatarUrl, record.authorColor, record.authorStyle, record.authorBadges,
-      record.displayTimestamp, record.replyPreview
+      record.avatarUrl, record.authorId, record.authorColor, record.authorStyle, record.authorBadges,
+      record.groupRootMessageId, record.sourceContinuation,
+      record.displayTimestamp, record.replyPreview, record.media
     ]);
   }
 
@@ -466,6 +623,9 @@
           for (const item of items) {
             if (persistedKeys.has(Core.recordKey(item.record))) state.signatures.set(Core.recordKey(item.record), item.signature);
           }
+          const mediaKeys = records.filter((record) => record.media?.some((item) => item.cacheable))
+            .map(Core.recordKey).filter((key) => persistedKeys.has(key));
+          if (mediaKeys.length) send({ type: T.CACHE_MEDIA, generation, keys: mediaKeys }).catch(() => {});
         }
         if (!response.ok && (response.reason === "broker-unavailable" || response.reason === "broker-error")) {
           for (const item of items) {
@@ -519,9 +679,25 @@
     state.archive = archive;
     state.generation = incomingGeneration;
     state.paused = Boolean(archive.paused);
+    if (wasPaused && !state.paused) state.lastMediaRecoveryAt = -Infinity;
+    requestMediaRecovery(archive);
     reconcileTombstones();
     applyRetainedStyles();
     if (wasPaused && !state.paused) requestAnimationFrame(() => snapshotRenderedMessages(true));
+  }
+
+  function requestMediaRecovery(archive) {
+    if (!archive || archive.paused || performance.now() - state.lastMediaRecoveryAt < 5 * 60 * 1000) return;
+    const keys = archive.records.filter((record) => record.media?.some((item) => item.cacheable))
+      .map(Core.recordKey);
+    state.lastMediaRecoveryAt = performance.now();
+    for (let offset = 0; offset < keys.length; offset += 200) {
+      send({
+        type: T.CACHE_MEDIA,
+        generation: archive.generation,
+        keys: keys.slice(offset, offset + 200)
+      }).catch(() => {});
+    }
   }
 
   async function refreshArchive() {
@@ -617,6 +793,84 @@
     };
   }
 
+  function groupingRecordFromNode(node) {
+    const identity = rowIdentity(node);
+    if (!identity) return null;
+    const authorElement = authorNameElement(node);
+    const presentationRow = authorElement?.closest(MESSAGE_SELECTOR) || node;
+    const avatarUrl = safeAvatarUrl(presentationRow);
+    const timeElement = node.querySelector("time[datetime]");
+    const groupRootMessageId = groupRootFromNode(node, identity.messageId);
+    const reply = node.querySelector("[class*='repliedMessage_'], [class*='reply_']");
+    return Core.sanitizeRecordPresentation({
+      messageId: identity.messageId,
+      channelId: identity.channelId || state.route?.channelId,
+      author: visibleElementText(authorElement) || firstText(node, AUTHOR_SELECTORS) ||
+        authorFromAriaLabelledBy(node) || "Unknown author",
+      avatarUrl,
+      // A continuation resolves its author element in the root row. Reading
+      // identity from that presentation row is intentional: every member of
+      // the native group belongs to the same Discord author.
+      authorId: authorIdFromNode(presentationRow, authorElement, avatarUrl),
+      messageTimestamp: timeElement?.getAttribute("datetime") || null,
+      groupRootMessageId,
+      sourceContinuation: Boolean(groupRootMessageId && groupRootMessageId !== identity.messageId),
+      replyPreview: Core.normalizeText(reply?.textContent).slice(0, 500) || null
+    });
+  }
+
+  function reconcileTombstoneGrouping() {
+    const archivedByKey = new Map(state.archive.records.map((record) => [Core.recordKey(record), record]));
+    const parents = new Set([...document.querySelectorAll("[data-ldma-tombstone]")]
+      .map((element) => element.parentElement).filter(Boolean));
+    for (const parent of parents) {
+      let previous = null;
+      for (const element of parent.children) {
+        if (element.dataset.ldmaNativeReplaced === "true") continue;
+        if (element.dataset.ldmaTombstone === "true") {
+          const record = archivedByKey.get(element.dataset.ldmaMessageKey);
+          const renderer = state.tombstoneRenderers.get(element.dataset.ldmaMessageKey);
+          if (!record || !renderer?.setContinuation) {
+            previous = null;
+            continue;
+          }
+          let continues = Core.messageContinues(previous, record);
+          const capturedRoot = Core.snowflakeValue(record.groupRootMessageId);
+          if (!continues && capturedRoot && capturedRoot !== record.messageId) {
+            // A surviving native row may have been promoted to a new full root
+            // after this deleted continuation was captured under the old root.
+            // Reconcile that stale non-self root only through the strict stable
+            // author/day/window fallback. Explicit self roots and replies stay
+            // authoritative full-row boundaries.
+            continues = Core.messageContinues(previous, record, { ignoreGroupRoot: true });
+          }
+          renderer.setContinuation(continues);
+          previous = record;
+          continue;
+        }
+        const identity = rowIdentity(element);
+        if (!identity) {
+          // A date divider, system row, thread marker, or other structural
+          // child is a real Discord grouping boundary.
+          previous = null;
+          continue;
+        }
+        const style = getComputedStyle(element);
+        const current = style.display === "none" || style.visibility === "hidden"
+          ? null
+          : groupingRecordFromNode(element);
+        if (!current) {
+          previous = null;
+          continue;
+        }
+        // Native Discord rows are presentation-authoritative. If Discord
+        // promotes a surviving message to a new group root, keep its avatar,
+        // author, badges, and timestamp exactly as Discord rendered them.
+        previous = current;
+      }
+    }
+  }
+
   function applySpacingShift(elements, shift) {
     const scale = Math.max(1, Number(devicePixelRatio) || 1);
     const rounded = Math.round(shift * scale) / scale;
@@ -628,6 +882,7 @@
 
   function rebalanceTombstoneSpacing() {
     state.spacingFrame = 0;
+    reconcileTombstoneGrouping();
     const parents = new Set([...document.querySelectorAll("[data-ldma-tombstone]")]
       .map((element) => element.parentElement).filter(Boolean));
     for (const parent of parents) {
@@ -681,6 +936,9 @@
       * { box-sizing:border-box; }
       .message { display:grid; grid-template-columns:40px minmax(0,1fr); column-gap:16px; min-height:48px; padding:2px 16px; background:rgb(242 63 66 / 7.5%); }
       .message:hover { background:rgb(242 63 66 / 10%); }
+      .message.continuation { min-height:22px; padding-block:0; }
+      .message.continuation .avatar,.message.continuation .header { display:none; }
+      .message.continuation .body { grid-column:2; }
       .avatar { display:grid; place-items:center; width:40px; height:40px; overflow:hidden; border-radius:50%; background:#5865f2; color:#fff; font-size:17px; font-weight:700; user-select:none; }
       .avatar img { width:100%; height:100%; object-fit:cover; }
       .body { min-width:0; }
@@ -700,6 +958,7 @@
       .deleted { margin-left:4px; color:#ff6b70; font-size:11px; font-weight:750; white-space:nowrap; }
       .attachments { color:#00a8fc; font-size:14px; line-height:20px; overflow-wrap:anywhere; }
       .attachment::before { content:"↳ "; color:#949ba4; }
+      .media-frame { display:block; width:100%; height:480px; margin:8px 0 2px; border:0; border-radius:8px; background:#1e1f22; }
       [hidden] { display:none !important; }
     `);
     shadow.adoptedStyleSheets = [sheet];
@@ -744,7 +1003,22 @@
     contentLine.append(content, deleted);
     const attachments = document.createElement("div");
     attachments.className = "attachments";
-    body.append(reply, header, contentLine, attachments);
+    const mediaFrame = document.createElement("iframe");
+    mediaFrame.className = "media-frame";
+    mediaFrame.title = "Locally cached message media";
+    mediaFrame.loading = "lazy";
+    mediaFrame.hidden = true;
+    mediaFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads");
+    mediaFrame.addEventListener("load", () => {
+      send({ type: T.CREATE_MEDIA_CAPABILITY, key }).then((response) => {
+        if (!response.ok || !response.capability || !mediaFrame.contentWindow || !mediaFrame.src) return;
+        mediaFrame.contentWindow.postMessage({
+          type: "LDMA_MEDIA_CAPABILITY",
+          capability: response.capability
+        }, extensionFrameOrigin());
+      }).catch(() => {});
+    });
+    body.append(reply, header, contentLine, attachments, mediaFrame);
     article.append(avatar, body);
     shadow.append(article);
 
@@ -757,6 +1031,7 @@
     let authorAnimationSignature = "";
     let badgeSignature = "";
     let lastRecord = null;
+    let continuation = false;
     const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
     function createBadge(badge) {
@@ -872,6 +1147,12 @@
         replaceText(item, `Attachment: ${nameValue}`);
         return item;
       }));
+      const hasMedia = Array.isArray(record.media) && record.media.length > 0;
+      mediaFrame.hidden = !hasMedia;
+      if (hasMedia && !mediaFrame.hasAttribute("src")) {
+        const viewerUrl = new URL(chrome.runtime.getURL("media/view.html"));
+        mediaFrame.src = viewerUrl.href;
+      }
       const avatarUrl = normalizedAvatarUrl(record.avatarUrl);
       replaceText(avatarFallback, name.trim().slice(0, 1).toLocaleUpperCase() || "?");
       avatarFallback.hidden = Boolean(avatarUrl);
@@ -880,6 +1161,14 @@
       else avatarImage.removeAttribute("src");
       article.setAttribute("aria-label", `${name}, deleted message preserved locally`);
     };
+    render.setContinuation = (value) => {
+      const next = Boolean(value);
+      if (next === continuation) return;
+      continuation = next;
+      article.classList.toggle("continuation", continuation);
+      host.dataset.ldmaContinuation = String(continuation);
+    };
+    host.dataset.ldmaContinuation = "false";
     const onMotionPreference = () => {
       authorAnimationSignature = "";
       if (lastRecord) applyAuthorPresentation(lastRecord);
@@ -891,6 +1180,7 @@
       authorAnimation = null;
       avatarImage.removeAttribute("src");
       badges.replaceChildren();
+      mediaFrame.removeAttribute("src");
     };
     state.tombstoneRenderers.set(key, render);
     return render;
@@ -900,74 +1190,120 @@
     const confirmed = record.status === "confirmed_deleted";
     if (!confirmed && record.inferredListIdentity && record.inferredListIdentity !== active.identity) return;
     const key = Core.recordKey(record);
-    const existing = findMountedTombstone(record.channelId, record.messageId);
-    if (existing) {
-      const needsRangeRevalidation = existing.dataset.ldmaEmptyRestore === "true" && active.rows.length > 0;
+    let element = findMountedTombstone(record.channelId, record.messageId);
+    if (element) {
       const belongsToTarget = replacementNode?.parentElement
-        ? existing.parentElement === replacementNode.parentElement
-        : Boolean(active.node?.contains(existing));
-      const existingRenderer = belongsToTarget && !needsRangeRevalidation && state.tombstoneRenderers.get(key);
-      if (existingRenderer && belongsToTarget) {
-        existingRenderer(record);
-        scheduleTombstoneSpacing();
-        return true;
+        ? element.parentElement === replacementNode.parentElement
+        : Boolean(active.node?.contains(element));
+      if (!belongsToTarget) {
+        dropTombstoneRenderer(key);
+        element.remove();
+        element = null;
       }
-      dropTombstoneRenderer(key);
-      existing.remove();
     }
+    if (element && active.rows.length) element.removeAttribute("data-ldma-empty-restore");
 
+    const liveIds = active.rows.map((row) => rowIdentity(row)?.messageId).filter(Boolean);
+    const scroller = findChatScrollContainer(active.node);
+    const atBottom = Core.isAtScrollBottom(scroller && {
+      scrollTop: scroller.scrollTop,
+      scrollHeight: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight
+    });
+    const newestLiveId = liveIds.reduce((newest, id) =>
+      !newest || Core.compareSnowflakeIds(id, newest) > 0 ? id : newest, null);
+    // A tail placement is range-qualified by the pre-mount bottom state even
+    // when its persisted previous anchor is still visible. Latch that decision
+    // because the restored row itself increases scrollHeight.
+    const tailAuthorized = Boolean(record.inferredTail && atBottom && newestLiveId &&
+      Core.compareSnowflakeIds(record.messageId, newestLiveId) > 0);
+    let anchorlessAuthorized = false;
     let previous = confirmed
       ? findPositionedMessage(record.channelId, record.inferredPreviousId, active.rows, active.node)
       : findMessage(record.inferredPreviousId, active.rows);
     let next = confirmed
       ? findPositionedMessage(record.channelId, record.inferredNextId, active.rows, active.node)
       : findMessage(record.inferredNextId, active.rows);
+    if (previous === element) previous = null;
+    if (next === element) next = null;
     if (confirmed && !previous && !next) {
-      const liveIds = active.rows.map((row) => rowIdentity(row)?.messageId).filter(Boolean);
-      const scroller = findChatScrollContainer(active.node);
-      const atBottom = Core.isAtScrollBottom(scroller && {
-        scrollTop: scroller.scrollTop,
-        scrollHeight: scroller.scrollHeight,
-        clientHeight: scroller.clientHeight
-      });
       if (!Core.anchorlessRestoreAllowed(record.messageId, liveIds, {
         allowEmpty: active.allowAnchorless,
         tail: record.inferredTail,
         atBottom
       })) return false;
+      anchorlessAuthorized = true;
       const positionedIds = active.rows.map(rawRowId).concat(
         [...active.node.querySelectorAll("[data-ldma-tombstone]")]
-          .map((element) => element.dataset.ldmaMessageKey)
+          .filter((candidate) => candidate !== element)
+          .map((candidate) => candidate.dataset.ldmaMessageKey)
       );
       const chronological = Core.chronologicalNeighborIds(record.messageId, positionedIds);
       previous = findPositionedMessage(record.channelId, chronological.previousId, active.rows, active.node);
       next = findPositionedMessage(record.channelId, chronological.nextId, active.rows, active.node);
     }
-    if (record.status === "inferred_deleted" && !previous) return;
-    if (!previous && !next && !active.allowAnchorless) return;
-    if (previous && next && previous.parentElement !== next.parentElement) return;
-    if (!confirmed && previous && next && active.rows.indexOf(next) !== active.rows.indexOf(previous) + 1) return;
+    if (record.status === "inferred_deleted" && !previous) return false;
+    if (!previous && !next && !active.allowAnchorless) return false;
+    if (previous && next && previous.parentElement !== next.parentElement) return false;
+    if (!confirmed && previous && next && active.rows.indexOf(next) !== active.rows.indexOf(previous) + 1) return false;
+
     const reference = next || previous || active.rows[0] || active.node;
-    const element = document.createElement(reference.tagName === "LI" || active.node?.tagName === "OL" ? "li" : "div");
-    element.className = "ldma-tombstone";
-    element.dataset.ldmaTombstone = "true";
-    element.dataset.ldmaMessageKey = key;
-    if (!active.rows.length) element.dataset.ldmaEmptyRestore = "true";
-    try {
-      createTombstoneRenderer(element, key)(record);
-    } catch (_error) {
-      dropTombstoneRenderer(key);
-      return false;
+    if (!element) {
+      element = document.createElement(reference.tagName === "LI" || active.node?.tagName === "OL" ? "li" : "div");
+      element.className = "ldma-tombstone";
+      element.dataset.ldmaTombstone = "true";
+      element.dataset.ldmaMessageKey = key;
+      if (!active.rows.length) element.dataset.ldmaEmptyRestore = "true";
+      try {
+        createTombstoneRenderer(element, key)(record);
+      } catch (_error) {
+        dropTombstoneRenderer(key);
+        return false;
+      }
+    } else {
+      const renderer = state.tombstoneRenderers.get(key);
+      if (!renderer) {
+        try { createTombstoneRenderer(element, key)(record); }
+        catch (_error) { dropTombstoneRenderer(key); element.remove(); return false; }
+      } else renderer(record);
     }
+    if (anchorlessAuthorized || tailAuthorized || replacementNode) {
+      element.dataset.ldmaAnchorlessEpoch = String(state.anchorlessEpoch);
+      element.dataset.ldmaAnchorlessRange = nativeRangeSignature(active);
+      element.dataset.ldmaMountKind = active.rows.length === 0
+        ? "empty"
+        : replacementNode
+          ? "retained"
+          : tailAuthorized ? "tail" : "range";
+    } else {
+      delete element.dataset.ldmaAnchorlessEpoch;
+      delete element.dataset.ldmaAnchorlessRange;
+      delete element.dataset.ldmaMountKind;
+    }
+
     if (replacementNode?.parentElement) {
-      replacementNode.parentElement.insertBefore(element, replacementNode);
+      if (element.nextSibling !== replacementNode) {
+        if (element.isConnected) replacementNode.parentElement.moveBefore(element, replacementNode);
+        else replacementNode.parentElement.insertBefore(element, replacementNode);
+      }
       scheduleTombstoneSpacing();
       return true;
     }
     const parent = previous?.parentElement || next?.parentElement || active.rows[0]?.parentElement || active.node;
-    if (next && next.parentElement === parent) parent.insertBefore(element, next);
-    else if (previous && previous.parentElement === parent) parent.insertBefore(element, previous.nextSibling);
-    else parent.append(element);
+    if (next && next.parentElement === parent) {
+      if (element.nextSibling !== next) {
+        if (element.isConnected) parent.moveBefore(element, next);
+        else parent.insertBefore(element, next);
+      }
+    } else if (previous && previous.parentElement === parent) {
+      if (previous.nextSibling !== element) {
+        if (element.isConnected) parent.moveBefore(element, previous.nextSibling);
+        else parent.insertBefore(element, previous.nextSibling);
+      }
+    } else if (element.parentElement !== parent || element !== parent.lastElementChild) {
+      if (element.isConnected) parent.moveBefore(element, null);
+      else parent.append(element);
+    }
     scheduleTombstoneSpacing();
     return true;
   }
@@ -983,6 +1319,16 @@
     for (const record of retained) {
       const nativeRow = retainedRow(route.channelId, record.messageId, active.node);
       if (!nativeRow || nativeRow.closest("[data-ldma-tombstone]")) continue;
+      const scroller = findChatScrollContainer(active.node);
+      const rowRect = nativeRow.getBoundingClientRect();
+      const clipRect = scroller?.getBoundingClientRect();
+      const clipTop = Math.max(0, clipRect?.top || 0);
+      const clipBottom = Math.min(innerHeight, clipRect?.bottom || innerHeight);
+      // The fallback is for a native row the user can currently see. A row
+      // already hidden behind a prior tombstone must not recreate that
+      // tombstone after range/gesture cleanup.
+      if (nativeRow.dataset.ldmaNativeReplaced === "true" || rowRect.height <= 0 ||
+        rowRect.bottom <= clipTop || rowRect.top >= clipBottom) continue;
       const mounted = insertTombstone(record, Object.assign({}, active, {
         rows: active.rows.filter((row) => row !== nativeRow),
         allowAnchorless: true
@@ -1004,12 +1350,27 @@
       const identity = rowIdentity(row);
       return `${active.route.channelId}:${identity && identity.messageId}`;
     }) : [];
+    const liveRowIds = active ? active.rows.map(rawRowId) : [];
+    const scroller = active && findChatScrollContainer(active.node);
+    const atBottom = Core.isAtScrollBottom(scroller && {
+      scrollTop: scroller.scrollTop,
+      scrollHeight: scroller.scrollHeight,
+      clientHeight: scroller.clientHeight
+    });
+    const inRenderedRange = (record, allowEmpty) => Boolean(active && Core.tombstoneInRenderedRange(
+      record.messageId,
+      liveRowIds,
+      { allowEmpty, tail: record.inferredTail, atBottom }
+    ));
     const cleanup = new Set(Core.tombstoneCleanupKeys(state.archive.records, mountedKeys, liveKeys));
     elements.forEach((element) => {
       const record = deleted.get(element.dataset.ldmaMessageKey);
       const wrongRoute = state.route && record && record.channelId !== state.route.channelId;
       const outsideActiveList = active && record?.channelId === active.route.channelId && !active.node.contains(element);
-      if (cleanup.has(element.dataset.ldmaMessageKey) || !record || wrongRoute || outsideActiveList) {
+      const outsideRenderedRange = active && record?.channelId === active.route.channelId &&
+        !inRenderedRange(record, active.allowAnchorless && element.dataset.ldmaEmptyRestore === "true") &&
+        !anchorlessMountIsCurrent(element, active);
+      if (cleanup.has(element.dataset.ldmaMessageKey) || !record || wrongRoute || outsideActiveList || outsideRenderedRange) {
         dropTombstoneRenderer(element.dataset.ldmaMessageKey);
         element.remove();
       }
@@ -1017,7 +1378,8 @@
     if (!active) return;
     const ordered = [...deleted.values()].sort((left, right) => Core.compareSnowflakeIds(left.messageId, right.messageId));
     for (const record of ordered) {
-      if (record.channelId === active.route.channelId && !findMessage(record.messageId, active.rows)) insertTombstone(record, active);
+      if (record.channelId === active.route.channelId && !findMessage(record.messageId, active.rows) &&
+        inRenderedRange(record, active.allowAnchorless)) insertTombstone(record, active);
     }
     scheduleTombstoneSpacing();
   }
@@ -1187,8 +1549,13 @@
     requestAnimationFrame(() => snapshotRenderedMessages(true));
   }
 
-  function noteScroll() {
+  function noteScroll(event) {
     state.lastScrollAt = performance.now();
+    // DOM growth can dispatch `scroll` while the browser maintains its anchor.
+    // Only direct user scroll gestures invalidate an anchorless mount here;
+    // actual virtual-list movement is independently invalidated by its native
+    // snowflake range signature.
+    if (event?.type === "wheel" || event?.type === "touchmove") state.anchorlessEpoch += 1;
     setTimeout(() => snapshotRenderedMessages(false), Core.DEFAULTS.scrollQuietMs + 50);
   }
 
@@ -1272,12 +1639,18 @@
     if (response.archive) applyArchive(response.archive);
     if (response.ok) {
       for (const id of ids) state.pendingRetainedKeys.delete(`${channelId}:${id}`);
+      // Discord can remove the rendered row even when its MessageStore record was
+      // retained. Mount from the pre-delete snapshot immediately in that case;
+      // the helper skips rows that are still native, so this cannot duplicate them.
+      mountConfirmedFromSnapshots(channelId, deletions);
     }
     if (!response.ok && retryAttempt < 3 && (response.reason === "broker-unavailable" || response.reason === "broker-error")) {
       setTimeout(() => confirmRetainedDeletion(channelId, ids, retryAttempt + 1).catch(() => {}), 500);
     }
     requestAnimationFrame(applyRetainedStyles);
     setTimeout(applyRetainedStyles, 120);
+    requestAnimationFrame(reconcileTombstones);
+    setTimeout(reconcileTombstones, 120);
   }
 
   function mountConfirmedFromSnapshots(channelId, deletions) {
@@ -1287,14 +1660,18 @@
       if (!snapshot?.listNode?.isConnected || !snapshot.parentNode?.isConnected) continue;
       const rows = uniqueMessageNodes(snapshot.listNode, state.route);
       const archived = state.archive.records.find((record) => Core.recordKey(record) === Core.recordKey(item.record));
-      if (!archived || archived.status !== "confirmed_deleted" || findMessage(archived.messageId, rows)) continue;
-      insertTombstone(archived, {
+      if (!archived || archived.status !== "confirmed_deleted") continue;
+      const nativeRow = findMessage(archived.messageId, rows);
+      const placementRows = nativeRow ? rows.filter((row) => row !== nativeRow) : rows;
+      const placement = {
         node: snapshot.parentNode,
         identity: snapshot.listIdentity,
-        rows,
+        rows: placementRows,
         route: state.route,
-        allowAnchorless: rows.length === 0
-      });
+        allowAnchorless: placementRows.length === 0
+      };
+      const mounted = insertTombstone(archived, placement, nativeRow);
+      if (mounted && nativeRow) nativeRow.dataset.ldmaNativeReplaced = "true";
     }
   }
 
@@ -1324,6 +1701,7 @@
     if ((route?.routeKey) !== (state.route?.routeKey)) {
       state.route = route;
       state.lastRouteAt = performance.now();
+      state.anchorlessEpoch += 1;
       state.signatures.clear();
       state.recentRemovals.clear();
       state.pendingRetainedKeys.clear();

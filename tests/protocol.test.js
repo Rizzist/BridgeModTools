@@ -199,7 +199,7 @@ test("confirmed deletions survive archive serialization and a fresh normalizatio
   assert.equal(restored.records[0].inferredNextId, "3");
 });
 
-test("archive normalization migrates to version 3 and sanitizes presentation", () => {
+test("archive normalization migrates to version 4 and sanitizes presentation", () => {
   const restored = Protocol.normalizeArchive({
     version: 2,
     generation: 4,
@@ -208,7 +208,7 @@ test("archive normalization migrates to version 3 and sanitizes presentation", (
       authorBadges: [{ kind: "image", url: "javascript:alert(1)" }]
     })]
   });
-  assert.equal(restored.version, 3);
+  assert.equal(restored.version, 4);
   assert.equal(restored.generation, 4);
   assert.equal(restored.records[0].authorStyle, undefined);
   assert.deepEqual(restored.records[0].authorBadges, []);

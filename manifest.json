@@ -1,10 +1,17 @@
 {
   "manifest_version": 3,
-  "minimum_chrome_version": "111",
+  "minimum_chrome_version": "133",
   "name": "BridgeModTools",
-  "version": "1.9.0",
-  "description": "Locally preserves rendered Discord messages and restores deleted rows in a Discord-style layout.",
-  "permissions": ["storage"],
+  "version": "2.2.0",
+  "description": "Locally preserves rendered Discord messages and cached media, then restores deleted rows in a Discord-style layout.",
+  "permissions": ["storage", "offscreen", "unlimitedStorage"],
+  "host_permissions": [
+    "https://cdn.discordapp.com/*",
+    "https://media.discordapp.net/*",
+    "https://images-ext-1.discordapp.net/*",
+    "https://images-ext-2.discordapp.net/*"
+  ],
+  "optional_host_permissions": ["https://*/*"],
   "background": {
     "service_worker": "src/background.js"
   },
@@ -25,5 +32,22 @@
       "css": ["src/content.css"],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "media/view.html",
+        "media/view.css",
+        "media/view.js",
+        "src/core.js",
+        "src/protocol.js",
+        "src/media-store.js"
+      ],
+      "matches": ["https://discord.com/*"],
+      "use_dynamic_url": true
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src https:; frame-ancestors 'self' https://discord.com"
+  }
 }

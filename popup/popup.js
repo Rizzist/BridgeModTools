@@ -6,6 +6,10 @@
   const pauseHelp = document.getElementById("pause-help");
   const recordCount = document.getElementById("record-count");
   const deletedCount = document.getElementById("deleted-count");
+  const mediaCount = document.getElementById("media-count");
+  const mediaBytes = document.getElementById("media-bytes");
+  const mediaCacheDetail = document.getElementById("media-cache-detail");
+  const mediaAccess = document.getElementById("media-access");
   const clearButton = document.getElementById("clear");
   const status = document.getElementById("status");
   const health = document.getElementById("health");
@@ -15,6 +19,7 @@
   const searchSummary = document.getElementById("search-summary");
   const Core = globalThis.LocalDiscordArchiveCore;
   let currentArchive = { records: [] };
+  let missingMediaOrigins = [];
 
   function send(command) {
     return chrome.runtime.sendMessage(command);
@@ -76,6 +81,32 @@
     renderSearch();
   }
 
+  function formatBytes(value) {
+    const bytes = Math.max(0, Number(value) || 0);
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+    return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+  }
+
+  async function refreshMediaStats() {
+    const response = await send({ type: T.GET_MEDIA_STATS });
+    const stats = response.stats || { cached: 0, bytes: 0, origins: [] };
+    mediaCount.textContent = String(stats.cached || 0);
+    mediaBytes.textContent = formatBytes(stats.bytes);
+    missingMediaOrigins = [];
+    for (const origin of stats.origins || []) {
+      const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] });
+      if (!granted) missingMediaOrigins.push(origin);
+    }
+    mediaAccess.hidden = missingMediaOrigins.length === 0;
+    mediaAccess.textContent = `Allow ${missingMediaOrigins.length} external media site${missingMediaOrigins.length === 1 ? "" : "s"}`;
+    const missingHosts = missingMediaOrigins.map((origin) => new URL(origin).hostname).join(", ");
+    mediaCacheDetail.textContent = missingMediaOrigins.length
+      ? `${stats.permissionRequired || missingMediaOrigins.length} item(s) are waiting for permission: ${missingHosts}.`
+      : `${stats.cached || 0} cached · ${stats.pending || 0} downloading · ${stats.failed || 0} failed`;
+  }
+
   async function refresh() {
     const response = await send({ type: T.GET_ARCHIVE });
     if (response.archive) render(response.archive);
@@ -94,15 +125,29 @@
     status.textContent = "Local history cleared.";
   });
 
+  mediaAccess.addEventListener("click", async () => {
+    if (!missingMediaOrigins.length) return;
+    const granted = await chrome.permissions.request({ origins: missingMediaOrigins.map((origin) => `${origin}/*`) });
+    if (!granted) {
+      status.textContent = "External media permission was not granted.";
+      return;
+    }
+    status.textContent = "Caching external media…";
+    await send({ type: T.CACHE_ALL_MEDIA });
+    await refreshMediaStats();
+    status.textContent = "External media caching enabled for the selected sites.";
+  });
+
   search.addEventListener("input", renderSearch);
 
   function connectUpdates() {
     const port = chrome.runtime.connect({ name: "ldma-updates" });
     port.onMessage.addListener((message) => {
       if (message.type === "LDMA_ARCHIVE_CHANGED") refresh().catch(() => {});
+      if (message.type === "LDMA_MEDIA_CHANGED") refreshMediaStats().catch(() => {});
     });
     port.onDisconnect.addListener(() => setTimeout(connectUpdates, 500));
   }
   connectUpdates();
-  refresh().catch(() => { status.textContent = "Could not reach the local archive broker."; });
+  Promise.all([refresh(), refreshMediaStats()]).catch(() => { status.textContent = "Could not reach the local archive broker."; });
 })();

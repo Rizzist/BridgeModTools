@@ -12,12 +12,17 @@
     SET_PAUSED: "LDMA_SET_PAUSED",
     CLEAR_ARCHIVE: "LDMA_CLEAR_ARCHIVE",
     DELETE_RECORD: "LDMA_DELETE_RECORD",
-    SET_HEALTH: "LDMA_SET_HEALTH"
+    SET_HEALTH: "LDMA_SET_HEALTH",
+    CACHE_MEDIA: "LDMA_CACHE_MEDIA",
+    CACHE_ALL_MEDIA: "LDMA_CACHE_ALL_MEDIA",
+    GET_MEDIA_STATS: "LDMA_GET_MEDIA_STATS",
+    CREATE_MEDIA_CAPABILITY: "LDMA_CREATE_MEDIA_CAPABILITY",
+    REDEEM_MEDIA_CAPABILITY: "LDMA_REDEEM_MEDIA_CAPABILITY"
   });
 
   function emptyArchive() {
     return {
-      version: 3,
+      version: 4,
       generation: 0,
       revision: 0,
       paused: false,
@@ -34,7 +39,7 @@
     const base = emptyArchive();
     if (!value || !Array.isArray(value.records)) return base;
     return Object.assign(base, value, {
-      version: 3,
+      version: 4,
       generation: Number.isInteger(value.generation) ? value.generation : 0,
       revision: Number.isInteger(value.revision) ? value.revision : 0,
       paused: Boolean(value.paused),

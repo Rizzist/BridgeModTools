@@ -2,9 +2,15 @@
 
 BridgeModTools is a local Chrome extension for moderators who need a searchable, persistent record of Discord messages that were rendered while the extension was active—including messages later deleted by their authors or by moderators.
 
+Requires Chrome 133 or newer so chronological tombstone moves preserve active iframe/video/audio playback state.
+
 It is an unpacked Chrome Manifest V3 extension that records messages **only after Discord has rendered them in the page**. Its primary path intercepts Discord's local `MessageStore` handlers for `MESSAGE_DELETE` and `MESSAGE_DELETE_BULK`: the cached record is marked `deleted: true` instead of being removed long enough to capture and confirm it. The extension then hides that retained native row and replaces it in the same list position with its own persistent Discord-style row. This includes messages deleted by moderators and messages you delete yourself. A conservative DOM inference path remains as a fallback when store retention is unavailable.
 
-It does not read Chrome's disk cache. A browser cache is not a dependable message history: it stores selected HTTP resources and can be evicted or encoded, while Discord's live message state is rendered by the app. This extension instead observes the already-visible page from the moment it is enabled.
+Version 2.2 preserves Discord message grouping: consecutive messages in the same captured author group render as compact continuations without repeating the avatar, author name, badges, or header timestamp. Replies, group/time boundaries, date dividers, and different authors start a full row. Older cached records without native grouping metadata use a conservative fallback that requires matching stable author identity, the same local day, and a seven-minute window.
+
+Version 2 also captures links and rendered upload/embed media. Discord-hosted images, videos, audio, voice messages, and files are downloaded immediately into an extension-owned local cache; direct third-party media can be enabled per site from the popup. Restored deleted rows and full history use the cached bytes, so supported media remains viewable or playable after the original message disappears.
+
+It does not read Chrome's ordinary disk cache. Message metadata stays in the bounded JSON archive; media bodies use a separate, explicit Cache Storage layer with an IndexedDB ownership/status index.
 
 ## Install from GitHub
 
@@ -46,22 +52,24 @@ Then use **Load unpacked** in `chrome://extensions` and select the cloned `Bridg
 3. Confirm that the row remains in place with a red deleted marker.
 4. Reload Discord and confirm that the saved row is restored once, without duplication.
 
-The toolbar popup shows archived and saved-deleted counts and includes an immediate local search over saved deleted content, authors, channels, and attachment names. It can also pause capture, open the full history page, or clear all local history. The full history page adds status filtering, JSON export, per-record deletion, and delete-all.
+The toolbar popup shows archived, saved-deleted, and cached-media counts and includes immediate local search. It can grant exact third-party origins when direct external media needs permission, pause capture, open full history, or clear everything. Full history adds status filtering, cached playback, JSON metadata export, per-record deletion, and delete-all.
 
 ## Privacy and security properties
 
-- Manifest permission: `storage` only.
+- Manifest permissions: `storage`, `offscreen`, and `unlimitedStorage`. Required hosts are limited to Discord's CDN/media proxy domains. Arbitrary HTTPS is optional; Chrome prompts only when you click the popup button for the exact origins currently waiting.
 - Page match: `https://discord.com/channels/*` only.
 - One local service worker serializes every archive read/write; content and UI pages cannot access storage directly.
 - A `document_start`, main-world adapter discovers Discord's `MessageStore` and retains cached records during single or bulk deletion. It sends only validated channel/message IDs to the isolated content script. Message content, tokens, cookies, and store objects never cross that bridge.
 - Clear, per-record delete, and pause/resume advance an archive generation. Stale in-flight capture or inference writes are rejected.
-- No programmatic network requests, remote scripts, analytics, cookies, tokens, Discord API calls, or browser-cache access. A restored row may display its captured avatar URL through an ordinary image element restricted to Discord's CDN hosts.
-- Data stays in `chrome.storage.local` for the Chrome profile where the extension is loaded.
+- The only programmatic network requests are bounded media downloads. They omit credentials and referrers, follow no cross-origin redirect, enforce MIME/size limits, and run in a packaged offscreen document. There are no remote scripts, analytics, cookies, tokens, authorization headers, Discord API calls, or ordinary browser-cache access.
+- Message metadata stays in `chrome.storage.local`; cached bodies and their local index stay in extension-origin Cache Storage/IndexedDB for the same Chrome profile.
 - Saved records survive Discord refreshes, tab/browser restarts, and MV3 service-worker suspension. Removing the extension or clearing its local history still removes them.
-- Stored fields are message/channel IDs, visible channel name, visible author/content, attachment **names**, timestamps, local capture/deletion times, and bounded presentation metadata (Discord CDN avatar/role-icon URLs, resolved username color or gradient, safe name-animation keyframes, visible timestamp text, badges, and reply preview).
+- Stored metadata includes message/channel IDs, visible channel/author/content, HTTPS links and media descriptors, attachment names, timestamps, local capture/deletion times, and bounded presentation metadata. Media bytes never enter the JSON archive.
 - Presentation metadata is normalized on capture, merge, load, and render. Raw Discord HTML, class names, arbitrary CSS variables, remote CSS URLs, and scripts are never stored or replayed.
 - Storage is pruned to at most 1,500 records and approximately 4 MiB of serialized record data. Confirmed/suspected removals retain priority while a small rolling reserve keeps newly rendered messages eligible for a later deletion.
-- Inline deleted-message content is rendered synchronously inside a closed Shadow DOM owned by the isolated content script. Discord's normal page selectors see only the generic host and record key, not the retained text.
+- Media is capped at 32 MiB per asset, 512 MiB total, 1,000 cached assets, and one download at a time. Downloads stream through a byte-counting limiter directly into Cache Storage, and space is reserved before each download. Old media referenced only by seen messages is evicted before deleted-message media. Record deletion and archive pruning remove unshared bodies; clear-all invalidates in-flight jobs and deletes the complete media cache.
+- Pending and transiently failed downloads are recovered from persisted cache metadata on later archive refreshes, with bounded retry/backoff. Missing Cache Storage bodies are repaired instead of being reported as cached forever.
+- Inline deleted-message content is rendered inside a closed Shadow DOM. A sandboxed, packaged extension-origin frame reads cached bodies, creates temporary blob URLs, provides native image/video/audio controls or file download, and revokes those URLs on unload.
 - Rendering uses `textContent`; archived message text is never interpreted as HTML.
 
 Use it only in conversations you are authorized to access, and respect other participants' privacy and applicable rules.
@@ -75,7 +83,8 @@ Discord's deletion actions contain IDs but not the deleted message content. The 
 - The isolated content script archives visible text from Discord's rendered message list.
 - The main-world adapter discovers Discord's local Flux dispatcher, named `MessageStore`, and that store's registered action-handler node.
 - For a cached single or bulk deletion, the adapter marks the immutable message record `deleted: true`, writes it back through the channel's message cache, and returns before the original MessageStore removal code. Other Discord stores still receive the deletion action normally.
-- The retained native row remains only as an internal safety copy. Once the deletion is persisted, the isolated script hides that row and mounts a packaged Discord-style replacement in the same list slot with avatar, author gradient/color, adjacent role/app/server icons, supported name motion, timestamp, reply preview, text, attachment names, red tint, and a deleted marker. Reduced-motion preferences are honored.
+- The retained native row remains only as an internal safety copy. Once deletion is persisted, the isolated script hides that row and mounts a packaged Discord-style replacement in the same list slot with captured presentation, text, links, cached media, red tint, and a deleted marker. Reduced-motion preferences are honored.
+- Native Discord group-root metadata is stored with each rendered row. After every chronological insertion, removal, or virtual-list change, a presentation-only pass recomputes restored deleted-row continuations from visible adjacency. Native live rows remain untouched, so a message Discord promotes to the top of a group keeps its real avatar, author, badges, and timestamp. Regrouping changes only restored row classes in place, preserving active media iframe and audio/video state.
 - Self-authored messages are not filtered. On a retained deletion, the isolated script immediately snapshots the still-native row before flushing storage, covering the race where you send and delete your own message before the normal capture debounce completes.
 - On later Discord loads, confirmed records are read back from `chrome.storage.local`. The extension first uses the archived neighboring message IDs, then falls back to the nearest older/newer Discord snowflake IDs currently rendered. It restores the same compact Discord-style replacement in chronological position and deduplicates by `{channelId,messageId}`, so repeated reconciliation cannot create copies. Its exterior position is balanced from the real neighboring-row geometry, including Discord's grouped/full-message spacing, without changing list height. Older saved records without presentation metadata use a generated initial avatar and formatted timestamp. The record remains searchable in the popup even when the chat view is not open.
 - If Discord exposes the store but not a writable action-handler node, a compatibility wrapper captures the record before dispatch and restores it before Flux finishes emitting changes.
@@ -104,7 +113,9 @@ If the same live message ID reappears later, its status is retracted to **seen**
 ## Limitations
 
 - It cannot recover messages deleted before they were rendered while capture was active.
-- It cannot recover attachment bytes; it stores visible attachment names only.
+- A media item must finish downloading while its signed source remains valid. Expired, oversized, unsupported, or repeatedly failed downloads keep their metadata and original link but may not be playable offline. JSON export strips Discord CDN signature query parameters.
+- Generic provider pages, HLS/DRM streams, and embeds such as YouTube/Vimeo are preserved as links and rendered preview media; the extension does not scrape, transcode, or bypass provider controls.
+- “Playable” means formats/codecs supported by the installed Chrome build. Other cached files remain downloadable.
 - Captured avatar and role/server-icon imagery remains dependent on Discord's CDN cache/network; the extension does not copy those image bytes into storage.
 - Unsupported proprietary name effects fall back to the captured resolved color/gradient. Safe background-position/color/opacity motion is replayed; arbitrary filters, transforms, CSS variables, and remote style resources are rejected.
 - Store retention works for first-row, last-row, only-row, moderator, and bulk deletions when the message is still present in Discord's local channel cache.
@@ -124,7 +135,7 @@ No package installation is needed. With Node.js 18 or newer:
 npm test
 ```
 
-The test suite checks the classifier's accept/reject paths, fake Discord `MessageStore` retention for single and bulk deletions, the dispatcher compatibility fallback, ID-only bridge normalization, confirmed-deletion durability, storage merge/pruning/search behavior, JavaScript syntax, the exact manifest permissions/match, packaged scripts, and absence of network/cookie/token/cache primitives.
+The test suite checks deletion classification, fake Discord `MessageStore` retention, dispatcher fallback, ID-only bridge normalization, archive durability, media URL/name sanitization, MIME/size/redirect enforcement, omitted credentials/referrers, storage merge/prune/search, exact manifest permissions and host scope, packaged offscreen/player files, and absence of cookie/token/remote-script primitives.
 
 Open `demo/index.html` in a browser for a deterministic fixture. Its controls feed fixed signals into the same pure classifier used by the extension; it does not contact Discord or write extension storage.
 
@@ -133,6 +144,8 @@ Open `demo/index.html` in a browser for a deterministic fixture. Its controls fe
 - `src/page-hook.js` — main-world Webpack/Flux discovery, MessageStore deletion retention, and ID-only bridge.
 - `src/core.js` — pure classifier, route/list parsing, storage merge/prune/search, and tombstone cleanup utilities.
 - `src/protocol.js` / `src/background.js` — generation-checked archive protocol and serialized storage broker.
+- `src/media-store.js` / `media/offscreen.*` — bounded extension-owned media cache and downloader.
+- `media/view.*` — sandboxed cached image/video/audio/file/link renderer shared by Discord rows and history.
 - `src/content.js` / `src/content.css` — rendered-message capture, native-row replacement, chronological/deduplicated restoration, and mutation checks.
 - `popup/` — capture pause/resume, counts, history shortcut, and clear.
 - `history/` — local search, filter, JSON export, and deletion controls.

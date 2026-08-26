@@ -25,6 +25,16 @@
     <section class="stats" aria-label="Archive statistics">
       <div><strong id="record-count">0</strong><span>archived</span></div>
       <div><strong id="deleted-count">0</strong><span>saved deleted</span></div>
+      <div><strong id="media-count">0</strong><span>media cached</span></div>
+    </section>
+
+    <section class="media-cache" aria-labelledby="media-cache-title">
+      <div>
+        <strong id="media-cache-title">Local media cache</strong>
+        <span id="media-bytes">0 B</span>
+      </div>
+      <p id="media-cache-detail">Discord uploads and proxied embeds cache automatically.</p>
+      <button id="media-access" type="button" hidden>Allow external media sites</button>
     </section>
 
     <p id="health" class="health" data-state="starting">Reload Discord once after installing or reloading this unpacked extension.</p>
@@ -36,7 +46,7 @@
         <span id="search-summary">0 saved</span>
       </div>
       <label class="search-label" for="search">Search saved messages</label>
-      <input id="search" type="search" placeholder="Content, author, channel…" autocomplete="off">
+      <input id="search" type="search" placeholder="Content, author, channel, media…" autocomplete="off">
       <div id="search-results" class="search-results" role="list"></div>
       <p id="search-empty" class="search-empty">No saved deleted messages yet.</p>
     </section>
