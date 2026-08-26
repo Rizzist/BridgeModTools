@@ -70,7 +70,7 @@ input[role="switch"]:checked::after { transform: translateX(16px); }
 
 .stats {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: 1fr 1fr;
   gap: 8px;
   margin: 16px 0;
 }

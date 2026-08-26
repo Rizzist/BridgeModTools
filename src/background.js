@@ -69,6 +69,7 @@ async function reconcileMediaUnlocked(command, archive) {
   }
   const recordMutations = new Set([
     Protocol.TYPES.UPSERT_RECORDS,
+    Protocol.TYPES.CONFIRM_EDIT,
     Protocol.TYPES.CONFIRM_DELETED,
     Protocol.TYPES.INFER_DELETED,
     Protocol.TYPES.RETRACT_MESSAGE,
@@ -141,22 +142,24 @@ function mediaRefs(records, generation) {
   const refs = [];
   for (const record of Array.isArray(records) ? records : []) {
     const ownerKey = Core.recordKey(record);
-    const deleted = Core.isDeletedStatus(record.status);
-    for (const media of Core.sanitizeMediaItems(record.media)) {
-      if (MediaStore.fetchableMedia(media)) refs.push({ ownerKey, deleted, generation, media });
-      if (media.posterUrl) refs.push({
-        ownerKey,
-        deleted,
-        generation,
-        media: {
-          url: media.posterUrl,
-          kind: "image",
-          source: "embed",
-          name: `${media.name || "Video"} preview`,
-          cacheable: true,
-          spoiler: media.spoiler
-        }
-      });
+    const deleted = Core.isDeletedStatus(record.status) || Core.hasEdits(record);
+    for (const version of [record, ...(record.editHistory || [])]) {
+      for (const media of Core.sanitizeMediaItems(version.media)) {
+        if (MediaStore.fetchableMedia(media)) refs.push({ ownerKey, deleted, generation, media });
+        if (media.posterUrl) refs.push({
+          ownerKey,
+          deleted,
+          generation,
+          media: {
+            url: media.posterUrl,
+            kind: "image",
+            source: "embed",
+            name: `${media.name || "Video"} preview`,
+            cacheable: true,
+            spoiler: media.spoiler
+          }
+        });
+      }
     }
   }
   return refs;
@@ -277,8 +280,14 @@ async function handlePlaybackCommand(command, sender) {
     const archive = await readArchive();
     if (!archive.records.some((record) => Core.recordKey(record) === key)) return { ok: false, reason: "record-missing" };
     const capability = randomCapability();
+    const revisionId = command.revisionId == null ? null : Core.normalizeText(command.revisionId).slice(0, 160);
+    const record = archive.records.find((candidate) => Core.recordKey(candidate) === key);
+    if (revisionId && !record?.editHistory?.some((revision) => revision.revisionId === revisionId)) {
+      return { ok: false, reason: "revision-missing" };
+    }
     playbackCapabilities.set(capability, {
       key,
+      revisionId,
       tabId: Number.isInteger(sender.tab?.id) ? sender.tab.id : null,
       expiresAt: Date.now() + 10 * 60 * 1000,
       boundDocumentId: null,
@@ -299,8 +308,16 @@ async function handlePlaybackCommand(command, sender) {
     item.boundFrameId = sender.frameId;
     const archive = await readArchive();
     const record = archive.records.find((candidate) => Core.recordKey(candidate) === item.key) || null;
-    if (record?.media?.length && !archive.paused) scheduleMediaRecovery([record]).catch(() => {});
-    return { ok: Boolean(record), reason: record ? "capability-redeemed" : "record-missing", record: record ? Core.sanitizeRecordPresentation(record) : null };
+    const revision = item.revisionId && record?.editHistory?.find((candidate) => candidate.revisionId === item.revisionId);
+    const playbackRecord = item.revisionId
+      ? revision ? Object.assign({}, record, revision, { editHistory: [] }) : null
+      : record;
+    if (playbackRecord?.media?.length && !archive.paused) scheduleMediaRecovery([record]).catch(() => {});
+    return {
+      ok: Boolean(playbackRecord),
+      reason: playbackRecord ? "capability-redeemed" : item.revisionId ? "revision-missing" : "record-missing",
+      record: playbackRecord ? Core.sanitizeRecordPresentation(playbackRecord) : null
+    };
   }
   return { ok: false, reason: "unknown-playback-command" };
 }
@@ -311,6 +328,7 @@ function archiveCommandAllowed(command, sender) {
   if (discordContentSender(sender)) return new Set([
     Protocol.TYPES.GET_ARCHIVE,
     Protocol.TYPES.UPSERT_RECORDS,
+    Protocol.TYPES.CONFIRM_EDIT,
     Protocol.TYPES.CONFIRM_DELETED,
     Protocol.TYPES.INFER_DELETED,
     Protocol.TYPES.RETRACT_MESSAGE,

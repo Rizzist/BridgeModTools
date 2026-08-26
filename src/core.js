@@ -6,6 +6,8 @@
     maxBytes: 4 * 1024 * 1024,
     seenReserve: 50,
     seenReserveBytes: 256 * 1024,
+    maxEditRevisions: 20,
+    maxEditBytes: 512 * 1024,
     maxSnapshotAgeMs: 30000,
     scrollQuietMs: 1500,
     routeQuietMs: 1200,
@@ -366,6 +368,78 @@
     return items;
   }
 
+  function editPayloadSignature(record) {
+    // Message edits are content-exact. Preserve meaningful whitespace so an
+    // edit that only adds a line break or repeated spaces is still retained.
+    // Normalize only platform line endings to keep signatures portable.
+    const content = String(record?.content ?? "").replace(/\r\n?/g, "\n");
+    // URL identity is the edit-semantic part of a media item. Dimensions,
+    // MIME, alt/name presentation, poster discovery, and inferred kind/source
+    // can all hydrate after Discord first renders the same unchanged asset.
+    const media = sanitizeMediaItems(record?.media).map((item) => mediaIdentity(item.url)).filter(Boolean).sort();
+    return JSON.stringify([
+      content,
+      (Array.isArray(record?.attachments) ? record.attachments : []).map(safeMediaName).filter(Boolean).sort(),
+      media
+    ]);
+  }
+
+  function editRevisionFromRecord(record, metadata) {
+    const settings = metadata || {};
+    const capturedAt = Number(record?.capturedAt);
+    const supersededAt = Number(settings.supersededAt);
+    return {
+      revisionId: normalizeText(settings.revisionId).slice(0, 160),
+      content: String(record?.content || "").slice(0, 20000),
+      attachments: (Array.isArray(record?.attachments) ? record.attachments : [])
+        .map(safeMediaName).filter(Boolean).slice(0, 12),
+      media: sanitizeMediaItems(record?.media),
+      capturedAt: Number.isFinite(capturedAt) && capturedAt > 0 ? capturedAt : 0,
+      supersededAt: Number.isFinite(supersededAt) && supersededAt > 0 ? supersededAt : 0
+    };
+  }
+
+  function sanitizeEditHistory(value, options) {
+    const limits = Object.assign({}, DEFAULTS, options || {});
+    const raw = Array.isArray(value) ? value : [];
+    const revisions = [];
+    const seenIds = new Set();
+    let previousSignature = null;
+    for (const item of raw.slice(0, 200)) {
+      if (!item || typeof item !== "object") continue;
+      const revision = editRevisionFromRecord(item, {
+        revisionId: item.revisionId,
+        supersededAt: item.supersededAt
+      });
+      const signature = editPayloadSignature(revision);
+      if (!revision.revisionId) revision.revisionId = `legacy:${revision.supersededAt}:${revisions.length}`;
+      if (seenIds.has(revision.revisionId) || signature === previousSignature) continue;
+      revisions.push(revision);
+      seenIds.add(revision.revisionId);
+      previousSignature = signature;
+    }
+    const maxRevisions = Math.max(1, Math.floor(Number(limits.maxEditRevisions) || 1));
+    let selected = revisions.length <= maxRevisions
+      ? revisions
+      : maxRevisions === 1 ? [revisions[0]] : [revisions[0], ...revisions.slice(-(maxRevisions - 1))];
+    const maxBytes = Math.max(1024, Number(limits.maxEditBytes) || 1024);
+    while (selected.length > 1 && estimateBytes(selected) > maxBytes) {
+      selected.splice(1, 1);
+    }
+    if (selected.length === 1 && estimateBytes(selected) > maxBytes) {
+      selected[0] = Object.assign({}, selected[0], {
+        content: selected[0].content.slice(0, Math.max(0, Math.floor(maxBytes / 4))),
+        media: selected[0].media.slice(0, 4),
+        attachments: selected[0].attachments.slice(0, 4)
+      });
+    }
+    return selected;
+  }
+
+  function hasEdits(record) {
+    return Array.isArray(record?.editHistory) && record.editHistory.length > 0;
+  }
+
   function sanitizeAuthorAnimation(value) {
     if (!value || !Array.isArray(value.frames) || !value.timing) return null;
     const allowedProperties = new Set(["backgroundPosition", "backgroundPositionX", "backgroundPositionY", "color", "opacity"]);
@@ -492,6 +566,26 @@
     if (groupRootMessageId) next.groupRootMessageId = groupRootMessageId;
     else delete next.groupRootMessageId;
     next.media = sanitizeMediaItems(record.media);
+    next.editHistory = sanitizeEditHistory(record.editHistory);
+    if (!next.editHistory.length) delete next.editHistory;
+    const editSessionId = normalizeText(record.editSessionId).slice(0, 100);
+    const lastEditSequence = Math.max(0, Math.floor(Number(record.lastEditSequence) || 0));
+    if (editSessionId && lastEditSequence) {
+      next.editSessionId = editSessionId;
+      next.lastEditSequence = lastEditSequence;
+    } else {
+      delete next.editSessionId;
+      delete next.lastEditSequence;
+    }
+    const captureSessionId = normalizeText(record.captureSessionId).slice(0, 100);
+    const captureSequence = Math.max(0, Math.floor(Number(record.captureSequence) || 0));
+    if (captureSessionId && captureSequence) {
+      next.captureSessionId = captureSessionId;
+      next.captureSequence = captureSequence;
+    } else {
+      delete next.captureSessionId;
+      delete next.captureSequence;
+    }
     return next;
   }
 
@@ -520,7 +614,8 @@
 
     const newestFirst = (a, b) => (b.updatedAt || b.capturedAt || 0) - (a.updatedAt || a.capturedAt || 0);
     const deleted = [...byKey.values()].filter((record) => isDeletedStatus(record.status)).sort(newestFirst);
-    const seen = [...byKey.values()].filter((record) => !isDeletedStatus(record.status)).sort(newestFirst);
+    const edited = [...byKey.values()].filter((record) => !isDeletedStatus(record.status) && hasEdits(record)).sort(newestFirst);
+    const seen = [...byKey.values()].filter((record) => !isDeletedStatus(record.status) && !hasEdits(record)).sort(newestFirst);
     const maxRecords = Math.max(0, Math.floor(Number(limits.maxRecords) || 0));
     const maxBytes = Math.max(0, Number(limits.maxBytes) || 0);
     const reserveCount = Math.min(Math.max(0, maxRecords - 1), Math.max(0, Math.floor(Number(limits.seenReserve) || 0)));
@@ -542,11 +637,12 @@
       if (reserved >= reserveCount) break;
       if (add(record, 2 + reserveBytes)) reserved += 1;
     }
-    for (const record of deleted) add(record);
+    for (const record of [...deleted, ...edited].sort(newestFirst)) add(record);
     for (const record of seen) add(record);
     return selected.sort((a, b) => {
       const statusOrder = Number(isDeletedStatus(b.status)) - Number(isDeletedStatus(a.status));
-      return statusOrder || newestFirst(a, b);
+      const editOrder = Number(hasEdits(b)) - Number(hasEdits(a));
+      return statusOrder || editOrder || newestFirst(a, b);
     });
   }
 
@@ -561,6 +657,9 @@
       const key = recordKey(record);
       const old = byKey.get(key) || {};
       const safeRecord = sanitizeRecordPresentation(record);
+      if (old.captureSessionId && safeRecord.captureSessionId === old.captureSessionId &&
+        safeRecord.captureSequence && old.captureSequence && safeRecord.captureSequence < old.captureSequence &&
+        !isDeletedStatus(safeRecord.status)) continue;
       const merged = Object.assign({}, old, safeRecord, {
         firstCapturedAt: old.firstCapturedAt || record.firstCapturedAt || record.capturedAt || now,
         updatedAt: now
@@ -570,6 +669,14 @@
         merged.inferredDeletedAt = old.inferredDeletedAt;
         merged.confirmedDeletedAt = old.confirmedDeletedAt;
         merged.deletionSource = old.deletionSource;
+        if (old.status === "confirmed_deleted") {
+          merged.content = old.content;
+          merged.attachments = old.attachments;
+          merged.media = old.media;
+          merged.capturedAt = old.capturedAt;
+          merged.captureSessionId = old.captureSessionId;
+          merged.captureSequence = old.captureSequence;
+        }
       } else if (old.status === "confirmed_deleted" && record.status === "inferred_deleted") {
         merged.status = old.status;
         merged.confirmedDeletedAt = old.confirmedDeletedAt;
@@ -593,7 +700,12 @@
           record.channelId,
           record.guildId,
           ...(Array.isArray(record.attachments) ? record.attachments : []),
-          ...(Array.isArray(record.media) ? record.media.flatMap((item) => [item.name, item.url, item.alt]) : [])
+          ...(Array.isArray(record.media) ? record.media.flatMap((item) => [item.name, item.url, item.alt]) : []),
+          ...(Array.isArray(record.editHistory) ? record.editHistory.flatMap((revision) => [
+            revision.content,
+            ...(Array.isArray(revision.attachments) ? revision.attachments : []),
+            ...(Array.isArray(revision.media) ? revision.media.flatMap((item) => [item.name, item.url, item.alt]) : [])
+          ]) : [])
         ].join(" ").toLocaleLowerCase();
         return haystack.includes(needle);
       })
@@ -668,6 +780,10 @@
     mediaKindFromMime,
     safeMediaName,
     sanitizeMediaItems,
+    editPayloadSignature,
+    editRevisionFromRecord,
+    sanitizeEditHistory,
+    hasEdits,
     sanitizeAuthorAnimation,
     sanitizeAuthorStyle,
     sanitizeAuthorBadges,

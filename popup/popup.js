@@ -5,6 +5,7 @@
   const paused = document.getElementById("paused");
   const pauseHelp = document.getElementById("pause-help");
   const recordCount = document.getElementById("record-count");
+  const editedCount = document.getElementById("edited-count");
   const deletedCount = document.getElementById("deleted-count");
   const mediaCount = document.getElementById("media-count");
   const mediaBytes = document.getElementById("media-bytes");
@@ -73,6 +74,7 @@
     paused.checked = Boolean(archive.paused);
     pauseHelp.textContent = archive.paused ? "Paused — existing history is retained" : "Active on supported Discord channel pages";
     recordCount.textContent = String(records.length);
+    editedCount.textContent = String(records.filter(Core.hasEdits).length);
     deletedCount.textContent = String(records.filter((record) => Core.isDeletedStatus(record.status)).length);
     const currentHealth = archive.health || { status: "starting", detail: "Waiting for Discord." };
     const healthState = currentHealth.status;

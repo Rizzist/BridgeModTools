@@ -10,7 +10,10 @@
   const LIST_SELECTOR = ["[data-list-id='chat-messages']", "ol[aria-label*='essages']", "[role='list'][aria-label*='essages']"].join(",");
   const AUTHOR_SELECTORS = ["[id^='message-username-']", "[class*='username_']"];
   const BRIDGE = "LDMA_BRIDGE_V1";
+  const EDIT_EVENT = "LDMA_EDIT_BEFORE_V1";
   const SNOWFLAKE = /^\d{15,25}$/;
+  const captureSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  let captureSequence = 0;
 
   const state = {
     archive: Protocol.emptyArchive(), generation: 0, paused: false,
@@ -19,8 +22,8 @@
     activeList: null, listIdentity: null, snapshots: new WeakMap(), signatures: new Map(),
     snapshotsByKey: new Map(), pageHookStatus: "searching", pageHookDetail: "Waiting for Discord's deletion event dispatcher.",
     pendingRecords: new Map(), pendingRetractions: new Set(), recentRemovals: new Map(), pendingRetainedKeys: new Set(), pendingReleaseKeys: new Set(), flushTimer: null, flushPromise: null,
-    healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), spacingFrame: 0,
-    pendingConfirmedMounts: new Map(),
+    healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), editRenderers: new Map(), spacingFrame: 0,
+    pendingConfirmedMounts: new Map(), pendingEdits: new Map(),
     lastMediaRecoveryAt: -Infinity
   };
 
@@ -245,17 +248,20 @@
   function allContent(node, messageId) {
     const parts = [];
     const seen = new Set();
-    const add = (element) => {
-      const text = Core.normalizeText(element?.textContent);
+    const add = (element, preserveFormatting) => {
+      const raw = preserveFormatting && typeof element?.innerText === "string" ? element.innerText : element?.textContent;
+      const text = preserveFormatting
+        ? String(raw || "").replace(/\r\n?/g, "\n")
+        : Core.normalizeText(raw);
       if (text && !seen.has(text)) { seen.add(text); parts.push(text); }
     };
     const exact = node.querySelector(`[id="message-content-${messageId}"]`) || document.getElementById(`message-content-${messageId}`);
     if (exact && node.contains(exact)) {
-      add(exact);
+      add(exact, true);
     } else {
       // Fallback for an unsupported Discord variant; exclude obvious reply-preview descendants.
       node.querySelectorAll("[class*='messageContent_']").forEach((element) => {
-        if (!element.closest("[class*='repliedMessage_'], [class*='reply_']")) add(element);
+        if (!element.closest("[class*='repliedMessage_'], [class*='reply_']")) add(element, true);
       });
     }
     node.querySelectorAll([
@@ -273,7 +279,7 @@
 
   function captureMedia(node, messageId) {
     const items = [];
-    const seen = new Set();
+    const itemIndexes = new Map();
     const replySelector = "[class*='repliedMessage_'], [class*='reply_']";
     const mediaAncestorSelector = [
       "[class*='attachment_']", "[class*='imageWrapper_']", "[class*='mosaicItem_']",
@@ -285,8 +291,25 @@
       [...node.querySelectorAll("[class*='messageContent_']")].find((element) => !element.closest(replySelector));
     const add = (raw) => {
       const value = Core.sanitizeMediaItems([raw])[0];
-      if (!value || seen.has(value.url)) return;
-      seen.add(value.url);
+      if (!value) return;
+      const identity = Core.mediaIdentity(value.url);
+      const existingIndex = itemIndexes.get(identity);
+      if (existingIndex !== undefined) {
+        const existing = items[existingIndex];
+        const merged = Object.assign({}, existing, {
+          kind: existing.kind === "file" || existing.kind === "link" ? value.kind : existing.kind,
+          alt: existing.alt || value.alt,
+          mimeType: existing.mimeType || value.mimeType,
+          width: Math.max(existing.width || 0, value.width || 0),
+          height: Math.max(existing.height || 0, value.height || 0),
+          posterUrl: existing.posterUrl || value.posterUrl,
+          cacheable: existing.cacheable !== false || value.cacheable !== false,
+          spoiler: Boolean(existing.spoiler || value.spoiler)
+        });
+        items[existingIndex] = Core.sanitizeMediaItems([merged])[0] || existing;
+        return;
+      }
+      itemIndexes.set(identity, items.length);
       items.push(value);
     };
     const nameFromUrl = (url, fallback) => {
@@ -323,8 +346,6 @@
       const tag = element.tagName.toLocaleLowerCase();
       const parentMedia = tag === "source" ? element.closest("video, audio") : element;
       const kind = parentMedia?.tagName === "VIDEO" ? "video" : parentMedia?.tagName === "AUDIO" ? "audio" : "image";
-      const attachmentAnchor = element.closest("a[href*='/attachments/'], a[href*='/ephemeral-attachments/']");
-      if (attachmentAnchor && seen.has(Core.safeMediaUrl(attachmentAnchor.href))) return;
       const url = [
         element.currentSrc,
         element.getAttribute("src"),
@@ -581,7 +602,8 @@
       content, attachments, media, messageTimestamp: timeElement?.getAttribute("datetime") || null,
       groupRootMessageId,
       sourceContinuation: Boolean(groupRootMessageId && groupRootMessageId !== identity.messageId),
-      capturedAt: now, updatedAt: now, status: "seen"
+      capturedAt: now, updatedAt: now, status: "seen",
+      captureSessionId, captureSequence: captureSequence += 1
     }, presentationFromNode(node, timeElement)));
   }
 
@@ -675,8 +697,10 @@
       state.recentRemovals.clear();
       state.pendingRetainedKeys.clear();
       state.pendingConfirmedMounts.clear();
+      state.pendingEdits.clear();
       state.pendingRecords.clear();
       state.signatures.clear();
+      removeEditHistories();
     }
     state.archive = archive;
     state.generation = incomingGeneration;
@@ -684,13 +708,15 @@
     if (wasPaused && !state.paused) state.lastMediaRecoveryAt = -Infinity;
     requestMediaRecovery(archive);
     reconcileTombstones();
+    reconcileEditHistories();
     applyRetainedStyles();
     if (wasPaused && !state.paused) requestAnimationFrame(() => snapshotRenderedMessages(true));
   }
 
   function requestMediaRecovery(archive) {
     if (!archive || archive.paused || performance.now() - state.lastMediaRecoveryAt < 5 * 60 * 1000) return;
-    const keys = archive.records.filter((record) => record.media?.some((item) => item.cacheable))
+    const keys = archive.records.filter((record) => [record, ...(record.editHistory || [])]
+      .some((version) => version.media?.some((item) => item.cacheable)))
       .map(Core.recordKey);
     state.lastMediaRecoveryAt = performance.now();
     for (let offset = 0; offset < keys.length; offset += 200) {
@@ -926,6 +952,71 @@
     state.spacingFrame = requestAnimationFrame(rebalanceTombstoneSpacing);
   }
 
+  function configureMediaFrame(frame, key, revisionId) {
+    const onSize = (event) => {
+      if (event.source !== frame.contentWindow || event.origin !== extensionFrameOrigin() || event.data?.type !== "LDMA_MEDIA_SIZE") return;
+      const width = Math.max(40, Math.min(550, Math.ceil(Number(event.data.width) || 550)));
+      const height = Math.max(24, Math.min(1600, Math.ceil(Number(event.data.height) || 40)));
+      frame.style.width = `${width}px`;
+      frame.style.height = `${height}px`;
+      const owner = frame.getRootNode()?.host?.closest?.("[data-ldma-tombstone], [data-ldma-edit-history]");
+      if (owner) {
+        owner.dataset.ldmaMediaWidth = String(width);
+        owner.dataset.ldmaMediaHeight = String(height);
+      }
+      scheduleTombstoneSpacing();
+    };
+    window.addEventListener("message", onSize);
+    frame.addEventListener("load", () => {
+      send({ type: T.CREATE_MEDIA_CAPABILITY, key, revisionId: revisionId || undefined }).then((response) => {
+        if (!response.ok || !response.capability || !frame.contentWindow || !frame.src) return;
+        frame.contentWindow.postMessage({
+          type: "LDMA_MEDIA_CAPABILITY",
+          capability: response.capability
+        }, extensionFrameOrigin());
+      }).catch(() => {});
+    });
+    return () => {
+      window.removeEventListener("message", onSize);
+      frame.removeAttribute("src");
+    };
+  }
+
+  function createRevisionPayload(record, key, tone, marker) {
+    const payload = document.createElement("section");
+    payload.className = `revision ${tone}`;
+    payload.setAttribute("role", "note");
+    payload.setAttribute("aria-label", tone === "edited" ? "Earlier edited message version" : "Deleted message version");
+    const line = document.createElement("div");
+    line.className = "content-line";
+    const content = document.createElement("span");
+    content.className = "content";
+    replaceText(content, record.content || "");
+    const label = document.createElement("span");
+    label.className = "lifecycle-label";
+    label.textContent = marker;
+    line.append(content, label);
+    const attachments = document.createElement("div");
+    attachments.className = "attachments";
+    const hasMedia = Array.isArray(record.media) && record.media.length > 0;
+    if (!hasMedia) attachments.replaceChildren(...(record.attachments || []).slice(0, 12).map((nameValue) => {
+      const item = document.createElement("div");
+      item.className = "attachment";
+      replaceText(item, `Attachment: ${nameValue}`);
+      return item;
+    }));
+    const mediaFrame = document.createElement("iframe");
+    mediaFrame.className = "media-frame";
+    mediaFrame.title = tone === "edited" ? "Locally cached media from an earlier edit" : "Locally cached deleted-message media";
+    mediaFrame.loading = "lazy";
+    mediaFrame.hidden = !hasMedia;
+    mediaFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads");
+    const disposeMedia = configureMediaFrame(mediaFrame, key, record.revisionId || null);
+    if (hasMedia) mediaFrame.src = new URL(chrome.runtime.getURL("media/view.html")).href;
+    payload.append(line, attachments, mediaFrame);
+    return { element: payload, dispose: disposeMedia };
+  }
+
   function createTombstoneRenderer(host, key) {
     dropTombstoneRenderer(key);
     const mount = document.createElement("div");
@@ -955,12 +1046,18 @@
       .app-badge { gap:2px; background:#5865f2; color:#fff; }
       .app-check { font-size:11px; line-height:1; }
       .timestamp { margin-left:6px; color:#949ba4; font-size:12px; font-weight:400; white-space:nowrap; }
+      .history { display:grid; gap:2px; }
+      .revision { min-width:0; margin-inline:-6px; padding:1px 6px 3px; border-radius:4px; }
+      .revision.edited { background:rgb(240 178 50 / 8%); }
+      .revision.edited:hover { background:rgb(240 178 50 / 11%); }
       .content-line { min-width:0; line-height:22px; }
       .content { color:#f23f42; white-space:pre-wrap; overflow-wrap:anywhere; }
-      .deleted { margin-left:4px; color:#ff6b70; font-size:11px; font-weight:750; white-space:nowrap; }
+      .revision.edited .content { color:#f0b232; }
+      .lifecycle-label,.deleted { margin-left:4px; color:#ff6b70; font-size:11px; font-weight:750; white-space:nowrap; }
+      .revision.edited .lifecycle-label { color:#f5c451; }
       .attachments { color:#00a8fc; font-size:14px; line-height:20px; overflow-wrap:anywhere; }
       .attachment::before { content:"↳ "; color:#949ba4; }
-      .media-frame { display:block; width:100%; height:480px; margin:8px 0 2px; border:0; border-radius:8px; background:#1e1f22; }
+      .media-frame { display:block; width:min(550px,100%); max-width:100%; height:40px; margin:4px 0 2px; border:0; border-radius:8px; background:transparent; }
       [hidden] { display:none !important; }
     `);
     shadow.adoptedStyleSheets = [sheet];
@@ -995,6 +1092,10 @@
     const timestamp = document.createElement("time");
     timestamp.className = "timestamp";
     header.append(authorGroup, timestamp);
+    const history = document.createElement("div");
+    history.className = "history";
+    history.setAttribute("role", "group");
+    history.setAttribute("aria-label", "Earlier edited versions");
     const contentLine = document.createElement("div");
     contentLine.className = "content-line";
     const content = document.createElement("span");
@@ -1011,16 +1112,8 @@
     mediaFrame.loading = "lazy";
     mediaFrame.hidden = true;
     mediaFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads");
-    mediaFrame.addEventListener("load", () => {
-      send({ type: T.CREATE_MEDIA_CAPABILITY, key }).then((response) => {
-        if (!response.ok || !response.capability || !mediaFrame.contentWindow || !mediaFrame.src) return;
-        mediaFrame.contentWindow.postMessage({
-          type: "LDMA_MEDIA_CAPABILITY",
-          capability: response.capability
-        }, extensionFrameOrigin());
-      }).catch(() => {});
-    });
-    body.append(reply, header, contentLine, attachments, mediaFrame);
+    const disposeCurrentMedia = configureMediaFrame(mediaFrame, key, null);
+    body.append(reply, header, history, contentLine, attachments, mediaFrame);
     article.append(avatar, body);
     shadow.append(article);
 
@@ -1034,6 +1127,8 @@
     let badgeSignature = "";
     let lastRecord = null;
     let continuation = false;
+    let historySignature = "";
+    let historyDisposers = [];
     const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
     function createBadge(badge) {
@@ -1143,13 +1238,24 @@
       reply.hidden = !record.replyPreview;
       replaceText(reply, record.replyPreview || "");
       replaceText(content, record.content || "");
-      attachments.replaceChildren(...(record.attachments || []).slice(0, 12).map((nameValue) => {
+      const revisions = Core.sanitizeEditHistory(record.editHistory);
+      host.dataset.ldmaEditCount = String(revisions.length);
+      const nextHistorySignature = JSON.stringify(revisions);
+      if (nextHistorySignature !== historySignature) {
+        historySignature = nextHistorySignature;
+        historyDisposers.forEach((dispose) => dispose());
+        historyDisposers = [];
+        const rendered = revisions.map((revision) => createRevisionPayload(revision, key, "edited", "• EDITED"));
+        history.replaceChildren(...rendered.map((item) => item.element));
+        historyDisposers = rendered.map((item) => item.dispose);
+      }
+      const hasMedia = Array.isArray(record.media) && record.media.length > 0;
+      attachments.replaceChildren(...(hasMedia ? [] : (record.attachments || []).slice(0, 12)).map((nameValue) => {
         const item = document.createElement("div");
         item.className = "attachment";
         replaceText(item, `Attachment: ${nameValue}`);
         return item;
       }));
-      const hasMedia = Array.isArray(record.media) && record.media.length > 0;
       mediaFrame.hidden = !hasMedia;
       if (hasMedia && !mediaFrame.hasAttribute("src")) {
         const viewerUrl = new URL(chrome.runtime.getURL("media/view.html"));
@@ -1161,7 +1267,7 @@
       avatarImage.hidden = !avatarUrl;
       if (avatarUrl) avatarImage.src = avatarUrl;
       else avatarImage.removeAttribute("src");
-      article.setAttribute("aria-label", `${name}, deleted message preserved locally`);
+      article.setAttribute("aria-label", `${name}, ${revisions.length ? `${revisions.length} earlier edited version${revisions.length === 1 ? "" : "s"}, ` : ""}deleted message preserved locally`);
     };
     render.setContinuation = (value) => {
       const next = Boolean(value);
@@ -1182,10 +1288,126 @@
       authorAnimation = null;
       avatarImage.removeAttribute("src");
       badges.replaceChildren();
-      mediaFrame.removeAttribute("src");
+      historyDisposers.forEach((dispose) => dispose());
+      historyDisposers = [];
+      disposeCurrentMedia();
     };
     state.tombstoneRenderers.set(key, render);
     return render;
+  }
+
+  function dropEditRenderer(key) {
+    const renderer = state.editRenderers.get(key);
+    if (renderer?.dispose) renderer.dispose();
+    state.editRenderers.delete(key);
+  }
+
+  function createLiveEditRenderer(host, key) {
+    dropEditRenderer(key);
+    const mount = document.createElement("div");
+    mount.className = "ldma-edit-history__mount";
+    host.append(mount);
+    const shadow = mount.attachShadow({ mode: "closed" });
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(`
+      :host { display:block; min-width:0; max-width:100%; color:#dbdee1; font:16px/1.375 "gg sans","Noto Sans","Helvetica Neue",Helvetica,Arial,sans-serif; }
+      * { box-sizing:border-box; }
+      .history { display:grid; gap:2px; margin:0 0 2px; }
+      .revision { min-width:0; margin-inline:-6px; padding:1px 6px 3px; border-radius:4px; }
+      .revision.edited { background:rgb(240 178 50 / 8%); }
+      .revision.edited:hover { background:rgb(240 178 50 / 11%); }
+      .content-line { min-width:0; line-height:22px; }
+      .content { color:#f0b232; white-space:pre-wrap; overflow-wrap:anywhere; }
+      .lifecycle-label { margin-left:4px; color:#f5c451; font-size:11px; font-weight:750; white-space:nowrap; }
+      .attachments { color:#00a8fc; font-size:14px; line-height:20px; overflow-wrap:anywhere; }
+      .attachment::before { content:"↳ "; color:#949ba4; }
+      .media-frame { display:block; width:min(550px,100%); max-width:100%; height:40px; margin:4px 0 2px; border:0; border-radius:8px; background:transparent; }
+      [hidden] { display:none !important; }
+    `);
+    shadow.adoptedStyleSheets = [sheet];
+    const history = document.createElement("div");
+    history.className = "history";
+    history.setAttribute("role", "group");
+    history.setAttribute("aria-label", "Earlier edited versions preserved locally");
+    shadow.append(history);
+    let signature = "";
+    let disposers = [];
+    const render = (record) => {
+      const revisions = Core.sanitizeEditHistory(record.editHistory);
+      host.dataset.ldmaEditCount = String(revisions.length);
+      const nextSignature = JSON.stringify(revisions);
+      if (signature === nextSignature) return;
+      signature = nextSignature;
+      disposers.forEach((dispose) => dispose());
+      const rendered = revisions.map((revision) => createRevisionPayload(revision, key, "edited", "• EDITED"));
+      history.replaceChildren(...rendered.map((item) => item.element));
+      disposers = rendered.map((item) => item.dispose);
+    };
+    render.dispose = () => {
+      disposers.forEach((dispose) => dispose());
+      disposers = [];
+      history.replaceChildren();
+    };
+    state.editRenderers.set(key, render);
+    return render;
+  }
+
+  function editHistoryInsertion(row, messageId) {
+    if (!row) return null;
+    const exactContent = document.getElementById(`message-content-${messageId}`);
+    const content = exactContent && row.contains(exactContent) ? exactContent :
+      [...row.querySelectorAll("[class*='messageContent_']")].find((node) => !node.closest("[class*='repliedMessage_'], [class*='reply_']"));
+    if (content?.parentElement) return { parent: content.parentElement, reference: content };
+    const body = row.querySelector("[class*='contents_']");
+    if (!body) return null;
+    const reference = body.querySelector("[class*='embed_'], [class*='attachment_'], [class*='mediaAttachmentsContainer_']");
+    return { parent: body, reference };
+  }
+
+  function removeEditHistories() {
+    for (const key of [...state.editRenderers.keys()]) dropEditRenderer(key);
+    document.querySelectorAll("[data-ldma-edit-history]").forEach((host) => host.remove());
+  }
+
+  function reconcileEditHistories(activeValue) {
+    const active = activeValue || findActiveMessageList();
+    const eligible = new Map(state.archive.records.filter((record) => record.status === "seen" && Core.hasEdits(record))
+      .map((record) => [Core.recordKey(record), record]));
+    const connectedKeys = new Set();
+    document.querySelectorAll("[data-ldma-edit-history]").forEach((host) => {
+      const key = host.dataset.ldmaMessageKey;
+      const record = eligible.get(key);
+      const row = host.closest(MESSAGE_SELECTOR);
+      const identity = rowIdentity(row);
+      const valid = Boolean(active && record && active.node.contains(host) && identity &&
+        `${active.route.channelId}:${identity.messageId}` === key);
+      if (!valid) {
+        dropEditRenderer(key);
+        host.remove();
+      } else connectedKeys.add(key);
+    });
+    for (const row of active?.rows || []) {
+      const identity = rowIdentity(row);
+      const key = identity && `${active.route.channelId}:${identity.messageId}`;
+      const record = key && eligible.get(key);
+      if (!record) continue;
+      let host = row.querySelector(`[data-ldma-edit-history][data-ldma-message-key="${key}"]`);
+      if (!host) {
+        const insertion = editHistoryInsertion(row, identity.messageId);
+        if (!insertion) continue;
+        host = document.createElement("div");
+        host.dataset.ldmaEditHistory = "true";
+        host.dataset.ldmaMessageKey = key;
+        insertion.parent.insertBefore(host, insertion.reference || null);
+      }
+      let renderer = state.editRenderers.get(key);
+      if (!renderer) renderer = createLiveEditRenderer(host, key);
+      renderer(record);
+      connectedKeys.add(key);
+    }
+    for (const key of [...state.editRenderers.keys()]) {
+      if (!connectedKeys.has(key)) dropEditRenderer(key);
+    }
   }
 
   function insertTombstone(record, active, replacementNode) {
@@ -1442,9 +1664,14 @@
         state.snapshotsByKey.set(Core.recordKey(record), snapshot);
         while (state.snapshotsByKey.size > 2500) state.snapshotsByKey.delete(state.snapshotsByKey.keys().next().value);
       }
-      if (record) { retractIfReappeared(record); if (persist) queueRecord(record); }
+      if (record) {
+        verifyPendingEditsForRecord(record);
+        retractIfReappeared(record);
+        if (persist) queueRecord(record);
+      }
     });
     reconcileTombstones();
+    reconcileEditHistories(active);
     applyRetainedStyles();
   }
 
@@ -1742,7 +1969,123 @@
     }
   }
 
+  function discardPendingEdit(pendingId, pending) {
+    if (state.pendingEdits.get(pendingId) !== pending) return;
+    state.pendingEdits.delete(pendingId);
+  }
+
+  function commitPendingEdit(pendingId, pending) {
+    if (state.pendingEdits.get(pendingId) !== pending || pending.sending || pending.generation !== state.generation || state.paused) return;
+    pending.sending = true;
+    send({
+      type: T.CONFIRM_EDIT,
+      generation: pending.generation,
+      record: pending.baseline,
+      editedAt: pending.editedAt,
+      editSessionId: pending.editSessionId,
+      editSequence: pending.editSequence
+    }).then((response) => {
+      if (response.archive) applyArchive(response.archive);
+      if (response.ok) {
+        discardPendingEdit(pendingId, pending);
+        send({ type: T.CACHE_MEDIA, generation: pending.generation, keys: [pending.recordKey] }).catch(() => {});
+        return;
+      }
+      pending.sending = false;
+      if (!["broker-unavailable", "broker-error"].includes(response.reason) || pending.attempts >= 4 ||
+        performance.now() >= pending.expiresAt) {
+        discardPendingEdit(pendingId, pending);
+        return;
+      }
+      pending.attempts += 1;
+      setTimeout(() => commitPendingEdit(pendingId, pending), Math.min(2000, 150 * (2 ** pending.attempts)));
+    }).catch(() => {
+      pending.sending = false;
+      if (pending.attempts >= 4 || performance.now() >= pending.expiresAt) discardPendingEdit(pendingId, pending);
+      else {
+        pending.attempts += 1;
+        setTimeout(() => commitPendingEdit(pendingId, pending), Math.min(2000, 150 * (2 ** pending.attempts)));
+      }
+    });
+  }
+
+  function verifyPendingEdit(pendingId, pending, renderedRecord) {
+    if (state.pendingEdits.get(pendingId) !== pending || pending.generation !== state.generation || state.paused ||
+      performance.now() >= pending.expiresAt) {
+      discardPendingEdit(pendingId, pending);
+      return;
+    }
+    if (state.route?.channelId !== pending.channelId) return;
+    const row = retainedRow(pending.channelId, pending.messageId, state.activeList) ||
+      findMessage(pending.messageId, state.activeList ? uniqueMessageNodes(state.activeList, state.route) : []);
+    const current = renderedRecord && Core.recordKey(renderedRecord) === pending.recordKey
+      ? renderedRecord
+      : row && recordFromNode(row, Date.now());
+    // The MAIN-world lifecycle signal contains IDs only. Persist its staged
+    // baseline only after the isolated world observes the exact row's semantic
+    // text/media payload change. No-op or forged events therefore write nothing.
+    if (current && Core.editPayloadSignature(current) !== pending.baselineSignature) {
+      commitPendingEdit(pendingId, pending);
+    }
+  }
+
+  function verifyPendingEditsForRecord(record) {
+    const key = Core.recordKey(record);
+    for (const [pendingId, pending] of state.pendingEdits) {
+      if (pending.recordKey === key) verifyPendingEdit(pendingId, pending, record);
+    }
+  }
+
+  function confirmEditLifecycle(message) {
+    const channelId = String(message?.channelId || "");
+    const messageId = String(message?.ids?.[0] || "");
+    const editSessionId = Core.normalizeText(message?.editSessionId).slice(0, 100);
+    const editSequence = Math.max(0, Math.floor(Number(message?.editSequence) || 0));
+    const editedAt = Number(message?.editedAt);
+    if (state.paused || state.route?.channelId !== channelId || !SNOWFLAKE.test(channelId) || !SNOWFLAKE.test(messageId) ||
+      !editSessionId || !editSequence || !Number.isFinite(editedAt) || editedAt <= 0) return;
+    const key = `${channelId}:${messageId}`;
+    const row = retainedRow(channelId, messageId, state.activeList) || findMessage(messageId, state.activeList ? uniqueMessageNodes(state.activeList, state.route) : []);
+    const baseline = (row && recordFromNode(row, Date.now())) || state.snapshotsByKey.get(key)?.record ||
+      state.archive.records.find((record) => Core.recordKey(record) === key);
+    if (!baseline) return;
+    const pendingId = `${key}|${editSessionId}:${editSequence}`;
+    if (state.pendingEdits.has(pendingId)) return;
+    const pending = {
+      baseline,
+      baselineSignature: Core.editPayloadSignature(baseline),
+      recordKey: key,
+      channelId,
+      messageId,
+      editedAt,
+      editSessionId,
+      editSequence,
+      generation: state.generation,
+      // Virtualized/off-route rows can remain absent for a long time. Keep the
+      // already-captured baseline bounded in memory until that exact message is
+      // rendered again, rather than letting an ordinary later upsert erase it.
+      expiresAt: performance.now() + 30 * 60 * 1000,
+      attempts: 0,
+      sending: false
+    };
+    state.pendingEdits.set(pendingId, pending);
+    while (state.pendingEdits.size > 500) state.pendingEdits.delete(state.pendingEdits.keys().next().value);
+    for (const delayMs of [0, 16, 50, 150, 350, 750]) {
+      setTimeout(() => {
+        snapshotRenderedMessages(true);
+        verifyPendingEdit(pendingId, pending);
+      }, delayMs);
+    }
+    setTimeout(() => discardPendingEdit(pendingId, pending), 30 * 60 * 1000 + 1000);
+  }
+
   function installPageBridge() {
+    window.addEventListener(EDIT_EVENT, (event) => {
+      let message = null;
+      try { message = JSON.parse(String(event.detail || "")); } catch (_error) { return; }
+      if (!message || message.bridge !== BRIDGE || message.kind !== "edit-before") return;
+      confirmEditLifecycle(message);
+    });
     window.addEventListener("message", (event) => {
       const message = event.data;
       if (event.source !== window || !message || message.bridge !== BRIDGE) return;
@@ -1750,6 +2093,10 @@
         state.pageHookStatus = message.status;
         state.pageHookDetail = Core.normalizeText(message.detail).slice(0, 220) || "Discord deletion event hook status unavailable.";
         reportCombinedHealth(state.activeList && { node: state.activeList });
+        return;
+      }
+      if (message.kind === "edit-before") {
+        confirmEditLifecycle(message);
         return;
       }
       if (!SNOWFLAKE.test(String(message.channelId || "")) || !Array.isArray(message.ids)) return;
@@ -1777,6 +2124,7 @@
       state.activeList = null;
       state.listIdentity = null;
       removeTombstone();
+      removeEditHistories();
       setTimeout(() => snapshotRenderedMessages(true), Core.DEFAULTS.routeQuietMs + 50);
     }
   }

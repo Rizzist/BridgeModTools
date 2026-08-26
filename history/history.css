@@ -88,7 +88,13 @@ button.danger:hover { background: #6b333a; }
 .record__meta { margin-top: 3px; color: #949ba4; font-size: 11px; }
 .record__content { margin: 11px 0 0; color: #dbdee1; font-size: 14px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
 .record__attachments { margin: 8px 0 0; color: #9cb9ff; font-size: 12px; }
-.record__media { display: block; width: 100%; height: 480px; margin: 10px 0 0; border: 0; border-radius: 8px; background: #1e1f22; }
+.record__revisions { display: grid; gap: 5px; margin-top: 10px; }
+.record__revision { padding: 8px 10px; border-left: 3px solid #f0b232; border-radius: 4px; background: #332f27; }
+.record__revision strong { color: #f5c451; font-size: 10px; letter-spacing: .04em; }
+.record__revision p { margin-top: 4px; color: #f0b232; font-size: 14px; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; }
+.record__revision .record__revision-attachments { color: #9cb9ff; font-size: 12px; }
+.record__media { display: block; width: min(550px, 100%); max-width: 100%; height: 40px; margin: 10px 0 0; border: 0; border-radius: 8px; background: transparent; }
+.record__revision-media { margin-top: 6px; }
 .badge { display: inline-block; margin-right: 6px; padding: 2px 6px; border-radius: 99px; background: #404249; color: #b5bac1; font-size: 10px; font-weight: 750; text-transform: uppercase; }
 .badge.deleted { background: #4a3b25; color: #f0b232; }
 .record__delete { flex: 0 0 auto; padding: 6px 8px; background: transparent; color: #f28d93; }

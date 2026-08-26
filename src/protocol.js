@@ -6,6 +6,7 @@
     GET_ARCHIVE: "LDMA_GET_ARCHIVE",
     GET_RECORD: "LDMA_GET_RECORD",
     UPSERT_RECORDS: "LDMA_UPSERT_RECORDS",
+    CONFIRM_EDIT: "LDMA_CONFIRM_EDIT",
     CONFIRM_DELETED: "LDMA_CONFIRM_DELETED",
     INFER_DELETED: "LDMA_INFER_DELETED",
     RETRACT_MESSAGE: "LDMA_RETRACT_MESSAGE",
@@ -22,7 +23,7 @@
 
   function emptyArchive() {
     return {
-      version: 4,
+      version: 5,
       generation: 0,
       revision: 0,
       paused: false,
@@ -39,7 +40,7 @@
     const base = emptyArchive();
     if (!value || !Array.isArray(value.records)) return base;
     return Object.assign(base, value, {
-      version: 4,
+      version: 5,
       generation: Number.isInteger(value.generation) ? value.generation : 0,
       revision: Number.isInteger(value.revision) ? value.revision : 0,
       paused: Boolean(value.paused),
@@ -107,7 +108,7 @@
     }
 
     if (stale(archive, command)) return unchanged(false, "stale-generation", archive);
-    if (archive.paused && (command.type === TYPES.UPSERT_RECORDS || command.type === TYPES.CONFIRM_DELETED || command.type === TYPES.INFER_DELETED)) {
+    if (archive.paused && (command.type === TYPES.UPSERT_RECORDS || command.type === TYPES.CONFIRM_EDIT || command.type === TYPES.CONFIRM_DELETED || command.type === TYPES.INFER_DELETED)) {
       return unchanged(false, "paused", archive);
     }
 
@@ -116,6 +117,56 @@
         records: Core.mergeRecords(archive.records, command.records || [], { now })
       });
       return { archive: next, accepted: true, changed: true, reason: "records-upserted", data: next };
+    }
+    if (command.type === TYPES.CONFIRM_EDIT) {
+      const baseline = Core.sanitizeRecordPresentation(command.record);
+      if (!baseline?.messageId || !baseline?.channelId) return unchanged(false, "missing-record");
+      const sessionId = Core.normalizeText(command.editSessionId).slice(0, 100);
+      const sequence = Math.max(0, Math.floor(Number(command.editSequence) || 0));
+      const supersededAt = Number(command.editedAt);
+      if (!sessionId || !sequence || !Number.isFinite(supersededAt) || supersededAt <= 0) {
+        return unchanged(false, "invalid-edit-lifecycle");
+      }
+      const key = Core.recordKey(baseline);
+      const existing = archive.records.find((record) => Core.recordKey(record) === key) || null;
+      const revisionId = `${sessionId}:${sequence}`;
+      if (existing?.editHistory?.some((revision) => revision.revisionId === revisionId)) {
+        return unchanged(true, "duplicate-edit", archive);
+      }
+      const revision = Core.editRevisionFromRecord(baseline, { revisionId, supersededAt });
+      const history = Core.sanitizeEditHistory([...(existing?.editHistory || []), revision]
+        .sort((left, right) => (Number(left.supersededAt) || 0) - (Number(right.supersededAt) || 0) ||
+          String(left.revisionId || "").localeCompare(String(right.revisionId || ""))));
+      const olderSameSession = existing?.editSessionId === sessionId && Number(existing.lastEditSequence) >= sequence;
+      if (olderSameSession) {
+        if (JSON.stringify(history) === JSON.stringify(existing.editHistory || [])) {
+          return unchanged(true, "duplicate-edit-payload", archive);
+        }
+        const next = changedArchive(archive, {
+          records: Core.pruneRecords([
+            ...archive.records.filter((record) => Core.recordKey(record) !== key),
+            Object.assign({}, existing, { editHistory: history, updatedAt: now })
+          ])
+        });
+        return { archive: next, accepted: true, changed: true, reason: "out-of-order-edit", data: next };
+      }
+      if (existing && Number(existing.lastEditedAt) >= supersededAt) {
+        return unchanged(true, "stale-edit", archive);
+      }
+      const current = Object.assign({}, existing || baseline, {
+        editHistory: history,
+        lastEditedAt: supersededAt,
+        editSessionId: sessionId,
+        lastEditSequence: sequence,
+        updatedAt: now
+      });
+      const next = changedArchive(archive, {
+        records: Core.pruneRecords([
+          ...archive.records.filter((record) => Core.recordKey(record) !== key),
+          current
+        ])
+      });
+      return { archive: next, accepted: true, changed: true, reason: "edit-confirmed", data: next };
     }
     if (command.type === TYPES.CONFIRM_DELETED) {
       const deletions = (Array.isArray(command.deletions) ? command.deletions : []).slice(0, 200);

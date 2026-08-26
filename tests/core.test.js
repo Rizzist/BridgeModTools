@@ -123,6 +123,83 @@ test("merge never downgrades a Discord-confirmed deletion", () => {
   assert.equal(merged[0].status, "confirmed_deleted");
   assert.equal(merged[0].confirmedDeletedAt, 50);
   assert.equal(merged[0].deletionSource, "discord_lifecycle");
+  assert.equal(merged[0].content, "old");
+});
+
+test("edit payload signatures ignore presentation churn but detect text and media changes", () => {
+  const base = {
+    content: "hello   world",
+    attachments: ["clip.gif"],
+    media: [{
+      url: "https://cdn.discordapp.com/attachments/111111111111111/222222222222222/clip.gif?ex=one&is=two",
+      kind: "image", source: "attachment", name: "clip.gif", width: 80, height: 80
+    }]
+  };
+  assert.equal(Core.editPayloadSignature(base), Core.editPayloadSignature(Object.assign({}, base, {
+    content: "hello   world",
+    authorColor: "red",
+    channelName: "renamed",
+    media: [{
+      url: "https://cdn.discordapp.com/attachments/111111111111111/222222222222222/clip.gif?ex=rotated&is=new",
+      kind: "image", source: "attachment", name: "clip.gif", width: 80, height: 80
+    }]
+  })));
+  assert.equal(Core.editPayloadSignature(base), Core.editPayloadSignature(Object.assign({}, base, {
+    media: [Object.assign({}, base.media[0], {
+      width: 320,
+      height: 180,
+      mimeType: "image/gif",
+      alt: "hydrated alt",
+      posterUrl: "https://media.discordapp.net/attachments/111111111111111/222222222222222/poster.png"
+    })]
+  })));
+  assert.notEqual(Core.editPayloadSignature(base), Core.editPayloadSignature(Object.assign({}, base, { content: "hello world" })));
+  assert.notEqual(Core.editPayloadSignature(base), Core.editPayloadSignature(Object.assign({}, base, { content: "changed" })));
+  assert.notEqual(Core.editPayloadSignature(base), Core.editPayloadSignature(Object.assign({}, base, { media: [] })));
+});
+
+test("edit history is sanitized, bounded, keeps the original, and remains searchable", () => {
+  const revisions = Array.from({ length: 25 }, (_, index) => ({
+    revisionId: `session:${index + 1}`,
+    content: `revision ${index}`,
+    attachments: [`file-${index}.txt`],
+    media: [{ url: `https://cdn.discordapp.com/attachments/111111111111111/${String(300000000000000 + index)}/file.png`, kind: "image" }],
+    capturedAt: index + 1,
+    supersededAt: index + 2
+  }));
+  const sanitized = Core.sanitizeEditHistory(revisions, { maxEditRevisions: 5, maxEditBytes: 100000 });
+  assert.equal(sanitized.length, 5);
+  assert.equal(sanitized[0].content, "revision 0");
+  assert.deepEqual(sanitized.slice(1).map((revision) => revision.content), ["revision 21", "revision 22", "revision 23", "revision 24"]);
+  const record = { messageId: "1", channelId: "2", status: "seen", content: "current", editHistory: sanitized, updatedAt: 30 };
+  assert.equal(Core.hasEdits(record), true);
+  assert.equal(Core.searchRecords([record], "revision 22", "all").length, 1);
+  const hostile = Core.sanitizeRecordPresentation(Object.assign({}, record, {
+    editHistory: [{ revisionId: "x", content: "old", media: [{ url: "javascript:alert(1)" }] }]
+  }));
+  assert.deepEqual(hostile.editHistory[0].media, []);
+});
+
+test("edit history preserves formatting-only revisions and handles a one-revision bound", () => {
+  const formatted = Core.sanitizeEditHistory([
+    { revisionId: "a", content: "hello\nworld", supersededAt: 1 },
+    { revisionId: "b", content: "hello world", supersededAt: 2 },
+    { revisionId: "c", content: "hello  world", supersededAt: 3 }
+  ]);
+  assert.deepEqual(formatted.map((revision) => revision.content), ["hello\nworld", "hello world", "hello  world"]);
+  const bounded = Core.sanitizeEditHistory(formatted, { maxEditRevisions: 1 });
+  assert.deepEqual(bounded.map((revision) => revision.revisionId), ["a"]);
+});
+
+test("same-session stale captures cannot roll the current payload backward", () => {
+  const current = {
+    messageId: "10", channelId: "20", content: "new", status: "seen",
+    captureSessionId: "page-a", captureSequence: 3, capturedAt: 30
+  };
+  const stale = Object.assign({}, current, { content: "old", captureSequence: 2, capturedAt: 20 });
+  const merged = Core.mergeRecords([current], [stale], { now: 40 });
+  assert.equal(merged[0].content, "new");
+  assert.equal(merged[0].captureSequence, 3);
 });
 
 test("prunes deterministically by record and byte caps", () => {

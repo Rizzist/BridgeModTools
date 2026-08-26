@@ -32,6 +32,130 @@ test("pause advances generation and rejects captures while paused", () => {
   assert.equal(current.reason, "paused");
 });
 
+test("genuine edit lifecycle preserves multiple prior payloads without changing deletion status", () => {
+  const original = seen("2", 1);
+  original.content = "A";
+  let archive = Object.assign(Protocol.emptyArchive(), { records: [original] });
+  const editA = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_EDIT,
+    generation: 0,
+    record: original,
+    editedAt: 100,
+    editSessionId: "page-session",
+    editSequence: 1
+  }, 100);
+  assert.equal(editA.accepted, true);
+  assert.equal(editA.archive.records[0].editHistory[0].content, "A");
+  assert.equal(editA.archive.records[0].status, "seen");
+
+  const versionB = Object.assign(seen("2", 110), { content: "B", captureSessionId: "capture", captureSequence: 2 });
+  archive = Protocol.applyCommand(editA.archive, {
+    type: T.UPSERT_RECORDS, generation: 0, records: [versionB]
+  }, 110).archive;
+  assert.equal(archive.records[0].content, "B");
+  assert.deepEqual(archive.records[0].editHistory.map((revision) => revision.content), ["A"]);
+
+  archive = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_EDIT,
+    generation: 0,
+    record: versionB,
+    editedAt: 120,
+    editSessionId: "page-session",
+    editSequence: 2
+  }, 120).archive;
+  const versionC = Object.assign(seen("2", 130), { content: "C", captureSessionId: "capture", captureSequence: 3 });
+  archive = Protocol.applyCommand(archive, {
+    type: T.UPSERT_RECORDS, generation: 0, records: [versionC]
+  }, 130).archive;
+  assert.deepEqual(archive.records[0].editHistory.map((revision) => revision.content), ["A", "B"]);
+  assert.equal(archive.records[0].content, "C");
+
+  const duplicate = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_EDIT,
+    generation: 0,
+    record: versionB,
+    editedAt: 120,
+    editSessionId: "page-session",
+    editSequence: 2
+  }, 140);
+  assert.equal(duplicate.changed, false);
+  assert.equal(duplicate.reason, "duplicate-edit");
+
+  const staleAcrossSession = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_EDIT,
+    generation: 0,
+    record: versionB,
+    editedAt: 120,
+    editSessionId: "reloaded-page-session",
+    editSequence: 1
+  }, 150);
+  assert.equal(staleAcrossSession.changed, false);
+  assert.equal(staleAcrossSession.reason, "stale-edit");
+  assert.deepEqual(staleAcrossSession.archive.records[0].editHistory.map((revision) => revision.content), ["A", "B"]);
+  const olderAcrossSession = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_EDIT,
+    generation: 0,
+    record: versionB,
+    editedAt: 119,
+    editSessionId: "another-page-session",
+    editSequence: 1
+  }, 151);
+  assert.equal(olderAcrossSession.reason, "stale-edit");
+});
+
+test("edit history compounds with deletion and late seen capture cannot overwrite the deleted latest payload", () => {
+  const original = Object.assign(seen("2", 1), { content: "original" });
+  let archive = Protocol.applyCommand(Object.assign(Protocol.emptyArchive(), { records: [original] }), {
+    type: T.CONFIRM_EDIT, generation: 0, record: original, editedAt: 10,
+    editSessionId: "session", editSequence: 1
+  }, 10).archive;
+  const edited = Object.assign(seen("2", 20), { content: "edited" });
+  archive = Protocol.applyCommand(archive, {
+    type: T.UPSERT_RECORDS, generation: 0, records: [edited]
+  }, 20).archive;
+  archive = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_DELETED,
+    generation: 0,
+    deletions: [{ record: edited, source: "message_store_preserved" }]
+  }, 30).archive;
+  assert.equal(archive.records[0].status, "confirmed_deleted");
+  assert.equal(archive.records[0].content, "edited");
+  assert.deepEqual(archive.records[0].editHistory.map((revision) => revision.content), ["original"]);
+  const late = Protocol.applyCommand(archive, {
+    type: T.UPSERT_RECORDS,
+    generation: 0,
+    records: [Object.assign(seen("2", 40), { content: "stale" })]
+  }, 40).archive;
+  assert.equal(late.records[0].content, "edited");
+  assert.deepEqual(late.records[0].editHistory.map((revision) => revision.content), ["original"]);
+});
+
+test("out-of-order same-session edit retries preserve every novel baseline without rolling back the cursor", () => {
+  const original = Object.assign(seen("2", 1), { content: "current" });
+  let archive = Object.assign(Protocol.emptyArchive(), { records: [original] });
+  archive = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_EDIT,
+    generation: 0,
+    record: Object.assign({}, original, { content: "B" }),
+    editedAt: 200,
+    editSessionId: "session",
+    editSequence: 2
+  }, 200).archive;
+  const lateEarlier = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_EDIT,
+    generation: 0,
+    record: Object.assign({}, original, { content: "A" }),
+    editedAt: 100,
+    editSessionId: "session",
+    editSequence: 1
+  }, 210);
+  assert.equal(lateEarlier.reason, "out-of-order-edit");
+  assert.deepEqual(lateEarlier.archive.records[0].editHistory.map((revision) => revision.content), ["A", "B"]);
+  assert.equal(lateEarlier.archive.records[0].lastEditSequence, 2);
+  assert.equal(lateEarlier.archive.records[0].lastEditedAt, 200);
+  assert.equal(lateEarlier.archive.records[0].content, "current");
+});
+
 test("inference persists anchors and live reappearance retracts to seen", () => {
   const base = Object.assign(Protocol.emptyArchive(), { records: [seen("2", 1)] });
   const inferred = Protocol.applyCommand(base, {
@@ -199,17 +323,30 @@ test("confirmed deletions survive archive serialization and a fresh normalizatio
   assert.equal(restored.records[0].inferredNextId, "3");
 });
 
-test("archive normalization migrates to version 4 and sanitizes presentation", () => {
+test("archive normalization migrates to version 5 and sanitizes presentation", () => {
   const restored = Protocol.normalizeArchive({
     version: 2,
     generation: 4,
     records: [Object.assign(seen("2", 1), {
       authorStyle: { gradient: "linear-gradient(red, blue), var(--bad)" },
-      authorBadges: [{ kind: "image", url: "javascript:alert(1)" }]
+      authorBadges: [{ kind: "image", url: "javascript:alert(1)" }],
+      editHistory: [{
+        revisionId: "legacy-edit:1",
+        content: "original text",
+        attachments: ["before.png"],
+        media: [{
+          url: "https://cdn.discordapp.com/attachments/111111111111111111/222222222222222222/before.png",
+          kind: "image",
+          source: "attachment"
+        }],
+        supersededAt: 10
+      }]
     })]
   });
-  assert.equal(restored.version, 4);
+  assert.equal(restored.version, 5);
   assert.equal(restored.generation, 4);
   assert.equal(restored.records[0].authorStyle, undefined);
   assert.deepEqual(restored.records[0].authorBadges, []);
+  assert.equal(restored.records[0].editHistory[0].content, "original text");
+  assert.equal(restored.records[0].editHistory[0].media[0].kind, "image");
 });

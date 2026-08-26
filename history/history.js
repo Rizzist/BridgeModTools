@@ -10,7 +10,7 @@
   const summary = document.getElementById("summary");
   const exportButton = document.getElementById("export");
   const clearButton = document.getElementById("clear");
-  let archive = { version: 4, generation: 0, paused: false, records: [] };
+  let archive = { version: 5, generation: 0, paused: false, records: [] };
   const recordViews = new Map();
   let lastMediaRecoveryAt = -Infinity;
 
@@ -20,6 +20,41 @@
 
   function extensionFrameOrigin() {
     return `chrome-extension://${chrome.runtime.id}`;
+  }
+
+  function configureMediaFrame(frame, key, revisionId) {
+    const onSize = (event) => {
+      if (event.source !== frame.contentWindow || event.origin !== extensionFrameOrigin() || event.data?.type !== "LDMA_MEDIA_SIZE") return;
+      frame.style.width = `${Math.max(40, Math.min(550, Math.ceil(Number(event.data.width) || 550)))}px`;
+      frame.style.height = `${Math.max(24, Math.min(1600, Math.ceil(Number(event.data.height) || 40)))}px`;
+    };
+    const onLoad = () => {
+      send({ type: T.CREATE_MEDIA_CAPABILITY, key, revisionId: revisionId || undefined }).then((response) => {
+        if (!response.ok || !response.capability || !frame.contentWindow) return;
+        frame.contentWindow.postMessage({
+          type: "LDMA_MEDIA_CAPABILITY",
+          capability: response.capability
+        }, extensionFrameOrigin());
+      }).catch(() => {});
+    };
+    window.addEventListener("message", onSize);
+    frame.addEventListener("load", onLoad);
+    return () => {
+      window.removeEventListener("message", onSize);
+      frame.removeEventListener("load", onLoad);
+      frame.removeAttribute("src");
+    };
+  }
+
+  function mediaFrame(key, revisionId, title) {
+    const frame = document.createElement("iframe");
+    frame.className = "record__media";
+    frame.loading = "lazy";
+    frame.title = title;
+    frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads");
+    const dispose = configureMediaFrame(frame, key, revisionId);
+    frame.src = new URL(chrome.runtime.getURL("media/view.html")).href;
+    return { frame, dispose };
   }
 
   async function refresh() {
@@ -41,6 +76,7 @@
 
   function createRecordView(initialRecord) {
     let record = initialRecord;
+    const key = Core.recordKey(initialRecord);
     const article = document.createElement("article");
     const top = document.createElement("div");
     top.className = "record__top";
@@ -64,26 +100,21 @@
     content.className = "record__content";
     const attachments = document.createElement("p");
     attachments.className = "record__attachments";
-    article.append(content, attachments);
+    const revisions = document.createElement("div");
+    revisions.className = "record__revisions";
+    revisions.setAttribute("aria-label", "Earlier edited versions");
+    article.append(revisions, content, attachments);
     let frame = null;
+    let disposeFrame = null;
+    let currentMediaSignature = "";
+    let revisionDisposers = [];
+    let revisionSignature = "";
 
     function ensureMediaFrame() {
       if (frame) return frame;
-      frame = document.createElement("iframe");
-      const url = new URL(chrome.runtime.getURL("media/view.html"));
-      frame.className = "record__media";
-      frame.loading = "lazy";
-      frame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads");
-      frame.addEventListener("load", () => {
-        send({ type: T.CREATE_MEDIA_CAPABILITY, key: Core.recordKey(record) }).then((response) => {
-          if (!response.ok || !response.capability || !frame.contentWindow) return;
-          frame.contentWindow.postMessage({
-            type: "LDMA_MEDIA_CAPABILITY",
-            capability: response.capability
-          }, extensionFrameOrigin());
-        }).catch(() => {});
-      });
-      frame.src = url.href;
+      const created = mediaFrame(key, null, `Cached media from ${record.author || "message author"}`);
+      frame = created.frame;
+      disposeFrame = created.dispose;
       article.append(frame);
       return frame;
     }
@@ -95,23 +126,74 @@
       article.className = `record${deleted ? " deleted" : ""}`;
       author.textContent = record.author || "Unknown author";
       badge.className = `badge${deleted ? " deleted" : ""}`;
-      badge.textContent = record.deletionSource === "message_store_preserved"
+      const lifecycle = record.deletionSource === "message_store_preserved"
         ? "Retained deleted"
         : confirmed ? "Lifecycle + removal" : record.status === "inferred_deleted" ? "Possibly removed" : "Seen";
+      const editCount = record.editHistory?.length || 0;
+      badge.textContent = `${lifecycle}${editCount ? ` · Edited ${editCount}×` : ""}`;
       metaText.data = `${record.channelName || record.channelId || "Unknown channel"} · ${formatDate(record.messageTimestamp || record.capturedAt)}`;
       content.hidden = !record.content;
       content.textContent = record.content || "";
       attachments.hidden = !record.attachments?.length;
       attachments.textContent = record.attachments?.length ? `Attachment names: ${record.attachments.join(", ")}` : "";
+      const nextRevisionSignature = JSON.stringify(record.editHistory || []);
+      if (nextRevisionSignature !== revisionSignature) {
+        revisionSignature = nextRevisionSignature;
+        revisionDisposers.forEach((dispose) => dispose());
+        revisionDisposers = [];
+        revisions.replaceChildren(...(record.editHistory || []).map((revision, index) => {
+        const section = document.createElement("section");
+        section.className = "record__revision";
+        section.setAttribute("role", "note");
+        const label = document.createElement("strong");
+        label.textContent = `EDITED VERSION ${index + 1} · ${formatDate(revision.supersededAt)}`;
+        const priorContent = document.createElement("p");
+        priorContent.textContent = revision.content || "No text content";
+        priorContent.hidden = !revision.content;
+        section.append(label, priorContent);
+        if (revision.attachments?.length && !revision.media?.length) {
+          const priorAttachments = document.createElement("p");
+          priorAttachments.className = "record__revision-attachments";
+          priorAttachments.textContent = `Attachment names: ${revision.attachments.join(", ")}`;
+          section.append(priorAttachments);
+        }
+        if (revision.media?.length) {
+          const created = mediaFrame(key, revision.revisionId, `Cached media from edited version ${index + 1}`);
+          created.frame.classList.add("record__revision-media");
+          section.append(created.frame);
+          revisionDisposers.push(created.dispose);
+        }
+        return section;
+        }));
+      }
       if (record.media?.length) {
+        const nextMediaSignature = JSON.stringify(Core.sanitizeMediaItems(record.media));
+        if (frame && currentMediaSignature !== nextMediaSignature) {
+          disposeFrame?.();
+          frame.remove();
+          frame = null;
+          disposeFrame = null;
+        }
+        currentMediaSignature = nextMediaSignature;
         const mediaFrame = ensureMediaFrame();
         mediaFrame.hidden = false;
         mediaFrame.title = `Cached media from ${record.author || "message author"}`;
-      } else if (frame) frame.hidden = true;
+      } else {
+        currentMediaSignature = "";
+        if (frame) frame.hidden = true;
+      }
     }
 
     update(initialRecord);
-    return { element: article, update };
+    return {
+      element: article,
+      update,
+      dispose() {
+        revisionDisposers.forEach((dispose) => dispose());
+        revisionDisposers = [];
+        disposeFrame?.();
+      }
+    };
   }
 
   function render() {
@@ -119,6 +201,7 @@
     const liveKeys = new Set(archive.records.map(Core.recordKey));
     for (const [key, view] of recordViews) {
       if (liveKeys.has(key)) continue;
+      view.dispose();
       view.element.remove();
       recordViews.delete(key);
     }
@@ -148,10 +231,14 @@
   }
 
   function exportJson() {
-    const records = archive.records.map((record) => Object.assign({}, record, {
-      media: Core.sanitizeMediaItems(record.media).map((item) => Object.assign({}, item, {
+    const exportMedia = (media) => Core.sanitizeMediaItems(media).map((item) => Object.assign({}, item, {
         url: Core.exportMediaUrl(item.url),
         posterUrl: item.posterUrl ? Core.exportMediaUrl(item.posterUrl) : undefined
+      }));
+    const records = archive.records.map((record) => Object.assign({}, record, {
+      media: exportMedia(record.media),
+      editHistory: (record.editHistory || []).map((revision) => Object.assign({}, revision, {
+        media: exportMedia(revision.media)
       }))
     }));
     const payload = {

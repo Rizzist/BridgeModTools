@@ -177,3 +177,25 @@ test("ownership repair is rebuilt from every archive reference, including poster
   assert.equal(owners.get(MediaStore.mediaStorageKey(url)).protected, true);
   assert.deepEqual(owners.get(MediaStore.mediaStorageKey(poster)).ownerKeys, ["111111111111111111:444444444444444444"]);
 });
+
+test("edited revision media remains owned and protected with the current message", () => {
+  const oldImage = "https://cdn.discordapp.com/attachments/111111111111111111/222222222222222222/old.png";
+  const oldVideo = "https://cdn.discordapp.com/attachments/111111111111111111/333333333333333333/old.mp4";
+  const poster = "https://media.discordapp.net/attachments/111111111111111111/444444444444444444/poster.png";
+  const current = "https://cdn.discordapp.com/attachments/111111111111111111/555555555555555555/current.png";
+  const ownerKey = "111111111111111111:666666666666666666";
+  const owners = MediaStore.expectedOwnerMap([{
+    channelId: "111111111111111111",
+    messageId: "666666666666666666",
+    status: "seen",
+    media: [{ url: current, kind: "image", source: "attachment" }],
+    editHistory: [
+      { revisionId: "session:1", media: [{ url: oldImage, kind: "image", source: "attachment" }] },
+      { revisionId: "session:2", media: [{ url: oldVideo, posterUrl: poster, kind: "video", source: "attachment" }] }
+    ]
+  }]);
+  for (const url of [oldImage, oldVideo, poster, current]) {
+    assert.deepEqual(owners.get(MediaStore.mediaStorageKey(url)).ownerKeys, [ownerKey]);
+    assert.equal(owners.get(MediaStore.mediaStorageKey(url)).protected, true);
+  }
+});

@@ -33,7 +33,7 @@ test("manifest is MV3 with bounded local-media permissions and a narrow Discord 
   assert.equal(manifest.content_scripts[0].world, "MAIN");
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/channels/*"]);
-  assert.equal(manifest.version, "2.2.2");
+  assert.equal(manifest.version, "2.3.0");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -305,6 +305,9 @@ test("media capture, cache broker, offscreen downloader, and local player are pa
   assert.match(viewer, /function beginRetryWindow/);
   assert.match(viewer, /function scheduleRetry/);
   assert.match(viewer, /retryable: !state \|\| state === "pending"/);
+  assert.match(viewer, /refreshable: true/);
+  assert.match(viewer, /currentRetryable \|\| currentRefreshable/);
+  assert.match(viewer, /refreshAfterRender/);
   assert.match(viewer, /retryDeadline = Date\.now\(\) \+ 130000/);
   assert.match(viewer, /video\.controls = true/);
   assert.match(viewer, /audio\.controls = true/);
@@ -315,10 +318,17 @@ test("media capture, cache broker, offscreen downloader, and local player are pa
   assert.equal(/postMessage\([^)]*,\s*["']\*["']/.test(viewer), false);
   assert.equal(/Promise\.all/.test(viewer), false);
   assert.equal(/innerHTML/.test(viewer), false);
-  assert.match(viewerCss, /\.pager/);
-  assert.match(viewerCss, /overflow:\s*auto/);
+  assert.equal(/\.pager/.test(viewerCss), false);
+  assert.match(viewerCss, /max-height:\s*350px/);
+  assert.match(viewerCss, /border-radius:\s*8px/);
+  assert.match(viewerCss, /overflow-y: auto/);
+  assert.match(viewer, /LDMA_MEDIA_SIZE/);
+  assert.match(content, /event\.source !== frame\.contentWindow/);
+  assert.equal(/height:480px/.test(content.replace(/\s+/g, "")), false);
   assert.match(history, /Core\.exportMediaUrl/);
   assert.match(history, /recordViews/);
+  assert.match(history, /revision\.revisionId/);
+  assert.match(history, /LDMA_MEDIA_SIZE/);
   assert.equal(/recordsElement\.replaceChildren/.test(history), false);
   assert.match(offscreen, /skipPrune:\s*true/);
   assert.match(popup, /chrome\.permissions\.request/);
@@ -326,6 +336,36 @@ test("media capture, cache broker, offscreen downloader, and local player are pa
   for (const relative of ["media/view.html", "media/view.css", "media/view.js", "media/offscreen.html", "media/offscreen.js", "src/media-store.js"]) {
     assert.equal(fs.existsSync(path.join(root, relative)), true, `${relative} is missing`);
   }
+});
+
+test("Discord edit lifecycle is event-gated, versioned, and rendered independently from deletion", () => {
+  const core = fs.readFileSync(path.join(root, "src", "core.js"), "utf8");
+  const protocol = fs.readFileSync(path.join(root, "src", "protocol.js"), "utf8");
+  const hook = fs.readFileSync(path.join(root, "src", "page-hook.js"), "utf8");
+  const content = fs.readFileSync(path.join(root, "src", "content.js"), "utf8");
+  const background = fs.readFileSync(path.join(root, "src", "background.js"), "utf8");
+  const mediaStore = fs.readFileSync(path.join(root, "src", "media-store.js"), "utf8");
+
+  assert.match(hook, /MESSAGE_UPDATE/);
+  assert.match(hook, /editedTimestamp \|\| value\.edited_timestamp/);
+  assert.match(hook, /new CustomEvent\(EDIT_EVENT/);
+  assert.match(hook, /kind: "edit-before"/);
+  assert.match(protocol, /CONFIRM_EDIT/);
+  assert.match(protocol, /editHistory/);
+  assert.match(core, /maxEditRevisions/);
+  assert.match(core, /editPayloadSignature/);
+  assert.match(content, /function confirmEditLifecycle/);
+  assert.match(content, /function verifyPendingEdit/);
+  assert.match(content, /function commitPendingEdit/);
+  assert.match(content, /baselineSignature/);
+  assert.match(content, /function reconcileEditHistories/);
+  assert.match(content, /data-ldma-edit-history/);
+  assert.match(content, /• EDITED/);
+  assert.match(content, /rgb\(240 178 50 \/ 8%\)/);
+  assert.match(content, /• DELETED/);
+  assert.match(background, /record\.editHistory/);
+  assert.match(mediaStore, /record\.editHistory/);
+  assert.match(background, /revisionId/);
 });
 
 test("extension pages use only packaged scripts and no inline handlers", () => {

@@ -534,10 +534,12 @@
     };
     for (const record of Array.isArray(records) ? records : []) {
       const ownerKey = Core.recordKey(record);
-      const protectedValue = Core.isDeletedStatus(record.status);
-      for (const media of Core.sanitizeMediaItems(record.media)) {
-        if (fetchableMedia(media)) add(media.url, ownerKey, protectedValue);
-        if (media.posterUrl) add(media.posterUrl, ownerKey, protectedValue);
+      const protectedValue = Core.isDeletedStatus(record.status) || Core.hasEdits(record);
+      for (const version of [record, ...(record.editHistory || [])]) {
+        for (const media of Core.sanitizeMediaItems(version.media)) {
+          if (fetchableMedia(media)) add(media.url, ownerKey, protectedValue);
+          if (media.posterUrl) add(media.posterUrl, ownerKey, protectedValue);
+        }
       }
     }
     return expected;
