@@ -22,6 +22,7 @@
   const SNOWFLAKE = /^\d{15,25}$/;
   const MAX_BULK_IDS = 200;
   const MAX_RETAINED_KEYS = 5000;
+  const TIMEOUT_7D_SECONDS = 7 * 24 * 60 * 60;
   const webpackInstances = new Set();
   const scannedModules = new WeakMap();
   const dispatchers = new Set();
@@ -36,6 +37,8 @@
   let coreDispatcher = null;
   let fallbackDispatcher = null;
   let messageStoreCandidate = null;
+  let userProfileActionsCandidate = null;
+  let timeoutUntilActionsCandidate = null;
   let messageStorePatched = false;
   let lastStatus = "";
   let captureSequence = 0;
@@ -156,6 +159,28 @@
       let descriptor;
       try { descriptor = Object.getOwnPropertyDescriptor(current, property); } catch (_error) { return null; }
       if (descriptor) return "value" in descriptor && typeof descriptor.value === "function" ? descriptor.value : null;
+      try { current = Object.getPrototypeOf(current); } catch (_error) { return null; }
+    }
+    return null;
+  }
+
+  function moduleExportFunction(value, property) {
+    let current = value;
+    for (let depth = 0; current && depth < 4; depth += 1) {
+      let descriptor;
+      try { descriptor = Object.getOwnPropertyDescriptor(current, property); } catch (_error) { return null; }
+      if (descriptor) {
+        if ("value" in descriptor) return typeof descriptor.value === "function" ? descriptor.value : null;
+        // Webpack harmony exports are enumerable getters. Read only the exact
+        // allowlisted action names, and contain getters that throw or change.
+        if (!descriptor.enumerable || typeof descriptor.get !== "function") return null;
+        try {
+          const exported = value[property];
+          return typeof exported === "function" ? exported : null;
+        } catch (_error) {
+          return null;
+        }
+      }
       try { current = Object.getPrototypeOf(current); } catch (_error) { return null; }
     }
     return null;
@@ -470,6 +495,23 @@
     return false;
   }
 
+  function inspectUserActionExports(value) {
+    if (!value || (typeof value !== "object" && typeof value !== "function")) return;
+    // Require the paired close method as a structural signature. A generic
+    // object with an open-like function must never become a privileged UI
+    // action target merely because one property name happens to match.
+    if (moduleExportFunction(value, "openUserProfileModal") &&
+        moduleExportFunction(value, "closeUserProfileModal")) {
+      userProfileActionsCandidate = value;
+    }
+    // Accept the timeout action only when its kick/ban companions prove this
+    // is Discord's native GuildMemberActions module.
+    if (dataFunction(value, "setCommunicationDisabledUntil") &&
+        dataFunction(value, "kickUser") && dataFunction(value, "banUser")) {
+      timeoutUntilActionsCandidate = value;
+    }
+  }
+
   function inspectExports(rootValue) {
     const queue = [{ value: rootValue, depth: 0 }];
     const visited = new WeakSet();
@@ -480,6 +522,7 @@
       visited.add(value);
       inspected += 1;
       if (shouldIgnoreValue(value)) continue;
+      inspectUserActionExports(value);
       const storeInfo = coreStoreInfo(value);
       if (storeInfo) {
         const usableMessageStore = storeInfo.name === "MessageStore" &&
@@ -605,6 +648,59 @@
     }
   }
 
+  function validUserActionPayload(action, payload) {
+    if (action !== "open-profile" && action !== "timeout-7d") return null;
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+    try {
+      const keys = Object.keys(payload);
+      if (keys.length !== 2 || !keys.includes("userId") || !keys.includes("guildId")) return null;
+      const rawUserId = payload.userId;
+      const rawGuildId = payload.guildId;
+      const userId = cleanId(rawUserId);
+      const guildId = rawGuildId == null ? null : cleanId(rawGuildId);
+      if (!userId || (rawGuildId != null && !guildId)) return null;
+      if (action === "timeout-7d" && !guildId) return null;
+      return { userId, guildId };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function rediscoverUserActionModules() {
+    // Clear first so a removed/replaced Discord module cannot remain callable
+    // through a stale object after Webpack swaps its cached export.
+    userProfileActionsCandidate = null;
+    timeoutUntilActionsCandidate = null;
+    for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
+  }
+
+  async function invokeUserAction(action, payload) {
+    const normalized = validUserActionPayload(action, payload);
+    if (!normalized) return { ok: false, reason: "invalid-request" };
+    rediscoverUserActionModules();
+    try {
+      if (action === "open-profile") {
+        const openProfile = moduleExportFunction(userProfileActionsCandidate, "openUserProfileModal");
+        if (!openProfile) return { ok: false, reason: "module-unavailable" };
+        const profileContext = { userId: normalized.userId, guildId: normalized.guildId };
+        await Promise.resolve(openProfile.call(userProfileActionsCandidate, profileContext));
+        return { ok: true, reason: "opened" };
+      }
+      const setUntil = dataFunction(timeoutUntilActionsCandidate, "setCommunicationDisabledUntil");
+      if (!setUntil) return { ok: false, reason: "module-unavailable" };
+      await Promise.resolve(setUntil.call(timeoutUntilActionsCandidate, {
+        guildId: normalized.guildId,
+        userId: normalized.userId,
+        communicationDisabledUntilTimestamp: new Date(Date.now() + TIMEOUT_7D_SECONDS * 1000).toISOString(),
+        duration: TIMEOUT_7D_SECONDS,
+        reason: ""
+      }));
+      return { ok: true, reason: "timed-out-7d" };
+    } catch (_error) {
+      return { ok: false, reason: "action-failed" };
+    }
+  }
+
   function releaseRetainedMessages(channelValue, idValues) {
     const channelId = cleanId(channelValue);
     const dispatcher = coreDispatcher || fallbackDispatcher;
@@ -659,6 +755,7 @@
   report("searching", "Waiting for Discord's lifecycle dispatcher; DOM deletion fallback is active.");
   observeWebpackGlobal();
   controller.recover = recoverHook;
+  controller.invokeUserAction = invokeUserAction;
   if (controller.pendingRecovery) recoverHook("queued-injection");
   let recoveryTicks = 0;
   setInterval(() => {

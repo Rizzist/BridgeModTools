@@ -16,6 +16,8 @@ Version 2.3.1 fixes cold-start capture. The document-start lifecycle hook now in
 
 An extension update automatically reloads any already-open Discord tabs once so the new MAIN-world controller replaces the previous bundle cleanly. This is automatic and does not happen on ordinary Discord launches or route changes.
 
+Version 2.4 keeps saved deleted-row author identity actionable. Click the restored avatar or author name to open Discord's native profile modal, or use the row toolbar to open the profile, copy the raw user ID, copy a Discord `<@USER_ID>` mention, or apply a fixed seven-day server timeout. Timeout is shown only in server channels and always requires a confirmation naming the archived author; Discord still enforces the moderator's current permission and role hierarchy.
+
 Restored visual media now uses Discord-like inline sizing and spacing instead of a fixed-height generic card. Images and videos retain intrinsic dimensions up to a 550×350-pixel display box, small GIFs stay small, multiple visuals use a compact grid, and audio remains a compact native player. Cached files and plain links keep a small labeled tile.
 
 Version 2 also captures links and rendered upload/embed media. Discord-hosted images, videos, audio, voice messages, and files are downloaded immediately into an extension-owned local cache; direct third-party media can be enabled per site from the popup. Restored deleted rows and full history use the cached bytes, so supported media remains viewable or playable after the original message disappears.
@@ -70,6 +72,7 @@ The toolbar popup shows archived, edited, saved-deleted, and cached-media counts
 - Bootstrap page match: `https://discord.com/*`. Message capture remains route-gated internally to real `/channels/<guild-or-@me>/<channelId>` views.
 - One local service worker serializes every archive read/write; content and UI pages cannot access storage directly.
 - A `document_start`, main-world adapter discovers Discord's `MessageStore`, signals genuine edits, and retains cached records during single or bulk deletion. It sends only validated channel/message IDs plus an edit timestamp/ordering token to the isolated content script. Message content, tokens, cookies, and store objects never cross that bridge.
+- Deleted-row profile and timeout actions pass only validated user/guild IDs through the document-bound service worker. The worker derives the guild from the current Discord route, rechecks that route in the MAIN world, allows only profile-open or fixed seven-day timeout, and invokes Discord's structurally discovered native client actions. It does not read a token or construct a Discord REST request; missing or changed native modules fail closed.
 - Clear, per-record delete, and pause/resume advance an archive generation. Stale in-flight capture or inference writes are rejected.
 - The only programmatic network requests are bounded media downloads. They omit credentials and referrers, follow no cross-origin redirect, enforce MIME/size limits, and run in a packaged offscreen document. There are no remote scripts, analytics, cookies, tokens, authorization headers, Discord API calls, or ordinary browser-cache access.
 - Message metadata stays in `chrome.storage.local`; cached bodies and their local index stay in extension-origin Cache Storage/IndexedDB for the same Chrome profile.
@@ -154,13 +157,13 @@ No package installation is needed. With Node.js 18 or newer:
 npm test
 ```
 
-The test suite checks deletion classification, fake Discord `MessageStore` edit/deletion lifecycle handling, ID-only bridge normalization, multi-edit and edit-then-delete durability, stale-capture rejection, historical-media ownership, responsive inline media structure, dispatcher fallback, media URL/name sanitization, MIME/size/redirect enforcement, omitted credentials/referrers, storage merge/prune/search, exact manifest permissions and host scope, packaged offscreen/player files, and absence of cookie/token/remote-script primitives.
+The test suite checks deletion classification, fake Discord `MessageStore` edit/deletion lifecycle handling, deleted-author profile/copy/timeout controls, document-bound moderation routing, fixed timeout arguments, ID-only bridge normalization, multi-edit and edit-then-delete durability, stale-capture rejection, historical-media ownership, responsive inline media structure, dispatcher fallback, media URL/name sanitization, MIME/size/redirect enforcement, omitted credentials/referrers, storage merge/prune/search, exact manifest permissions and host scope, packaged offscreen/player files, and absence of cookie/token/remote-script primitives.
 
 Open `demo/index.html` in a browser for a deterministic fixture. Its controls feed fixed signals into the same pure classifier used by the extension; it does not contact Discord or write extension storage.
 
 ## File map
 
-- `src/page-hook.js` — main-world Webpack/Flux discovery, MessageStore deletion retention, and ID-only bridge.
+- `src/page-hook.js` — main-world Webpack/Flux discovery, MessageStore deletion retention, ID-only lifecycle bridge, and native profile/timeout action adapter.
 - `src/core.js` — pure classifier, route/list parsing, storage merge/prune/search, and tombstone cleanup utilities.
 - `src/protocol.js` / `src/background.js` — generation-checked archive protocol and serialized storage broker.
 - `src/media-store.js` / `media/offscreen.*` — bounded extension-owned media cache and downloader.

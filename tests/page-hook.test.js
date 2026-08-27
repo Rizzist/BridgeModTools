@@ -14,6 +14,7 @@ function runHook(options) {
   const subscriptions = new Map();
   const intervals = [];
   const messages = new Map();
+  const userActionCalls = { profile: [], until: [] };
   const makeMessage = (id, deleted, content, editedTimestamp) => ({
     id,
     channel_id: "777777777777777777",
@@ -77,11 +78,43 @@ function runHook(options) {
   const rejectingStore = { _dispatcher: rejectingDispatcher, getName() { return "MessageStore"; } };
   const webpackRequire = function webpackRequire() {};
   const moduleExports = {};
+  let actionGeneration = 1;
+  const makeUserActionModules = () => ({
+    profile: {
+      openUserProfileModal(payload) {
+        userActionCalls.profile.push({ generation: actionGeneration, payload });
+        if (settings.rejectProfileAction) return Promise.reject(new Error("profile rejected"));
+      },
+      closeUserProfileModal() {}
+    },
+    until: {
+      setCommunicationDisabledUntil(payload) {
+        userActionCalls.until.push({ generation: actionGeneration, payload });
+        if (settings.rejectTimeoutAction) return Promise.reject(new Error("timeout rejected"));
+      },
+      kickUser() {},
+      banUser() {}
+    }
+  });
+  let userActionModules = settings.noUserActionModules ? null : makeUserActionModules();
+  const userActionExports = {};
+  Object.defineProperties(userActionExports, {
+    openUserProfileModal: {
+      enumerable: true,
+      get() { return userActionModules?.profile.openUserProfileModal; }
+    },
+    closeUserProfileModal: {
+      enumerable: true,
+      get() { return userActionModules?.profile.closeUserProfileModal; }
+    },
+    until: { enumerable: true, get() { return userActionModules?.until || {}; } }
+  });
   let storeAvailable = !settings.delayedStore;
   Object.defineProperty(moduleExports, "Z", { enumerable: true, get() { return storeAvailable ? messageStore : {}; } });
   webpackRequire.c = {
     "0": { exports: { rejectingStore } },
     "1": { exports: { fallbackDispatcher } },
+    "21": { exports: userActionExports },
     "42": { exports: moduleExports }
   };
   const chunks = [];
@@ -128,6 +161,17 @@ function runHook(options) {
   if (!settings.deferReady && !settings.readyBeforeHook) ready();
   return {
     posted, dispatched, subscriptions, fallbackSubscriptions, handlerNode, messages, dispatcher, window, ready,
+    userActionCalls,
+    profileExportUsesGetter: typeof Object.getOwnPropertyDescriptor(userActionExports, "openUserProfileModal").get === "function",
+    invokeUserAction(action, payload) {
+      return window[Symbol.for("BridgeModTools.pageHook.v1")].invokeUserAction(action, payload);
+    },
+    replaceUserActionModules() {
+      actionGeneration += 1;
+      userActionModules = makeUserActionModules();
+      return actionGeneration;
+    },
+    removeUserActionModules() { userActionModules = null; },
     reinject() { vm.runInContext(source, context); },
     makeStoreAvailable() { storeAvailable = true; },
     replaceStoreDispatcher() {
@@ -395,6 +439,94 @@ test("dispatcher compatibility fallback restores a message when handler metadata
     bulk: false
   }]);
   assert.equal(JSON.stringify(retained).includes("must not cross"), false);
+});
+
+test("user actions reject unrecognized operations, malformed IDs, missing guilds, and extra payload fields", async () => {
+  const result = runHook();
+  const userId = "888888888888888881";
+  const guildId = "777777777777777777";
+  const rejected = await Promise.all([
+    result.invokeUserAction("unknown", { userId, guildId }),
+    result.invokeUserAction("open-profile", { userId: "bad", guildId }),
+    result.invokeUserAction("open-profile", { userId, guildId: "bad" }),
+    result.invokeUserAction("open-profile", { userId }),
+    result.invokeUserAction("open-profile", { userId, guildId, username: "must-not-cross" }),
+    result.invokeUserAction("timeout-7d", { userId, guildId: null })
+  ]);
+  assert.deepEqual(rejected.map((item) => JSON.parse(JSON.stringify(item))), [
+    { ok: false, reason: "invalid-request" },
+    { ok: false, reason: "invalid-request" },
+    { ok: false, reason: "invalid-request" },
+    { ok: false, reason: "invalid-request" },
+    { ok: false, reason: "invalid-request" },
+    { ok: false, reason: "invalid-request" }
+  ]);
+  assert.deepEqual(result.userActionCalls, { profile: [], until: [] });
+});
+
+test("native profile and fixed seven-day timeout actions receive only normalized identity context", async () => {
+  const result = runHook();
+  assert.equal(result.profileExportUsesGetter, true);
+  const userId = "888888888888888881";
+  const guildId = "777777777777777777";
+  const profile = await result.invokeUserAction("open-profile", { userId, guildId });
+  assert.deepEqual(JSON.parse(JSON.stringify(profile)), { ok: true, reason: "opened" });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.userActionCalls.profile)), [{
+    generation: 1,
+    payload: { userId, guildId }
+  }]);
+
+  const before = Date.now();
+  const timeout = await result.invokeUserAction("timeout-7d", { userId, guildId });
+  const after = Date.now();
+  assert.deepEqual(JSON.parse(JSON.stringify(timeout)), { ok: true, reason: "timed-out-7d" });
+  assert.equal(result.userActionCalls.until.length, 1);
+  const timeoutPayload = result.userActionCalls.until[0].payload;
+  assert.deepEqual(Object.keys(timeoutPayload).sort(), [
+    "communicationDisabledUntilTimestamp", "duration", "guildId", "reason", "userId"
+  ]);
+  assert.equal(timeoutPayload.userId, userId);
+  assert.equal(timeoutPayload.guildId, guildId);
+  assert.equal(timeoutPayload.duration, 604800);
+  assert.equal(timeoutPayload.reason, "");
+  const deadline = Date.parse(timeoutPayload.communicationDisabledUntilTimestamp);
+  assert.ok(deadline >= before + 604800000);
+  assert.ok(deadline <= after + 604800000);
+});
+
+test("user actions fail closed when Discord's native modules are unavailable or reject", async () => {
+  const payload = { userId: "888888888888888881", guildId: "777777777777777777" };
+  const unavailable = runHook({ noUserActionModules: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(await unavailable.invokeUserAction("open-profile", payload))),
+    { ok: false, reason: "module-unavailable" });
+  assert.deepEqual(JSON.parse(JSON.stringify(await unavailable.invokeUserAction("timeout-7d", payload))),
+    { ok: false, reason: "module-unavailable" });
+
+  const rejected = runHook({ rejectProfileAction: true, rejectTimeoutAction: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(await rejected.invokeUserAction("open-profile", payload))),
+    { ok: false, reason: "action-failed" });
+  assert.deepEqual(JSON.parse(JSON.stringify(await rejected.invokeUserAction("timeout-7d", payload))),
+    { ok: false, reason: "action-failed" });
+});
+
+test("user actions rediscover replaced modules and never call removed stale exports", async () => {
+  const result = runHook();
+  const payload = { userId: "888888888888888881", guildId: "777777777777777777" };
+  await result.invokeUserAction("open-profile", payload);
+  await result.invokeUserAction("timeout-7d", payload);
+  result.replaceUserActionModules();
+  await result.invokeUserAction("open-profile", payload);
+  await result.invokeUserAction("timeout-7d", payload);
+  assert.deepEqual(result.userActionCalls.profile.map((call) => call.generation), [1, 2]);
+  assert.deepEqual(result.userActionCalls.until.map((call) => call.generation), [1, 2]);
+
+  result.removeUserActionModules();
+  assert.deepEqual(JSON.parse(JSON.stringify(await result.invokeUserAction("open-profile", payload))),
+    { ok: false, reason: "module-unavailable" });
+  assert.deepEqual(JSON.parse(JSON.stringify(await result.invokeUserAction("timeout-7d", payload))),
+    { ok: false, reason: "module-unavailable" });
+  assert.deepEqual(result.userActionCalls.profile.map((call) => call.generation), [1, 2]);
+  assert.deepEqual(result.userActionCalls.until.map((call) => call.generation), [1, 2]);
 });
 
 test("release removes only a message previously retained by the hook", () => {

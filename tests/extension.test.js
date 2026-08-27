@@ -35,7 +35,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.3.1");
+  assert.equal(manifest.version, "2.4.0");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -261,6 +261,32 @@ test("persistent replacements use a Discord-style row and hide the retained nati
   assert.match(content, /reducedMotion\.addEventListener/);
   assert.match(content, /render\.dispose/);
   assert.equal(/innerHTML/.test(content), false);
+});
+
+test("deleted rows expose identity-safe profile, copy, and confirmed seven-day timeout actions", () => {
+  const content = fs.readFileSync(path.join(root, "src", "content.js"), "utf8");
+
+  assert.match(content, /const avatar = document\.createElement\("button"\)/);
+  assert.match(content, /const author = document\.createElement\("button"\)/);
+  assert.match(content, /avatar\.setAttribute\("aria-label", profileLabel\)/);
+  assert.match(content, /author\.setAttribute\("aria-label", profileLabel\)/);
+  assert.match(content, /role", "toolbar"/);
+  for (const label of ["Open profile", "Copy ID", "Copy mention", "Timeout 7d"]) {
+    assert.match(content, new RegExp(label));
+  }
+  assert.match(content, /navigator\.clipboard\.writeText\(value\)/);
+  assert.match(content, /document\.execCommand\("copy"\)/);
+  assert.match(content, /`<@\$\{actionUserId\}>`/);
+  assert.match(content, /role", "status"/);
+  assert.match(content, /window\.confirm\(`Timeout \$\{actionAuthor\} for 7 days\?`\)/);
+  assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "open-profile",\s*userId: actionUserId,\s*guildId: actionGuildId/);
+  assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "timeout-7d",\s*userId: actionUserId,\s*guildId: actionGuildId/);
+  assert.match(content, /actions\.hidden = !nextUserId/);
+  assert.match(content, /timeoutAction\.hidden = !nextGuildId/);
+  assert.match(content, /SNOWFLAKE\.test\(String\(record\.authorId/);
+  assert.match(content, /event\.stopPropagation\(\)/);
+  assert.equal(/\bfetch\s*\(/.test(content), false);
+  assert.equal(/Authorization/i.test(content), false);
 });
 
 test("popup and history reconnect their broker update ports", () => {

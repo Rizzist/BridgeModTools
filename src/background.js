@@ -16,9 +16,15 @@ const playbackCapabilities = new Map();
 const BOOTSTRAP_COMMAND = "LDMA_ENSURE_BOOTSTRAP";
 const REPORT_LIVE_HEALTH = "LDMA_REPORT_LIVE_HEALTH";
 const GET_LIVE_HEALTH = "LDMA_GET_LIVE_HEALTH";
+const USER_ACTION_COMMAND = "LDMA_USER_ACTION";
 const DISCORD_TAB_PATTERN = "https://discord.com/*";
 const bootstrapJobs = new Map();
 const liveHealthByDocument = new Map();
+const userActionRateLimits = new Map();
+const USER_ACTION_RATE_WINDOW_MS = 10000;
+const USER_ACTION_RATE_MAX = 8;
+const USER_ACTION_RATE_BUCKET_MAX = 500;
+const SNOWFLAKE_PATTERN = /^\d{15,25}$/;
 
 function injectionTarget(tabId, documentId) {
   if (!Number.isInteger(tabId) || !documentId) return null;
@@ -355,7 +361,8 @@ function mediaViewerSender(sender) {
 
 function discordContentSender(sender) {
   if (sender?.id !== chrome.runtime.id || !Number.isInteger(sender.tab?.id) ||
-    !sender.documentId || sender.origin !== "https://discord.com" || sender.frameId !== 0) return false;
+    sender.tab.id < 0 || typeof sender.documentId !== "string" || !sender.documentId ||
+    sender.origin !== "https://discord.com" || sender.frameId !== 0) return false;
   try {
     const url = new URL(String(sender.url || ""));
     return url.protocol === "https:" && url.hostname === "discord.com" && url.port === "";
@@ -373,6 +380,109 @@ function discordChannelContentSender(sender) {
   } catch (_error) {
     return false;
   }
+}
+
+function discordChannelContext(sender) {
+  if (!discordContentSender(sender)) return null;
+  try {
+    const url = new URL(String(sender.tab.url || ""));
+    if (url.protocol !== "https:" || url.hostname !== "discord.com" || url.port !== "") return null;
+    const match = /^\/channels\/(@me|\d{15,25})\/(\d{15,25})\/?$/.exec(url.pathname);
+    if (!match) return null;
+    return {
+      guildId: match[1] === "@me" ? null : match[1],
+      channelId: match[2]
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+function consumeUserActionRateLimit(sender) {
+  const now = Date.now();
+  for (const [key, item] of userActionRateLimits) {
+    if (!item || item.resetAt <= now) userActionRateLimits.delete(key);
+  }
+  const key = `${sender.tab.id}:${sender.documentId}`;
+  let bucket = userActionRateLimits.get(key);
+  if (!bucket) {
+    while (userActionRateLimits.size >= USER_ACTION_RATE_BUCKET_MAX) {
+      userActionRateLimits.delete(userActionRateLimits.keys().next().value);
+    }
+    bucket = { count: 0, resetAt: now + USER_ACTION_RATE_WINDOW_MS };
+    userActionRateLimits.set(key, bucket);
+  }
+  if (bucket.count >= USER_ACTION_RATE_MAX) return false;
+  bucket.count += 1;
+  return true;
+}
+
+function safeUserActionResult(value) {
+  const ok = value?.ok === true;
+  const reason = typeof value?.reason === "string"
+    ? value.reason.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 160)
+    : "";
+  return { ok, reason: reason || (ok ? "user-action-invoked" : "user-action-rejected") };
+}
+
+async function handleUserAction(command, sender) {
+  const context = discordChannelContext(sender);
+  if (!context) return { ok: false, reason: "untrusted-user-action-sender" };
+  const action = command?.action;
+  if (action !== "open-profile" && action !== "timeout-7d") {
+    return { ok: false, reason: "unsupported-user-action" };
+  }
+  if (typeof command?.userId !== "string" || !SNOWFLAKE_PATTERN.test(command.userId)) {
+    return { ok: false, reason: "invalid-user-id" };
+  }
+  if (action === "timeout-7d") {
+    if (!context.guildId) return { ok: false, reason: "timeout-requires-guild" };
+    if (typeof command?.guildId !== "string" || command.guildId !== context.guildId) {
+      return { ok: false, reason: "guild-context-mismatch" };
+    }
+  }
+  if (!consumeUserActionRateLimit(sender)) return { ok: false, reason: "user-action-throttled" };
+
+  const payload = { userId: command.userId, guildId: context.guildId };
+  const expectedRoute = { guildId: context.guildId, channelId: context.channelId };
+  let execution;
+  try {
+    execution = await chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, documentIds: [sender.documentId] },
+      world: "MAIN",
+      func(actionName, actionPayload, route) {
+        try {
+          const current = new URL(globalThis.location.href);
+          const match = /^\/channels\/(@me|\d{15,25})\/(\d{15,25})\/?$/.exec(current.pathname);
+          const currentGuildId = match && match[1] !== "@me" ? match[1] : null;
+          if (current.protocol !== "https:" || current.hostname !== "discord.com" || current.port !== "" ||
+            !match || currentGuildId !== route.guildId || match[2] !== route.channelId) {
+            return { ok: false, reason: "user-action-route-changed" };
+          }
+          const controller = globalThis[Symbol.for("BridgeModTools.pageHook.v1")];
+          if (!controller || typeof controller.invokeUserAction !== "function") {
+            return { ok: false, reason: "user-action-controller-unavailable" };
+          }
+          return Promise.resolve(controller.invokeUserAction(actionName, actionPayload)).then(
+            (result) => ({
+              ok: result?.ok === true,
+              reason: typeof result?.reason === "string" ? result.reason : ""
+            }),
+            () => ({ ok: false, reason: "user-action-controller-error" })
+          );
+        } catch (_error) {
+          return { ok: false, reason: "user-action-controller-error" };
+        }
+      },
+      args: [action, payload, expectedRoute]
+    });
+  } catch (_error) {
+    return { ok: false, reason: "user-action-injection-failed" };
+  }
+  const result = Array.isArray(execution)
+    ? execution.find((item) => item && Object.prototype.hasOwnProperty.call(item, "result"))?.result
+    : null;
+  return safeUserActionResult(result);
 }
 
 function documentHealthKey(sender) {
@@ -552,6 +662,8 @@ chrome.runtime.onMessage.addListener((command, sender, sendResponse) => {
     operation = Promise.resolve(reportLiveHealth(command, sender));
   } else if (command?.type === GET_LIVE_HEALTH && popupSender(sender)) {
     operation = Promise.resolve({ ok: true, reason: "live-health-read", health: bestLiveHealth() });
+  } else if (command?.type === USER_ACTION_COMMAND) {
+    operation = handleUserAction(command, sender);
   } else if (command?.type === BOOTSTRAP_COMMAND && discordContentSender(sender)) {
     operation = ensureDiscordBootstrap(sender.tab.id, sender.documentId || null, true);
   } else if (playbackTypes.has(command && command.type)) operation = handlePlaybackCommand(command, sender);

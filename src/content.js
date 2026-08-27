@@ -1058,19 +1058,25 @@
     sheet.replaceSync(`
       :host { display:block; min-width:0; color:#dbdee1; font:16px/1.375 "gg sans","Noto Sans","Helvetica Neue",Helvetica,Arial,sans-serif; }
       * { box-sizing:border-box; }
-      .message { display:grid; grid-template-columns:40px minmax(0,1fr); column-gap:16px; min-height:48px; padding:2px 16px; background:rgb(242 63 66 / 7.5%); }
+      .message { position:relative; display:grid; grid-template-columns:40px minmax(0,1fr); column-gap:16px; min-height:48px; padding:2px 16px; background:rgb(242 63 66 / 7.5%); }
       .message:hover { background:rgb(242 63 66 / 10%); }
       .message.continuation { min-height:22px; padding-block:0; }
       .message.continuation .avatar,.message.continuation .header { display:none; }
       .message.continuation .body { grid-column:2; }
-      .avatar { display:grid; place-items:center; width:40px; height:40px; overflow:hidden; border-radius:50%; background:#5865f2; color:#fff; font-size:17px; font-weight:700; user-select:none; }
+      button { font:inherit; }
+      .profile-trigger { border:0; cursor:pointer; }
+      .profile-trigger:disabled { cursor:default; }
+      .profile-trigger:focus-visible { outline:2px solid #00a8fc; outline-offset:2px; }
+      .avatar { display:grid; place-items:center; width:40px; height:40px; margin:0; padding:0; overflow:hidden; border-radius:50%; background:#5865f2; color:#fff; font-size:17px; font-weight:700; user-select:none; }
+      .avatar:not(:disabled):hover { box-shadow:0 0 0 2px rgb(255 255 255 / 20%); }
       .avatar img { width:100%; height:100%; object-fit:cover; }
       .body { min-width:0; }
       .reply { position:relative; margin:-1px 0 2px; padding-left:18px; overflow:hidden; color:#b5bac1; font-size:13px; line-height:18px; text-overflow:ellipsis; white-space:nowrap; }
       .reply::before { content:""; position:absolute; left:2px; top:8px; width:11px; border-top:2px solid #4e5058; }
       .header { display:flex; align-items:baseline; min-width:0; line-height:22px; }
       .author-group { display:inline-flex; align-items:center; min-width:0; gap:4px; }
-      .author { display:inline-block; overflow:hidden; color:#f2f3f5; font-size:16px; font-weight:400; text-overflow:ellipsis; white-space:nowrap; }
+      .author { display:inline-block; min-width:0; margin:0; padding:0; overflow:hidden; background:transparent; color:#f2f3f5; font-size:16px; font-weight:400; line-height:inherit; text-align:left; text-overflow:ellipsis; white-space:nowrap; }
+      .author:not(:disabled):hover { text-decoration:underline; }
       .badges { display:inline-flex; align-items:center; flex:0 0 auto; gap:3px; }
       .author-icon,.author-vector { display:block; flex:0 0 auto; object-fit:contain; }
       .app-badge,.text-badge { display:inline-flex; align-items:center; height:16px; padding:0 4px; border-radius:3px; font-size:10px; font-weight:750; line-height:16px; white-space:nowrap; }
@@ -1089,6 +1095,15 @@
       .attachments { color:#00a8fc; font-size:14px; line-height:20px; overflow-wrap:anywhere; }
       .attachment::before { content:"↳ "; color:#949ba4; }
       .media-frame { display:block; width:min(550px,100%); max-width:100%; height:40px; margin:4px 0 2px; border:0; border-radius:8px; background:transparent; }
+      .actions { position:absolute; z-index:2; top:-16px; right:16px; display:flex; align-items:center; gap:1px; max-width:calc(100% - 32px); padding:2px; border:1px solid rgb(255 255 255 / 8%); border-radius:4px; background:#2b2d31; box-shadow:0 2px 5px rgb(0 0 0 / 25%); opacity:0; pointer-events:none; transform:translateY(2px); transition:opacity 100ms ease,transform 100ms ease; }
+      .message:hover .actions,.message:focus-within .actions,.actions:focus-within { opacity:1; pointer-events:auto; transform:none; }
+      .action { min-height:28px; padding:3px 7px; border:0; border-radius:3px; background:transparent; color:#b5bac1; font-size:12px; font-weight:600; line-height:18px; white-space:nowrap; cursor:pointer; }
+      .action:hover { background:#404249; color:#f2f3f5; }
+      .action:focus-visible { outline:2px solid #00a8fc; outline-offset:-2px; }
+      .action.timeout:hover { background:#da373c; color:#fff; }
+      .action-status { position:absolute; top:calc(100% + 5px); right:0; max-width:260px; padding:3px 7px; border-radius:4px; background:#111214; color:#dbdee1; font-size:12px; font-weight:500; line-height:18px; white-space:nowrap; box-shadow:0 2px 5px rgb(0 0 0 / 30%); }
+      .action-status.error { color:#ff6b70; }
+      @media (prefers-reduced-motion:reduce) { .actions { transition:none; } }
       [hidden] { display:none !important; }
     `);
     shadow.adoptedStyleSheets = [sheet];
@@ -1096,9 +1111,10 @@
     const article = document.createElement("article");
     article.className = "message";
     article.setAttribute("role", "article");
-    const avatar = document.createElement("div");
+    const avatar = document.createElement("button");
+    avatar.type = "button";
     avatar.className = "avatar";
-    avatar.setAttribute("aria-hidden", "true");
+    avatar.classList.add("profile-trigger");
     const avatarImage = document.createElement("img");
     avatarImage.alt = "";
     avatarImage.hidden = true;
@@ -1115,8 +1131,10 @@
     header.className = "header";
     const authorGroup = document.createElement("span");
     authorGroup.className = "author-group";
-    const author = document.createElement("strong");
+    const author = document.createElement("button");
+    author.type = "button";
     author.className = "author";
+    author.classList.add("profile-trigger");
     const badges = document.createElement("span");
     badges.className = "badges";
     authorGroup.append(author, badges);
@@ -1145,8 +1163,119 @@
     mediaFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads");
     const disposeCurrentMedia = configureMediaFrame(mediaFrame, key, null);
     body.append(reply, header, history, contentLine, attachments, mediaFrame);
-    article.append(avatar, body);
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    actions.setAttribute("role", "toolbar");
+    actions.setAttribute("aria-label", "Actions for deleted message author");
+    const profileAction = document.createElement("button");
+    profileAction.type = "button";
+    profileAction.className = "action";
+    profileAction.textContent = "Open profile";
+    const copyIdAction = document.createElement("button");
+    copyIdAction.type = "button";
+    copyIdAction.className = "action";
+    copyIdAction.textContent = "Copy ID";
+    const copyMentionAction = document.createElement("button");
+    copyMentionAction.type = "button";
+    copyMentionAction.className = "action";
+    copyMentionAction.textContent = "Copy mention";
+    const timeoutAction = document.createElement("button");
+    timeoutAction.type = "button";
+    timeoutAction.className = "action timeout";
+    timeoutAction.textContent = "Timeout 7d";
+    const actionStatus = document.createElement("span");
+    actionStatus.className = "action-status";
+    actionStatus.setAttribute("role", "status");
+    actionStatus.setAttribute("aria-live", "polite");
+    actionStatus.hidden = true;
+    actions.append(profileAction, copyIdAction, copyMentionAction, timeoutAction, actionStatus);
+    article.append(avatar, body, actions);
     shadow.append(article);
+
+    let actionUserId = null;
+    let actionGuildId = null;
+    let actionAuthor = "Unknown author";
+    let actionStatusTimer = null;
+
+    function suppressChatAction(event) {
+      event.stopPropagation();
+    }
+
+    for (const control of [avatar, author, actions]) {
+      for (const eventName of ["pointerdown", "mousedown", "click", "dblclick", "keydown"]) {
+        control.addEventListener(eventName, suppressChatAction);
+      }
+    }
+
+    function setActionStatus(message, error) {
+      clearTimeout(actionStatusTimer);
+      replaceText(actionStatus, message);
+      actionStatus.classList.toggle("error", Boolean(error));
+      actionStatus.hidden = !message;
+      if (message) {
+        actionStatusTimer = setTimeout(() => {
+          actionStatus.hidden = true;
+          replaceText(actionStatus, "");
+        }, 2400);
+      }
+    }
+
+    function legacyCopyText(value) {
+      const textArea = document.createElement("textarea");
+      textArea.value = value;
+      textArea.setAttribute("readonly", "");
+      textArea.style.position = "fixed";
+      textArea.style.left = "-9999px";
+      document.body.append(textArea);
+      textArea.select();
+      let copied = false;
+      try { copied = document.execCommand("copy"); } catch (_error) {}
+      textArea.remove();
+      return copied;
+    }
+
+    async function copyUserText(value, successMessage) {
+      if (!value) return;
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error("clipboard-api-unavailable");
+        await navigator.clipboard.writeText(value);
+        setActionStatus(successMessage, false);
+      } catch (_error) {
+        const copied = legacyCopyText(value);
+        setActionStatus(copied ? successMessage : "Copy failed", !copied);
+      }
+    }
+
+    async function openProfile() {
+      if (!actionUserId) return;
+      const response = await send({
+        type: "LDMA_USER_ACTION",
+        action: "open-profile",
+        userId: actionUserId,
+        guildId: actionGuildId
+      });
+      if (!response?.ok) setActionStatus("Profile unavailable", true);
+    }
+
+    async function timeoutForSevenDays() {
+      if (!actionUserId || !SNOWFLAKE.test(actionGuildId || "")) return;
+      const confirmed = window.confirm(`Timeout ${actionAuthor} for 7 days?`);
+      if (!confirmed) return;
+      const response = await send({
+        type: "LDMA_USER_ACTION",
+        action: "timeout-7d",
+        userId: actionUserId,
+        guildId: actionGuildId
+      });
+      setActionStatus(response?.ok ? `Timed out ${actionAuthor} for 7 days` : "Timeout unavailable", !response?.ok);
+    }
+
+    avatar.addEventListener("click", openProfile);
+    author.addEventListener("click", openProfile);
+    profileAction.addEventListener("click", openProfile);
+    copyIdAction.addEventListener("click", () => copyUserText(actionUserId, "User ID copied"));
+    copyMentionAction.addEventListener("click", () => copyUserText(actionUserId && `<@${actionUserId}>`, "Mention copied"));
+    timeoutAction.addEventListener("click", timeoutForSevenDays);
 
     avatarImage.addEventListener("error", () => {
       avatarImage.hidden = true;
@@ -1260,6 +1389,19 @@
     const render = (record) => {
       lastRecord = record;
       const name = record.author || "Unknown author";
+      const nextUserId = SNOWFLAKE.test(String(record.authorId || "")) ? String(record.authorId) : null;
+      const nextGuildId = SNOWFLAKE.test(String(record.guildId || "")) ? String(record.guildId) : null;
+      if (nextUserId !== actionUserId || nextGuildId !== actionGuildId) setActionStatus("", false);
+      actionUserId = nextUserId;
+      actionGuildId = nextGuildId;
+      actionAuthor = name;
+      const profileLabel = nextUserId ? `Open ${name}'s profile` : "Profile unavailable for this archived message";
+      avatar.disabled = !nextUserId;
+      author.disabled = !nextUserId;
+      avatar.setAttribute("aria-label", profileLabel);
+      author.setAttribute("aria-label", profileLabel);
+      actions.hidden = !nextUserId;
+      timeoutAction.hidden = !nextGuildId;
       replaceText(author, name);
       applyAuthorPresentation(record);
       const time = storedTime(record);
@@ -1314,6 +1456,7 @@
     };
     reducedMotion.addEventListener("change", onMotionPreference);
     render.dispose = () => {
+      clearTimeout(actionStatusTimer);
       reducedMotion.removeEventListener("change", onMotionPreference);
       if (authorAnimation) authorAnimation.cancel();
       authorAnimation = null;
