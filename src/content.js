@@ -5,11 +5,28 @@
   const Protocol = globalThis.LocalDiscordArchiveProtocol;
   if (!Core || !Protocol || !globalThis.chrome || !chrome.runtime) return;
 
+  const INSTALL_KEY = Symbol.for("BridgeModTools.contentScript.v1");
+  const existingController = globalThis[INSTALL_KEY];
+  if (existingController && typeof existingController.recover === "function") {
+    existingController.recover("duplicate-injection");
+    return;
+  }
+  const controller = {
+    pendingRecovery: false,
+    recover() { this.pendingRecovery = true; }
+  };
+  try {
+    Object.defineProperty(globalThis, INSTALL_KEY, { configurable: false, enumerable: false, value: controller });
+  } catch (_error) {
+    try { globalThis[INSTALL_KEY] = controller; } catch (_ignored) {}
+  }
+
   const T = Protocol.TYPES;
   const MESSAGE_SELECTOR = "li[id^='chat-messages-'], [data-list-item-id^='chat-messages___']";
   const LIST_SELECTOR = ["[data-list-id='chat-messages']", "ol[aria-label*='essages']", "[role='list'][aria-label*='essages']"].join(",");
   const AUTHOR_SELECTORS = ["[id^='message-username-']", "[class*='username_']"];
   const BRIDGE = "LDMA_BRIDGE_V1";
+  const LIVE_HEALTH = "LDMA_REPORT_LIVE_HEALTH";
   const EDIT_EVENT = "LDMA_EDIT_BEFORE_V1";
   const SNOWFLAKE = /^\d{15,25}$/;
   const captureSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
@@ -24,11 +41,21 @@
     pendingRecords: new Map(), pendingRetractions: new Set(), recentRemovals: new Map(), pendingRetainedKeys: new Set(), pendingReleaseKeys: new Set(), flushTimer: null, flushPromise: null,
     healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), editRenderers: new Map(), spacingFrame: 0,
     pendingConfirmedMounts: new Map(), pendingEdits: new Map(),
-    lastMediaRecoveryAt: -Infinity
+    lastMediaRecoveryAt: -Infinity,
+    pageHookLastSeenAt: -Infinity, bootstrapRequestedAt: -Infinity, bootstrapPromise: null
   };
 
   function send(command) {
     return chrome.runtime.sendMessage(command).catch(() => ({ ok: false, reason: "broker-unavailable" }));
+  }
+
+  function requestPageHook(reason) {
+    const now = performance.now();
+    if (state.bootstrapPromise || now - state.bootstrapRequestedAt < 1500) return state.bootstrapPromise || Promise.resolve();
+    state.bootstrapRequestedAt = now;
+    state.bootstrapPromise = send({ type: "LDMA_ENSURE_BOOTSTRAP", reason: String(reason || "watchdog").slice(0, 80) })
+      .finally(() => { state.bootstrapPromise = null; });
+    return state.bootstrapPromise;
   }
 
   function extensionFrameOrigin() {
@@ -145,22 +172,26 @@
     };
   }
 
-  function reportHealth(status, detail) {
+  function reportHealth(status, detail, force) {
     const signature = `${status}:${detail}`;
-    if (signature === state.healthSignature) return;
-    state.healthSignature = signature;
-    send({ type: T.SET_HEALTH, status, detail }).catch(() => {});
+    const changed = signature !== state.healthSignature;
+    if (!force && !changed) return;
+    if (changed) {
+      state.healthSignature = signature;
+      send({ type: T.SET_HEALTH, status, detail }).catch(() => {});
+    }
+    send({ type: LIVE_HEALTH, status, detail }).catch(() => {});
   }
 
-  function reportCombinedHealth(active) {
+  function reportCombinedHealth(active, force) {
     if (!state.route) {
-      reportHealth("unsupported", "This page is not a supported Discord channel route.");
+      return;
     } else if (!active) {
-      reportHealth("degraded", "No active Discord message list was found; capture is suspended.");
+      reportHealth("degraded", "No active Discord message list was found; capture is suspended.", force);
     } else if (state.pageHookStatus === "active") {
-      reportHealth("active", `${state.pageHookDetail} Archiving rendered messages locally.`);
+      reportHealth("active", `${state.pageHookDetail} Archiving rendered messages locally.`, force);
     } else {
-      reportHealth("degraded", `${state.pageHookDetail} Rendered-message capture and conservative DOM fallback remain active.`);
+      reportHealth("degraded", `${state.pageHookDetail} Rendered-message capture and conservative DOM fallback remain active.`, force);
     }
   }
 
@@ -2089,24 +2120,37 @@
     window.addEventListener("message", (event) => {
       const message = event.data;
       if (event.source !== window || !message || message.bridge !== BRIDGE) return;
+      if (message.kind === "ready-request") {
+        signalPageBridgeReady();
+        return;
+      }
       if (message.kind === "status" && ["active", "searching", "degraded"].includes(message.status)) {
+        state.pageHookLastSeenAt = performance.now();
         state.pageHookStatus = message.status;
         state.pageHookDetail = Core.normalizeText(message.detail).slice(0, 220) || "Discord deletion event hook status unavailable.";
         reportCombinedHealth(state.activeList && { node: state.activeList });
         return;
       }
       if (message.kind === "edit-before") {
+        checkRoute();
         confirmEditLifecycle(message);
         return;
       }
       if (!SNOWFLAKE.test(String(message.channelId || "")) || !Array.isArray(message.ids)) return;
       const ids = [...new Set(message.ids.slice(0, 200).map(String))];
+      // Discord can enter a channel and deliver the first lifecycle event before
+      // the 300 ms SPA route poll runs. Synchronize the route at the event boundary
+      // so the first edit/delete is never rejected as belonging to the old page.
+      checkRoute();
       if (message.kind === "retained") {
         confirmRetainedDeletion(String(message.channelId), ids).catch(() => {});
       } else if (message.kind === "delete") {
         confirmLifecycleDeletion(String(message.channelId), ids).catch(() => {});
       }
     });
+  }
+
+  function signalPageBridgeReady() {
     window.postMessage({ bridge: BRIDGE, kind: "isolated-ready" }, "*");
   }
 
@@ -2125,11 +2169,17 @@
       state.listIdentity = null;
       removeTombstone();
       removeEditHistories();
+      if (!route) send({ type: LIVE_HEALTH, status: "inactive", detail: "This Discord document is outside a channel route." }).catch(() => {});
+      refreshArchive().catch(() => {});
+      if (route) requestPageHook("channel-route-entered").catch(() => {});
       setTimeout(() => snapshotRenderedMessages(true), Core.DEFAULTS.routeQuietMs + 50);
     }
   }
 
   async function initialize() {
+    installPageBridge();
+    if (state.route) reportHealth("starting", "Connecting this Discord document to local capture.");
+    requestPageHook("content-start").catch(() => {});
     await refreshArchive();
     function connectUpdates() {
       const port = chrome.runtime.connect({ name: "ldma-updates" });
@@ -2137,6 +2187,7 @@
         if (message.type === "LDMA_ARCHIVE_CHANGED") refreshArchive().catch(() => {});
       });
       port.onDisconnect.addListener(() => setTimeout(connectUpdates, 500));
+      if (state.route) reportCombinedHealth(state.activeList && { node: state.activeList }, true);
     }
     connectUpdates();
     const root = document.getElementById("app-mount") || document.documentElement;
@@ -2147,10 +2198,28 @@
     window.addEventListener("resize", scheduleTombstoneSpacing, { passive: true });
     setInterval(checkRoute, 300);
     setInterval(() => snapshotRenderedMessages(true), 2000);
+    setInterval(() => {
+      if (state.route && (state.pageHookStatus !== "active" ||
+        performance.now() - state.pageHookLastSeenAt > 15000)) {
+        requestPageHook("lifecycle-watchdog").catch(() => {});
+      }
+    }, 5000);
+    setInterval(() => {
+      if (state.route) reportCombinedHealth(state.activeList && { node: state.activeList }, true);
+    }, 15000);
     // Also heals missed change notifications if Chrome suspended the MV3 worker.
     setInterval(() => refreshArchive().catch(() => {}), 10000);
     snapshotRenderedMessages(true);
-    installPageBridge();
+    signalPageBridgeReady();
+    controller.recover = function recoverContent(reason) {
+      requestPageHook(reason || "content-recovery").catch(() => {});
+      refreshArchive().then(() => {
+        checkRoute();
+        snapshotRenderedMessages(true);
+        signalPageBridgeReady();
+      }).catch(() => {});
+    };
+    if (controller.pendingRecovery) controller.recover("queued-injection");
   }
 
   initialize().catch(() => reportHealth("degraded", "The local archive broker is unavailable."));

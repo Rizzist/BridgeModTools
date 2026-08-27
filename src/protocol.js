@@ -29,7 +29,7 @@
       paused: false,
       health: {
         status: "starting",
-        detail: "Reload Discord once after installing or reloading this unpacked extension.",
+        detail: "Open a Discord channel; capture connects without a manual page refresh.",
         updatedAt: 0
       },
       records: []

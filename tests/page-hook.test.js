@@ -12,6 +12,7 @@ function runHook(options) {
   const dispatched = [];
   const posted = [];
   const subscriptions = new Map();
+  const intervals = [];
   const messages = new Map();
   const makeMessage = (id, deleted, content, editedTimestamp) => ({
     id,
@@ -76,7 +77,8 @@ function runHook(options) {
   const rejectingStore = { _dispatcher: rejectingDispatcher, getName() { return "MessageStore"; } };
   const webpackRequire = function webpackRequire() {};
   const moduleExports = {};
-  Object.defineProperty(moduleExports, "Z", { enumerable: true, get() { return messageStore; } });
+  let storeAvailable = !settings.delayedStore;
+  Object.defineProperty(moduleExports, "Z", { enumerable: true, get() { return storeAvailable ? messageStore : {}; } });
   webpackRequire.c = {
     "0": { exports: { rejectingStore } },
     "1": { exports: { fallbackDispatcher } },
@@ -106,13 +108,147 @@ function runHook(options) {
   class CustomEvent {
     constructor(type, options) { this.type = type; this.detail = options?.detail; }
   }
-  const context = vm.createContext({ window, CustomEvent, setInterval() { return 1; }, Date, Math, Object, Array, Set, Map, WeakMap, WeakSet, String, Boolean });
+  const context = vm.createContext({
+    window, CustomEvent,
+    setInterval(callback) { intervals.push(callback); return intervals.length; },
+    Date, Math, Object, Array, Set, Map, WeakMap, WeakSet, String, Boolean, Symbol
+  });
+  if (settings.readyBeforeHook) {
+    window.addEventListener("message", (event) => {
+      if (event.data?.bridge === "LDMA_BRIDGE_V1" && event.data.kind === "ready-request") {
+        window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "isolated-ready" }, "*");
+      }
+    });
+    window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "isolated-ready" }, "*");
+  }
   const source = fs.readFileSync(path.resolve(__dirname, "../src/page-hook.js"), "utf8");
   vm.runInContext(source, context);
   window.webpackChunkdiscord_app = chunks;
-  window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "isolated-ready" }, "*");
-  return { posted, dispatched, subscriptions, fallbackSubscriptions, handlerNode, messages, dispatcher, window };
+  const ready = () => window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "isolated-ready" }, "*");
+  if (!settings.deferReady && !settings.readyBeforeHook) ready();
+  return {
+    posted, dispatched, subscriptions, fallbackSubscriptions, handlerNode, messages, dispatcher, window, ready,
+    reinject() { vm.runInContext(source, context); },
+    makeStoreAvailable() { storeAvailable = true; },
+    replaceStoreDispatcher() {
+      const replacementSubscriptions = new Map();
+      const replacementNode = {
+        name: "MessageStore",
+        actionHandler: {
+          MESSAGE_DELETE(action) { messages.delete(action.id); },
+          MESSAGE_DELETE_BULK(action) { for (const id of action.ids) messages.delete(id); },
+          MESSAGE_UPDATE(action) {
+            const incoming = action.message || action;
+            const previous = messages.get(incoming.id);
+            if (previous) messages.set(incoming.id, makeMessage(incoming.id, previous.deleted,
+              incoming.content || previous.content, incoming.editedTimestamp || incoming.edited_timestamp));
+          }
+        }
+      };
+      const replacementDispatcher = {
+        _actionHandlers: { _dependencyGraph: { nodes: { message_store_token: replacementNode } } },
+        dispatch(action) {
+          const handler = replacementNode.actionHandler[action && action.type];
+          if (typeof handler === "function") handler(action);
+        },
+        subscribe(type, callback) { replacementSubscriptions.set(type, callback); },
+        unsubscribe(type) { replacementSubscriptions.delete(type); }
+      };
+      messageStore._dispatcher = replacementDispatcher;
+      return { dispatcher: replacementDispatcher, handlerNode: replacementNode, subscriptions: replacementSubscriptions };
+    },
+    tick(count) {
+      for (let index = 0; index < (count || 1); index += 1) for (const callback of [...intervals]) callback();
+    },
+    intervalCount() { return intervals.length; },
+    listenerCount(type) { return (listeners.get(type) || []).length; }
+  };
 }
+
+test("duplicate page-hook injection recovers in place without duplicate listeners, timers, wrappers, or events", () => {
+  const result = runHook();
+  const originalDeleteWrapper = result.handlerNode.actionHandler.MESSAGE_DELETE;
+  assert.equal(result.intervalCount(), 1);
+  assert.equal(result.listenerCount("message"), 1);
+
+  result.reinject();
+  assert.equal(result.intervalCount(), 1);
+  assert.equal(result.listenerCount("message"), 1);
+  assert.equal(result.handlerNode.actionHandler.MESSAGE_DELETE, originalDeleteWrapper);
+
+  result.handlerNode.actionHandler.MESSAGE_DELETE({
+    channelId: "777777777777777777",
+    id: "888888888888888881"
+  });
+  assert.equal(result.posted.filter((message) => message.kind === "retained").length, 1);
+});
+
+test("cold recovery revisits a previously seen mutable export and activates MessageStore", () => {
+  const result = runHook({ delayedStore: true });
+  assert.equal(result.posted.some((message) => message.kind === "status" && message.status === "active"), false);
+  result.makeStoreAvailable();
+  result.tick(4);
+  assert.equal(result.posted.some((message) => message.kind === "status" && message.status === "active"), true);
+  result.handlerNode.actionHandler.MESSAGE_DELETE({
+    channelId: "777777777777777777",
+    id: "888888888888888881"
+  });
+  assert.equal(result.messages.get("888888888888888881").deleted, true);
+});
+
+test("reinjection repairs a Discord handler that was replaced after activation", () => {
+  const result = runHook();
+  result.handlerNode.actionHandler.MESSAGE_DELETE = function replacement(action) { result.messages.delete(action.id); };
+  result.reinject();
+  result.handlerNode.actionHandler.MESSAGE_DELETE({
+    channelId: "777777777777777777",
+    id: "888888888888888881"
+  });
+  assert.equal(result.messages.get("888888888888888881").deleted, true);
+  assert.equal(result.posted.filter((message) => message.kind === "retained").length, 1);
+});
+
+test("edit lifecycle emitted before isolated readiness is buffered and delivered once", () => {
+  const result = runHook({ deferReady: true });
+  result.handlerNode.actionHandler.MESSAGE_UPDATE({
+    message: {
+      channel_id: "777777777777777777",
+      id: "888888888888888881",
+      content: "early edit",
+      edited_timestamp: "2026-08-27T10:11:12.000Z"
+    }
+  });
+  assert.equal(result.dispatched.filter((event) => event.type === "LDMA_EDIT_BEFORE_V1").length, 0);
+  result.ready();
+  assert.equal(result.posted.filter((message) => message.kind === "edit-before").length, 1);
+});
+
+test("a late page hook requests a fresh ready handshake and flushes lifecycle events", () => {
+  const result = runHook({ readyBeforeHook: true });
+  assert.equal(result.posted.filter((message) => message.kind === "ready-request").length, 1);
+  result.handlerNode.actionHandler.MESSAGE_DELETE({
+    channelId: "777777777777777777",
+    id: "888888888888888881"
+  });
+  assert.equal(result.posted.filter((message) => message.kind === "retained").length, 1);
+});
+
+test("MessageStore dispatcher replacement migrates subscriptions and repairs retention before reporting active", () => {
+  const result = runHook();
+  const replacement = result.replaceStoreDispatcher();
+  result.tick(1);
+  assert.equal(result.subscriptions.size, 0);
+  assert.equal(typeof replacement.subscriptions.get("MESSAGE_DELETE"), "function");
+  assert.equal(typeof replacement.subscriptions.get("MESSAGE_DELETE_BULK"), "function");
+  replacement.handlerNode.actionHandler.MESSAGE_DELETE({
+    channelId: "777777777777777777",
+    id: "888888888888888881"
+  });
+  assert.equal(result.messages.get("888888888888888881").deleted, true);
+  assert.equal(result.posted.filter((message) => message.kind === "retained").length, 1);
+  const statuses = result.posted.filter((message) => message.kind === "status");
+  assert.equal(statuses.at(-1).status, "active");
+});
 
 test("main-world hook discovers Flux structurally and emits only normalized deletion IDs", () => {
   const { posted, subscriptions, fallbackSubscriptions } = runHook();

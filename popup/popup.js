@@ -20,6 +20,7 @@
   const searchSummary = document.getElementById("search-summary");
   const Core = globalThis.LocalDiscordArchiveCore;
   let currentArchive = { records: [] };
+  let currentLiveHealth = null;
   let missingMediaOrigins = [];
 
   function send(command) {
@@ -68,6 +69,17 @@
       : "No saved deleted messages yet.";
   }
 
+  function renderHealth(archive) {
+    const currentHealth = currentLiveHealth;
+    const healthAge = Date.now() - Number(currentHealth?.updatedAt);
+    const fresh = Number(currentHealth?.updatedAt) > 0 && healthAge >= 0 && healthAge <= 45000;
+    const healthState = fresh ? currentHealth.status : "disconnected";
+    health.dataset.state = healthState === "active" ? "active" : "degraded";
+    health.textContent = fresh
+      ? `${healthState === "active" ? "Active" : "Degraded"}: ${currentHealth.detail}`
+      : `Disconnected: no live Discord capture document has reported recently.${archive.health?.detail ? ` Last diagnostic: ${archive.health.detail}` : ""}`;
+  }
+
   function render(archive) {
     currentArchive = archive;
     const records = Array.isArray(archive.records) ? archive.records : [];
@@ -76,10 +88,7 @@
     recordCount.textContent = String(records.length);
     editedCount.textContent = String(records.filter(Core.hasEdits).length);
     deletedCount.textContent = String(records.filter((record) => Core.isDeletedStatus(record.status)).length);
-    const currentHealth = archive.health || { status: "starting", detail: "Waiting for Discord." };
-    const healthState = currentHealth.status;
-    health.dataset.state = healthState;
-    health.textContent = `${healthState === "active" ? "Active" : "Degraded"}: ${currentHealth.detail}`;
+    renderHealth(archive);
     renderSearch();
   }
 
@@ -112,6 +121,12 @@
   async function refresh() {
     const response = await send({ type: T.GET_ARCHIVE });
     if (response.archive) render(response.archive);
+  }
+
+  async function refreshLiveHealth() {
+    const response = await send({ type: "LDMA_GET_LIVE_HEALTH" });
+    currentLiveHealth = response.health || null;
+    renderHealth(currentArchive);
   }
 
   paused.addEventListener("change", async () => {
@@ -147,9 +162,11 @@
     port.onMessage.addListener((message) => {
       if (message.type === "LDMA_ARCHIVE_CHANGED") refresh().catch(() => {});
       if (message.type === "LDMA_MEDIA_CHANGED") refreshMediaStats().catch(() => {});
+      if (message.type === "LDMA_LIVE_HEALTH_CHANGED") refreshLiveHealth().catch(() => {});
     });
     port.onDisconnect.addListener(() => setTimeout(connectUpdates, 500));
   }
   connectUpdates();
-  Promise.all([refresh(), refreshMediaStats()]).catch(() => { status.textContent = "Could not reach the local archive broker."; });
+  Promise.all([refresh(), refreshLiveHealth(), refreshMediaStats()]).catch(() => { status.textContent = "Could not reach the local archive broker."; });
+  setInterval(() => renderHealth(currentArchive), 5000);
 })();

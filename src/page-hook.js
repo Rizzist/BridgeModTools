@@ -1,18 +1,35 @@
 (function installLocalDiscordLifecycleHook() {
   "use strict";
 
+  const INSTALL_KEY = Symbol.for("BridgeModTools.pageHook.v1");
+  const existingController = window[INSTALL_KEY];
+  if (existingController && typeof existingController.recover === "function") {
+    existingController.recover("duplicate-injection");
+    return;
+  }
+  const controller = {
+    pendingRecovery: false,
+    recover() { this.pendingRecovery = true; }
+  };
+  try {
+    Object.defineProperty(window, INSTALL_KEY, { configurable: false, enumerable: false, value: controller });
+  } catch (_error) {
+    try { window[INSTALL_KEY] = controller; } catch (_ignored) {}
+  }
+
   const BRIDGE = "LDMA_BRIDGE_V1";
   const EDIT_EVENT = "LDMA_EDIT_BEFORE_V1";
   const SNOWFLAKE = /^\d{15,25}$/;
   const MAX_BULK_IDS = 200;
+  const MAX_RETAINED_KEYS = 5000;
   const webpackInstances = new Set();
   const scannedModules = new WeakMap();
   const dispatchers = new Set();
   const fallbackDispatchers = new Set();
   const CORE_STORES = new Set(["MessageStore", "ChannelStore", "GuildStore", "ReadStateStore"]);
   const bufferedEvents = [];
-  const patchedHandlerNodes = new WeakSet();
-  const patchedRetentionDispatchers = new WeakSet();
+  const patchedHandlerNodes = new WeakMap();
+  const patchedRetentionDispatchers = new WeakMap();
   const releaseKeys = new Set();
   const retainedKeys = new Set();
   let isolatedReady = false;
@@ -23,15 +40,18 @@
   let lastStatus = "";
   let captureSequence = 0;
   let editSequence = 0;
+  let observedChunkArray = null;
+  let lastForcedScanAt = -Infinity;
+  let forcedScanAttempts = 0;
   const editSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 
   function bridgeMessage(kind, payload) {
     window.postMessage(Object.assign({ bridge: BRIDGE, kind }, payload || {}), "*");
   }
 
-  function report(status, detail) {
+  function report(status, detail, force) {
     const signature = `${status}:${detail}`;
-    if (signature === lastStatus) return;
+    if (!force && signature === lastStatus) return;
     lastStatus = signature;
     bridgeMessage("status", { status, detail });
   }
@@ -108,6 +128,11 @@
       editSessionId,
       editSequence: editSequence += 1
     };
+    if (!isolatedReady) {
+      bufferedEvents.push(detail);
+      if (bufferedEvents.length > 100) bufferedEvents.shift();
+      return;
+    }
     try {
       window.dispatchEvent(new CustomEvent(EDIT_EVENT, { detail: JSON.stringify(detail) }));
     } catch (_error) {
@@ -141,43 +166,52 @@
       dataFunction(value, "dispatch") && dataFunction(value, "subscribe") && dataFunction(value, "unsubscribe"));
   }
 
-  function subscribeDispatcher(dispatcher, preferred) {
-    if (!isDispatcher(dispatcher)) return;
-    if (preferred && dispatcher === fallbackDispatcher && dispatchers.has(dispatcher)) {
-      coreDispatcher = dispatcher;
-      fallbackDispatcher = null;
-      report(messageStorePatched ? "active" : "searching", messageStorePatched
-        ? "Discord MessageStore edit history and deletion retention are active."
-        : "Discord core dispatcher connected; waiting for MessageStore retention.");
-      return;
-    }
-    if (dispatchers.has(dispatcher)) return;
+  function unsubscribeDispatcher(dispatcher) {
+    if (!dispatcher) return;
+    disableDispatcherRetention(dispatcher);
+    try { dispatcher.unsubscribe("MESSAGE_DELETE", onDelete); } catch (_error) {}
+    try { dispatcher.unsubscribe("MESSAGE_DELETE_BULK", onBulkDelete); } catch (_error) {}
+    dispatchers.delete(dispatcher);
+    if (coreDispatcher === dispatcher) coreDispatcher = null;
+    if (fallbackDispatcher === dispatcher) fallbackDispatcher = null;
+  }
+
+  function subscribeDispatcher(dispatcher, preferred, authoritative) {
+    if (!isDispatcher(dispatcher)) return false;
+    if (preferred && coreDispatcher === dispatcher && dispatchers.has(dispatcher)) return true;
     if (preferred) {
-      if (coreDispatcher) return;
+      if (coreDispatcher && coreDispatcher !== dispatcher && !authoritative) return false;
     } else {
-      if (coreDispatcher || fallbackDispatcher) return;
+      if (coreDispatcher || (fallbackDispatcher && fallbackDispatcher !== dispatcher)) return false;
     }
-    try {
-      dispatcher.subscribe("MESSAGE_DELETE", onDelete);
-      dispatcher.subscribe("MESSAGE_DELETE_BULK", onBulkDelete);
-      if (preferred) {
-        coreDispatcher = dispatcher;
-        if (fallbackDispatcher && fallbackDispatcher !== dispatcher) {
-          try { fallbackDispatcher.unsubscribe("MESSAGE_DELETE", onDelete); } catch (_ignored) {}
-          try { fallbackDispatcher.unsubscribe("MESSAGE_DELETE_BULK", onBulkDelete); } catch (_ignored) {}
-          dispatchers.delete(fallbackDispatcher);
-          fallbackDispatcher = null;
-        }
-      } else fallbackDispatcher = dispatcher;
+    if (!dispatchers.has(dispatcher)) {
+      try {
+        dispatcher.subscribe("MESSAGE_DELETE", onDelete);
+        dispatcher.subscribe("MESSAGE_DELETE_BULK", onBulkDelete);
+      } catch (_error) {
+        try { dispatcher.unsubscribe("MESSAGE_DELETE", onDelete); } catch (_ignored) {}
+        try { dispatcher.unsubscribe("MESSAGE_DELETE_BULK", onBulkDelete); } catch (_ignored) {}
+        return false;
+      }
       dispatchers.add(dispatcher);
-      report(messageStorePatched ? "active" : "searching", messageStorePatched
-        ? "Discord MessageStore edit history and deletion retention are active."
-        : preferred ? "Discord core dispatcher connected; waiting for MessageStore retention."
-        : "A deletion dispatcher candidate is connected; waiting for Discord's core store dispatcher.");
-    } catch (_error) {
-      try { dispatcher.unsubscribe("MESSAGE_DELETE", onDelete); } catch (_ignored) {}
-      try { dispatcher.unsubscribe("MESSAGE_DELETE_BULK", onBulkDelete); } catch (_ignored) {}
     }
+    if (preferred) {
+      const previousCore = coreDispatcher;
+      const previousFallback = fallbackDispatcher;
+      coreDispatcher = dispatcher;
+      if (fallbackDispatcher === dispatcher) fallbackDispatcher = null;
+      // The replacement is subscribed before the previous path is detached, so
+      // a rejected Discord dispatcher can never tear down a working hook.
+      if (previousCore && previousCore !== dispatcher) unsubscribeDispatcher(previousCore);
+      if (previousFallback && previousFallback !== dispatcher && previousFallback !== previousCore) {
+        unsubscribeDispatcher(previousFallback);
+      }
+    } else fallbackDispatcher = dispatcher;
+    report(messageStorePatched ? "active" : "searching", messageStorePatched
+      ? "Discord MessageStore edit history and deletion retention are active."
+      : preferred ? "Discord core dispatcher connected; waiting for MessageStore retention."
+      : "A deletion dispatcher candidate is connected; waiting for Discord's core store dispatcher.");
+    return true;
   }
 
   function coreStoreInfo(value) {
@@ -242,6 +276,9 @@
         channelMessages.receiveMessage(message);
         retainedIds.push(entry.id);
         retainedKeys.add(`${channelId}:${entry.id}`);
+        while (retainedKeys.size > MAX_RETAINED_KEYS) {
+          retainedKeys.delete(retainedKeys.values().next().value);
+        }
       } catch (_error) {}
     }
     if (retainedIds.length) emitRetained(channelId, retainedIds, isBulk);
@@ -264,29 +301,45 @@
   }
 
   function patchDispatcherRetention(store, dispatcher, options) {
-    if (patchedRetentionDispatchers.has(dispatcher)) return true;
+    const installed = patchedRetentionDispatchers.get(dispatcher);
+    if (installed && dataFunction(dispatcher, "dispatch") === installed.handler) {
+      const settings = options || {};
+      installed.captureEdits = settings.edits !== false;
+      installed.deleteTypes = settings.deleteTypes instanceof Set
+        ? new Set(settings.deleteTypes)
+        : new Set(["MESSAGE_DELETE", "MESSAGE_DELETE_BULK"]);
+      messageStorePatched = true;
+      return true;
+    }
+    if (installed) patchedRetentionDispatchers.delete(dispatcher);
     const settings = options || {};
-    const captureEdits = settings.edits !== false;
-    const captureDeleteTypes = settings.deleteTypes instanceof Set
-      ? settings.deleteTypes
-      : new Set(["MESSAGE_DELETE", "MESSAGE_DELETE_BULK"]);
+    const record = {
+      captureEdits: settings.edits !== false,
+      deleteTypes: settings.deleteTypes instanceof Set
+        ? new Set(settings.deleteTypes)
+        : new Set(["MESSAGE_DELETE", "MESSAGE_DELETE_BULK"]),
+      original: null,
+      handler: null
+    };
     const original = dataFunction(dispatcher, "dispatch");
     if (!original) return false;
+    record.original = original;
     try {
       const retainingDispatch = function localArchiveRetainingDispatch(action) {
         const type = action && action.type;
-        if (captureEdits && type === "MESSAGE_UPDATE") emitEditBefore(editLifecycle(store, action));
+        if (record.captureEdits && type === "MESSAGE_UPDATE") emitEditBefore(editLifecycle(store, action));
         const isBulk = type === "MESSAGE_DELETE_BULK";
         const key = `${cleanId(action && (action.channelId || action.channel_id))}:${cleanId(action && action.id)}`;
-        const shouldRetain = captureDeleteTypes.has(type) && !releaseKeys.has(key);
+        const shouldRetain = record.deleteTypes.has(type) && !releaseKeys.has(key);
         const captured = shouldRetain ? captureCachedMessages(store, action, isBulk).captured : [];
         const result = original.apply(this, arguments);
         if (captured.length) retainCachedMessages(store, action, isBulk, captured);
         return result;
       };
+      record.handler = retainingDispatch;
       dispatcher.dispatch = retainingDispatch;
       if (dataFunction(dispatcher, "dispatch") !== retainingDispatch) return false;
-      patchedRetentionDispatchers.add(dispatcher);
+      patchedRetentionDispatchers.set(dispatcher, record);
       messageStorePatched = true;
       report("active", "Discord MessageStore edit history and deletion retention fallback is active.");
       return true;
@@ -295,28 +348,55 @@
     }
   }
 
+  function disableDispatcherRetention(dispatcher) {
+    const installed = patchedRetentionDispatchers.get(dispatcher);
+    if (!installed) return;
+    installed.captureEdits = false;
+    installed.deleteTypes.clear();
+    if (dataFunction(dispatcher, "dispatch") !== installed.handler) {
+      patchedRetentionDispatchers.delete(dispatcher);
+      return;
+    }
+    try {
+      dispatcher.dispatch = installed.original;
+      if (dataFunction(dispatcher, "dispatch") === installed.original) patchedRetentionDispatchers.delete(dispatcher);
+    } catch (_error) {}
+  }
+
   function patchMessageStore(store, dispatcher) {
+    messageStorePatched = false;
     const node = messageStoreHandlerNode(store, dispatcher);
     if (!node) {
       patchDispatcherRetention(store, dispatcher);
       return;
     }
-    if (patchedHandlerNodes.has(node)) return;
     const handlers = node.actionHandler;
-    let editPatched = false;
+    const previousInstall = patchedHandlerNodes.get(node);
+    const installed = previousInstall?.handlers === handlers ? previousInstall : {};
+    let editPatched = Boolean(installed.MESSAGE_UPDATE && handlers.MESSAGE_UPDATE === installed.MESSAGE_UPDATE);
     const deletePatched = new Set();
     const originalUpdate = handlers.MESSAGE_UPDATE;
-    if (typeof originalUpdate === "function") {
+    let updateHandler = editPatched ? installed.MESSAGE_UPDATE : null;
+    if (!editPatched && typeof originalUpdate === "function") {
       const retainingUpdateHandler = function localArchiveEditHandler(action) {
         emitEditBefore(editLifecycle(store, action));
         return originalUpdate.apply(this, arguments);
       };
       try {
         handlers.MESSAGE_UPDATE = retainingUpdateHandler;
-        if (handlers.MESSAGE_UPDATE === retainingUpdateHandler) editPatched = true;
+        if (handlers.MESSAGE_UPDATE === retainingUpdateHandler) {
+          editPatched = true;
+          updateHandler = retainingUpdateHandler;
+        }
       } catch (_error) {}
     }
+    const installedDeletes = {};
     for (const [type, isBulk] of [["MESSAGE_DELETE", false], ["MESSAGE_DELETE_BULK", true]]) {
+      if (installed[type] && handlers[type] === installed[type]) {
+        deletePatched.add(type);
+        installedDeletes[type] = installed[type];
+        continue;
+      }
       const original = handlers[type];
       if (typeof original !== "function") continue;
       const retainingHandler = function localArchiveRetainingDeleteHandler(action) {
@@ -329,7 +409,10 @@
       };
       try {
         handlers[type] = retainingHandler;
-        if (handlers[type] === retainingHandler) deletePatched.add(type);
+        if (handlers[type] === retainingHandler) {
+          deletePatched.add(type);
+          installedDeletes[type] = retainingHandler;
+        }
       } catch (_error) {}
     }
     const missingDeleteTypes = new Set(["MESSAGE_DELETE", "MESSAGE_DELETE_BULK"]
@@ -339,15 +422,39 @@
       edits: !editPatched,
       deleteTypes: missingDeleteTypes
     });
+    if (!needsFallback) disableDispatcherRetention(dispatcher);
     if (needsFallback && !fallbackPatched) {
-      patchedHandlerNodes.add(node);
+      patchedHandlerNodes.set(node, Object.assign({ handlers, MESSAGE_UPDATE: updateHandler }, installedDeletes));
       messageStorePatched = false;
       report("degraded", "Discord MessageStore is only partially patchable; edit history or deletion retention may be unavailable.");
       return;
     }
-    patchedHandlerNodes.add(node);
+    patchedHandlerNodes.set(node, Object.assign({ handlers, MESSAGE_UPDATE: updateHandler }, installedDeletes));
     messageStorePatched = true;
     report("active", "Discord MessageStore edit history and deletion retention are active.");
+  }
+
+  function reconcileMessageStore(reason) {
+    if (!messageStoreCandidate) {
+      messageStorePatched = false;
+      return false;
+    }
+    const storeInfo = coreStoreInfo(messageStoreCandidate);
+    const usable = storeInfo?.name === "MessageStore" &&
+      dataFunction(messageStoreCandidate, "getMessage") && dataFunction(messageStoreCandidate, "getMessages");
+    if (!usable) {
+      messageStorePatched = false;
+      report("degraded", `Discord MessageStore identity changed during ${reason || "recovery"}; searching for its replacement.`);
+      return false;
+    }
+    if (storeInfo.dispatcher !== coreDispatcher) messageStorePatched = false;
+    if (!subscribeDispatcher(storeInfo.dispatcher, true, true) || coreDispatcher !== storeInfo.dispatcher) {
+      messageStorePatched = false;
+      report("degraded", `Discord replaced its lifecycle dispatcher during ${reason || "recovery"}; retrying safely.`);
+      return false;
+    }
+    patchMessageStore(messageStoreCandidate, storeInfo.dispatcher);
+    return messageStorePatched;
   }
 
   function shouldIgnoreValue(value) {
@@ -356,10 +463,7 @@
       const tag = value[Symbol.toStringTag];
       if (tag === "IntlMessagesProxy" || tag === "DOMTokenList") return true;
       const probe = "__ldma_proxy_probe_7d31__";
-      if (value[probe] !== undefined) {
-        try { Reflect.deleteProperty(value, probe); } catch (_ignored) {}
-        return true;
-      }
+      if (value[probe] !== undefined) return true;
     } catch (_error) {
       return true;
     }
@@ -378,16 +482,15 @@
       if (shouldIgnoreValue(value)) continue;
       const storeInfo = coreStoreInfo(value);
       if (storeInfo) {
-        subscribeDispatcher(storeInfo.dispatcher, true);
         const usableMessageStore = storeInfo.name === "MessageStore" &&
           dataFunction(value, "getMessage") && dataFunction(value, "getMessages");
         // Do not let a decoy/partial named store claim global hook health. Its
         // dispatcher must first pass subscription and become the accepted core
         // dispatcher, and the store must expose the cache reads retention needs.
-        if (usableMessageStore && storeInfo.dispatcher === coreDispatcher) {
+        if (usableMessageStore) {
           messageStoreCandidate = value;
-          patchMessageStore(value, storeInfo.dispatcher);
-        }
+          reconcileMessageStore("module-discovery");
+        } else subscribeDispatcher(storeInfo.dispatcher, true, false);
       }
       else if (fallbackDispatchers.size < 4 && isDispatcher(value)) fallbackDispatchers.add(value);
       if (depth >= 2) continue;
@@ -407,7 +510,7 @@
     }
   }
 
-  function scanWebpack(requireFunction) {
+  function scanWebpack(requireFunction, force) {
     if (!requireFunction || (typeof requireFunction !== "function" && typeof requireFunction !== "object")) return;
     webpackInstances.add(requireFunction);
     const cache = requireFunction.c;
@@ -418,16 +521,17 @@
       scannedModules.set(requireFunction, seen);
     }
     for (const [moduleId, module] of Object.entries(cache)) {
-      if (seen.has(moduleId)) continue;
+      if (!force && seen.has(moduleId)) continue;
       seen.add(moduleId);
       try { inspectExports(module && module.exports); } catch (_error) {}
     }
     if (!coreDispatcher && !fallbackDispatcher && fallbackDispatchers.size) {
-      subscribeDispatcher(fallbackDispatchers.values().next().value, false);
+      for (const dispatcher of fallbackDispatchers) {
+        subscribeDispatcher(dispatcher, false);
+        if (fallbackDispatcher) break;
+      }
     }
-    if (!messageStorePatched && messageStoreCandidate && coreDispatcher) {
-      patchMessageStore(messageStoreCandidate, coreDispatcher);
-    }
+    if (messageStoreCandidate) reconcileMessageStore("module-scan");
   }
 
   function acceptWebpackRequire(requireFunction) {
@@ -450,7 +554,11 @@
   function observeWebpackGlobal() {
     const property = "webpackChunkdiscord_app";
     if (property in window) {
-      attachWebpackArray(window[property]);
+      const current = window[property];
+      if (current && current !== observedChunkArray) {
+        observedChunkArray = current;
+        attachWebpackArray(current);
+      }
       return;
     }
     try {
@@ -460,11 +568,40 @@
         set(value) {
           delete window[property];
           window[property] = value;
+          observedChunkArray = value;
           attachWebpackArray(value);
         }
       });
     } catch (_error) {
       report("degraded", "Could not observe Discord's module loader; DOM fallback remains active.");
+    }
+  }
+
+  function recoverHook(reason) {
+    observeWebpackGlobal();
+    if (messageStoreCandidate) reconcileMessageStore(reason || "recovery");
+    if (!messageStorePatched) {
+      const backoff = Math.min(30000, forcedScanAttempts
+        ? 1500 * (2 ** Math.min(5, forcedScanAttempts - 1))
+        : 0);
+      if (Date.now() - lastForcedScanAt >= backoff) {
+        lastForcedScanAt = Date.now();
+        forcedScanAttempts += 1;
+        for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
+        if (messageStoreCandidate) reconcileMessageStore("forced-scan");
+      }
+    } else {
+      forcedScanAttempts = 0;
+    }
+    lastStatus = "";
+    if (messageStorePatched) {
+      report("active", "Discord MessageStore edit history and deletion retention are active.", true);
+    } else if (coreDispatcher) {
+      report("searching", "Discord core dispatcher connected; waiting for MessageStore retention.", true);
+    } else if (fallbackDispatcher) {
+      report("searching", "A deletion dispatcher candidate is connected; waiting for Discord's core store dispatcher.", true);
+    } else {
+      report("searching", `Waiting for Discord's lifecycle dispatcher; recovery probe ${reason || "scheduled"}.`, true);
     }
   }
 
@@ -515,10 +652,25 @@
     }
   });
 
+  // A content script may already have sent its one-time ready signal before a
+  // restored/late MAIN-world hook was injected. Request an explicit reply so
+  // buffered lifecycle events can never wait for a page refresh.
+  bridgeMessage("ready-request");
   report("searching", "Waiting for Discord's lifecycle dispatcher; DOM deletion fallback is active.");
   observeWebpackGlobal();
+  controller.recover = recoverHook;
+  if (controller.pendingRecovery) recoverHook("queued-injection");
+  let recoveryTicks = 0;
   setInterval(() => {
     for (const requireFunction of webpackInstances) scanWebpack(requireFunction);
-    if (!dispatchers.size && !webpackInstances.size && "webpackChunkdiscord_app" in window) attachWebpackArray(window.webpackChunkdiscord_app);
+    if (!dispatchers.size && !webpackInstances.size && "webpackChunkdiscord_app" in window) observeWebpackGlobal();
+    if (messageStoreCandidate) reconcileMessageStore("integrity-tick");
+    recoveryTicks += 1;
+    // Cold Discord boots can expose a mutable/lazy export after its module ID was
+    // first seen. Revisit the full cache while unresolved, and periodically
+    // revalidate an established patch in case Discord replaced its handlers.
+    if ((!messageStorePatched && recoveryTicks % 4 === 0) || recoveryTicks % 20 === 0) {
+      recoverHook(messageStorePatched ? "integrity-check" : "cold-start");
+    }
   }, 1500);
 })();

@@ -15,12 +15,13 @@ function filesBelow(directory) {
   });
 }
 
-test("manifest is MV3 with bounded local-media permissions and a narrow Discord match", () => {
+test("manifest is MV3 with bounded media access and route-safe Discord bootstrap permissions", () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.minimum_chrome_version, "133");
-  assert.deepEqual(manifest.permissions, ["storage", "offscreen", "unlimitedStorage"]);
+  assert.deepEqual(manifest.permissions, ["storage", "offscreen", "unlimitedStorage", "scripting", "webNavigation"]);
   assert.deepEqual(manifest.host_permissions, [
+    "https://discord.com/*",
     "https://cdn.discordapp.com/*",
     "https://media.discordapp.net/*",
     "https://images-ext-1.discordapp.net/*",
@@ -28,12 +29,13 @@ test("manifest is MV3 with bounded local-media permissions and a narrow Discord 
   ]);
   assert.deepEqual(manifest.optional_host_permissions, ["https://*/*"]);
   assert.equal(manifest.host_permissions.includes("https://*/*"), false);
-  assert.deepEqual(manifest.content_scripts[0].matches, ["https://discord.com/channels/*"]);
+  assert.deepEqual(manifest.content_scripts[0].matches, ["https://discord.com/*"]);
   assert.deepEqual(manifest.content_scripts[0].js, ["src/page-hook.js"]);
   assert.equal(manifest.content_scripts[0].world, "MAIN");
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
-  assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/channels/*"]);
-  assert.equal(manifest.version, "2.3.0");
+  assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
+  assert.equal("css" in manifest.content_scripts[1], false);
+  assert.equal(manifest.version, "2.3.1");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -44,6 +46,59 @@ test("manifest is MV3 with bounded local-media permissions and a narrow Discord 
   assert.match(manifest.content_security_policy.extension_pages, /media-src 'self' blob:/);
   assert.match(manifest.content_security_policy.extension_pages, /frame-ancestors 'self' https:\/\/discord\.com/);
   assert.deepEqual(manifest.background, { service_worker: "src/background.js" });
+});
+
+test("tagged releases are tested, version-checked, packaged, and published as latest", () => {
+  const workflow = fs.readFileSync(path.join(root, ".github", "workflows", "release.yml"), "utf8");
+  assert.match(workflow, /tags:\s*\n\s*- "v\*"/);
+  assert.match(workflow, /contents: write/);
+  assert.match(workflow, /npm test/);
+  assert.match(workflow, /require\('\.\/package\.json'\)\.version/);
+  assert.match(workflow, /require\('\.\/manifest\.json'\)\.version/);
+  assert.match(workflow, /BridgeModTools-\$\{GITHUB_REF_NAME\}\.zip/);
+  assert.match(workflow, /sha256sum/);
+  assert.match(workflow, /gh release create/);
+  assert.match(workflow, /--latest/);
+  assert.match(workflow, /--verify-tag/);
+});
+
+test("background self-heals fresh, restored, updated, and SPA Discord documents", () => {
+  const background = fs.readFileSync(path.join(root, "src", "background.js"), "utf8");
+  const content = fs.readFileSync(path.join(root, "src", "content.js"), "utf8");
+  const hook = fs.readFileSync(path.join(root, "src", "page-hook.js"), "utf8");
+
+  assert.match(background, /LDMA_ENSURE_BOOTSTRAP/);
+  assert.match(background, /chrome\.tabs\.query\(\{ url: \[DISCORD_TAB_PATTERN\] \}\)/);
+  assert.match(background, /chrome\.scripting\.executeScript/);
+  assert.match(background, /files: \["src\/page-hook\.js"\][\s\S]*world: "MAIN"/);
+  assert.match(background, /files: \["src\/core\.js", "src\/protocol\.js", "src\/content\.js"\][\s\S]*world: "ISOLATED"/);
+  assert.match(background, /Symbol\.for\("BridgeModTools\.contentStyle\.v1"\)/);
+  assert.match(background, /documentIds: \[documentId\]/);
+  assert.match(background, /chrome\.webNavigation\.onCommitted\.addListener/);
+  assert.match(background, /chrome\.webNavigation\.onHistoryStateUpdated\.addListener/);
+  assert.match(background, /chrome\.webNavigation\.onTabReplaced\.addListener/);
+  assert.match(background, /chrome\.tabs\.onActivated\.addListener/);
+  assert.match(background, /chrome\.runtime\.onInstalled\.addListener/);
+  assert.match(background, /chrome\.runtime\.onStartup\.addListener/);
+  assert.match(background, /sender\.origin !== "https:\/\/discord\.com"/);
+  assert.match(background, /url\.hostname === "discord\.com"/);
+  assert.equal(/discord\.com\/channels/.test(background), false);
+
+  assert.match(content, /Symbol\.for\("BridgeModTools\.contentScript\.v1"\)/);
+  assert.match(content, /existingController[\s\S]*recover\("duplicate-injection"\)/);
+  assert.match(content, /requestPageHook\("content-start"\)/);
+  assert.match(content, /requestPageHook\("channel-route-entered"\)/);
+  assert.match(content, /requestPageHook\("lifecycle-watchdog"\)/);
+  assert.match(content, /message\.kind === "ready-request"[\s\S]*signalPageBridgeReady\(\)/);
+  assert.match(content, /installPageBridge\(\);[\s\S]*await refreshArchive\(\);[\s\S]*signalPageBridgeReady\(\)/);
+
+  assert.match(hook, /Symbol\.for\("BridgeModTools\.pageHook\.v1"\)/);
+  assert.match(hook, /existingController[\s\S]*recover\("duplicate-injection"\)/);
+  assert.match(hook, /scanWebpack\(requireFunction, true\)/);
+  assert.match(hook, /bridgeMessage\("ready-request"\)/);
+  assert.match(hook, /reconcileMessageStore/);
+  assert.match(hook, /recoveryTicks % 4/);
+  assert.match(hook, /recoveryTicks % 20/);
 });
 
 test("only the serialized background broker accesses chrome storage", () => {
@@ -226,13 +281,18 @@ test("history targets the chrome-extension scheme and host for media capabilitie
 test("popup exposes saved-deletion counts and local search without unsafe HTML rendering", () => {
   const html = fs.readFileSync(path.join(root, "popup", "popup.html"), "utf8");
   const source = fs.readFileSync(path.join(root, "popup", "popup.js"), "utf8");
+  const protocol = fs.readFileSync(path.join(root, "src", "protocol.js"), "utf8");
   assert.match(html, /id="deleted-count"/);
   assert.match(html, /id="search" type="search"/);
   assert.match(html, /id="search-results"/);
   assert.match(source, /Core\.searchRecords/);
   assert.match(source, /Core\.isDeletedStatus/);
   assert.match(source, /replaceChildren/);
+  assert.match(source, /LDMA_GET_LIVE_HEALTH/);
+  assert.match(source, /healthAge >= 0 && healthAge <= 45000/);
+  assert.match(source, /LDMA_LIVE_HEALTH_CHANGED/);
   assert.equal(/innerHTML/.test(source), false);
+  assert.equal(/reload Discord once/i.test(`${html}\n${source}\n${protocol}`), false);
 });
 
 test("only the bounded media store uses network and Cache Storage primitives", () => {

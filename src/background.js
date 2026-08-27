@@ -13,6 +13,102 @@ let mediaMetadataQueue = Promise.resolve();
 let archiveCache = null;
 let creatingOffscreen = null;
 const playbackCapabilities = new Map();
+const BOOTSTRAP_COMMAND = "LDMA_ENSURE_BOOTSTRAP";
+const REPORT_LIVE_HEALTH = "LDMA_REPORT_LIVE_HEALTH";
+const GET_LIVE_HEALTH = "LDMA_GET_LIVE_HEALTH";
+const DISCORD_TAB_PATTERN = "https://discord.com/*";
+const bootstrapJobs = new Map();
+const liveHealthByDocument = new Map();
+
+function injectionTarget(tabId, documentId) {
+  if (!Number.isInteger(tabId) || !documentId) return null;
+  return { tabId, documentIds: [documentId] };
+}
+
+async function ensureDiscordBootstrap(tabId, documentId, full) {
+  const target = injectionTarget(tabId, documentId);
+  if (!target) return { ok: false, reason: "invalid-bootstrap-target" };
+  const key = `${tabId}:${documentId || "top"}:${full ? "full" : "hook"}`;
+  if (bootstrapJobs.has(key)) return bootstrapJobs.get(key);
+  const operation = (async () => {
+    await chrome.scripting.executeScript({
+      target,
+      files: ["src/page-hook.js"],
+      world: "MAIN",
+      injectImmediately: true
+    });
+    if (full) {
+      const probe = await chrome.scripting.executeScript({
+        target,
+        world: "ISOLATED",
+        func() {
+          const controller = globalThis[Symbol.for("BridgeModTools.contentScript.v1")];
+          const contentInstalled = Boolean(controller && typeof controller.recover === "function");
+          if (contentInstalled) controller.recover("background-bootstrap");
+          return {
+            contentInstalled,
+            styleInstalled: globalThis[Symbol.for("BridgeModTools.contentStyle.v1")] === true
+          };
+        }
+      });
+      const state = probe.find((result) => result && result.result)?.result || {};
+      if (!state.styleInstalled) {
+        await chrome.scripting.insertCSS({ target, files: ["src/content.css"] });
+        await chrome.scripting.executeScript({
+          target,
+          world: "ISOLATED",
+          func() {
+            globalThis[Symbol.for("BridgeModTools.contentStyle.v1")] = true;
+          }
+        });
+      }
+      if (!state.contentInstalled) {
+        await chrome.scripting.executeScript({
+          target,
+          files: ["src/core.js", "src/protocol.js", "src/content.js"],
+          world: "ISOLATED"
+        });
+      }
+    }
+    return { ok: true, reason: full ? "document-bootstrap-ensured" : "page-hook-ensured" };
+  })().catch((error) => ({
+    ok: false,
+    reason: "bootstrap-injection-failed",
+    error: String(error && error.message || error)
+  })).finally(() => bootstrapJobs.delete(key));
+  bootstrapJobs.set(key, operation);
+  return operation;
+}
+
+async function bootstrapOpenDiscordTabs() {
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({ url: [DISCORD_TAB_PATTERN] }); } catch (_error) {}
+  await Promise.allSettled(tabs.filter((tab) => Number.isInteger(tab.id))
+    .map((tab) => bootstrapDiscordTab(tab.id, true)));
+}
+
+async function reloadOpenDiscordTabs() {
+  let tabs = [];
+  try { tabs = await chrome.tabs.query({ url: [DISCORD_TAB_PATTERN] }); } catch (_error) {}
+  await Promise.allSettled(tabs.filter((tab) => Number.isInteger(tab.id))
+    .map((tab) => chrome.tabs.reload(tab.id)));
+}
+
+async function bootstrapDiscordTab(tabId, full) {
+  if (!Number.isInteger(tabId)) return { ok: false, reason: "invalid-bootstrap-tab" };
+  let frame;
+  try { frame = await chrome.webNavigation.getFrame({ tabId, frameId: 0 }); } catch (_error) {}
+  if (!frame?.documentId) return { ok: false, reason: "discord-document-unavailable" };
+  try {
+    const url = new URL(String(frame.url || ""));
+    if (url.protocol !== "https:" || url.hostname !== "discord.com" || url.port !== "") {
+      return { ok: false, reason: "not-discord-document" };
+    }
+  } catch (_error) {
+    return { ok: false, reason: "invalid-document-url" };
+  }
+  return ensureDiscordBootstrap(tabId, frame.documentId, full);
+}
 
 function mutateMediaMetadata(operation) {
   mediaMetadataQueue = mediaMetadataQueue.catch(() => undefined).then(operation);
@@ -235,26 +331,96 @@ function scheduleMediaRecovery(records) {
   return mediaQueue;
 }
 
-function senderPath(sender) {
+function extensionSenderPath(sender) {
   if (!sender || sender.id !== chrome.runtime.id) return null;
-  try { return new URL(String(sender.url || "")).pathname; } catch (_error) { return null; }
+  try {
+    const url = new URL(String(sender.url || ""));
+    return url.protocol === "chrome-extension:" && url.hostname === chrome.runtime.id && url.port === ""
+      ? url.pathname
+      : null;
+  } catch (_error) { return null; }
 }
 
 function popupSender(sender) {
-  return senderPath(sender) === "/popup/popup.html";
+  return extensionSenderPath(sender) === "/popup/popup.html";
 }
 
 function historySender(sender) {
-  return senderPath(sender) === "/history/history.html";
+  return extensionSenderPath(sender) === "/history/history.html";
 }
 
 function mediaViewerSender(sender) {
-  return senderPath(sender) === "/media/view.html" && Number.isInteger(sender.frameId) && sender.frameId > 0;
+  return extensionSenderPath(sender) === "/media/view.html" && Number.isInteger(sender.frameId) && sender.frameId > 0;
 }
 
 function discordContentSender(sender) {
-  const value = String(sender?.url || "");
-  return sender?.id === chrome.runtime.id && /^https:\/\/discord\.com\/channels\//.test(value);
+  if (sender?.id !== chrome.runtime.id || !Number.isInteger(sender.tab?.id) ||
+    !sender.documentId || sender.origin !== "https://discord.com" || sender.frameId !== 0) return false;
+  try {
+    const url = new URL(String(sender.url || ""));
+    return url.protocol === "https:" && url.hostname === "discord.com" && url.port === "";
+  } catch (_error) {
+    return false;
+  }
+}
+
+function discordChannelContentSender(sender) {
+  if (!discordContentSender(sender)) return false;
+  try {
+    const url = new URL(String(sender.tab.url || ""));
+    return url.protocol === "https:" && url.hostname === "discord.com" && url.port === "" &&
+      /^\/channels\/[^/]+\/[^/?#]+/.test(url.pathname);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function documentHealthKey(sender) {
+  return discordContentSender(sender) ? `${sender.tab.id}:${sender.documentId}` : null;
+}
+
+function pruneLiveHealth() {
+  const now = Date.now();
+  const cutoff = now - 45000;
+  for (const [key, item] of liveHealthByDocument) {
+    if (!Number.isFinite(item.updatedAt) || item.updatedAt < cutoff || item.updatedAt > now + 5000) {
+      liveHealthByDocument.delete(key);
+    }
+  }
+}
+
+function broadcastLiveHealth() {
+  for (const port of [...ports]) {
+    try { port.postMessage({ type: "LDMA_LIVE_HEALTH_CHANGED" }); }
+    catch (_error) { ports.delete(port); }
+  }
+}
+
+function reportLiveHealth(command, sender) {
+  const key = documentHealthKey(sender);
+  const statuses = new Set(["active", "searching", "degraded", "starting", "inactive"]);
+  if (!key || !statuses.has(command.status)) return { ok: false, reason: "untrusted-live-health" };
+  if (command.status === "inactive") liveHealthByDocument.delete(key);
+  else liveHealthByDocument.set(key, {
+    status: command.status,
+    detail: Core.normalizeText(command.detail).slice(0, 300) || "Discord capture status unavailable.",
+    updatedAt: Date.now(),
+    tabId: sender.tab.id,
+    documentId: sender.documentId
+  });
+  pruneLiveHealth();
+  broadcastLiveHealth();
+  return { ok: true, reason: "live-health-updated" };
+}
+
+function bestLiveHealth() {
+  pruneLiveHealth();
+  const ranked = [...liveHealthByDocument.values()].sort((left, right) => {
+    const leftRank = left.status === "active" ? 2 : 1;
+    const rightRank = right.status === "active" ? 2 : 1;
+    return rightRank - leftRank || right.updatedAt - left.updatedAt;
+  });
+  return ranked[0] || null;
 }
 
 function randomCapability() {
@@ -274,7 +440,7 @@ function pruneCapabilities(nowValue) {
 async function handlePlaybackCommand(command, sender) {
   pruneCapabilities();
   if (command.type === Protocol.TYPES.CREATE_MEDIA_CAPABILITY) {
-    if (!discordContentSender(sender) && !historySender(sender)) return { ok: false, reason: "untrusted-capability-issuer" };
+    if (!discordChannelContentSender(sender) && !historySender(sender)) return { ok: false, reason: "untrusted-capability-issuer" };
     const key = String(command.key || "");
     if (!/^\d{15,25}:\d{15,25}$/.test(key)) return { ok: false, reason: "invalid-record-key" };
     const archive = await readArchive();
@@ -325,8 +491,7 @@ async function handlePlaybackCommand(command, sender) {
 function archiveCommandAllowed(command, sender) {
   const type = command && command.type;
   if (!type) return false;
-  if (discordContentSender(sender)) return new Set([
-    Protocol.TYPES.GET_ARCHIVE,
+  if (discordChannelContentSender(sender)) return new Set([
     Protocol.TYPES.UPSERT_RECORDS,
     Protocol.TYPES.CONFIRM_EDIT,
     Protocol.TYPES.CONFIRM_DELETED,
@@ -334,6 +499,7 @@ function archiveCommandAllowed(command, sender) {
     Protocol.TYPES.RETRACT_MESSAGE,
     Protocol.TYPES.SET_HEALTH
   ]).has(type);
+  if (discordContentSender(sender)) return type === Protocol.TYPES.GET_ARCHIVE;
   if (popupSender(sender)) return new Set([
     Protocol.TYPES.GET_ARCHIVE,
     Protocol.TYPES.SET_PAUSED,
@@ -355,7 +521,7 @@ function handleMediaCommand(command, sender) {
       return { ok: true, stats: await MediaStore.getStats() };
     }
     if (command.type === Protocol.TYPES.CACHE_MEDIA) {
-      if (!discordContentSender(sender)) return { ok: false, reason: "untrusted-media-sender" };
+      if (!discordChannelContentSender(sender)) return { ok: false, reason: "untrusted-media-sender" };
       if (archive.paused || command.generation !== archive.generation) return { ok: false, reason: "stale-or-paused" };
       const keys = new Set((Array.isArray(command.keys) ? command.keys : []).map(String).slice(0, 200));
       const records = archive.records.filter((record) => keys.has(Core.recordKey(record)));
@@ -382,7 +548,13 @@ chrome.runtime.onMessage.addListener((command, sender, sendResponse) => {
     Protocol.TYPES.REDEEM_MEDIA_CAPABILITY
   ]);
   let operation;
-  if (playbackTypes.has(command && command.type)) operation = handlePlaybackCommand(command, sender);
+  if (command?.type === REPORT_LIVE_HEALTH) {
+    operation = Promise.resolve(reportLiveHealth(command, sender));
+  } else if (command?.type === GET_LIVE_HEALTH && popupSender(sender)) {
+    operation = Promise.resolve({ ok: true, reason: "live-health-read", health: bestLiveHealth() });
+  } else if (command?.type === BOOTSTRAP_COMMAND && discordContentSender(sender)) {
+    operation = ensureDiscordBootstrap(sender.tab.id, sender.documentId || null, true);
+  } else if (playbackTypes.has(command && command.type)) operation = handlePlaybackCommand(command, sender);
   else if (mediaTypes.has(command && command.type)) operation = handleMediaCommand(command, sender);
   else if (archiveCommandAllowed(command, sender)) operation = dispatch(command);
   else operation = Promise.resolve({ ok: false, reason: "untrusted-command-sender" });
@@ -396,5 +568,36 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "ldma-updates") return;
   if (!discordContentSender(port.sender) && !popupSender(port.sender) && !historySender(port.sender) && !mediaViewerSender(port.sender)) return;
   ports.add(port);
-  port.onDisconnect.addListener(() => ports.delete(port));
+  const healthKey = documentHealthKey(port.sender);
+  port.onDisconnect.addListener(() => {
+    ports.delete(port);
+    if (healthKey && liveHealthByDocument.delete(healthKey)) broadcastLiveHealth();
+  });
 });
+
+function bootstrapNavigation(details, full) {
+  if (details.frameId !== 0 || !Number.isInteger(details.tabId)) return;
+  ensureDiscordBootstrap(details.tabId, details.documentId || null, Boolean(full)).catch(() => {});
+}
+
+chrome.webNavigation.onCommitted.addListener((details) => bootstrapNavigation(details, false), {
+  url: [{ schemes: ["https"], hostEquals: "discord.com" }]
+});
+chrome.webNavigation.onHistoryStateUpdated.addListener((details) => bootstrapNavigation(details, true), {
+  url: [{ schemes: ["https"], hostEquals: "discord.com" }]
+});
+chrome.webNavigation.onTabReplaced.addListener((details) => {
+  bootstrapDiscordTab(details.tabId, true).catch(() => {});
+});
+chrome.tabs.onActivated.addListener((details) => {
+  bootstrapDiscordTab(details.tabId, true).catch(() => {});
+});
+chrome.runtime.onInstalled.addListener((details) => {
+  // A MAIN-world controller belongs to the JavaScript bundle version that
+  // installed it and cannot be safely replaced in place. Extension updates are
+  // rare, so reload each open Discord document once automatically; ordinary
+  // Discord launches and SPA route changes never require a reload.
+  if (details.reason === "update") reloadOpenDiscordTabs().catch(() => {});
+  else bootstrapOpenDiscordTabs().catch(() => {});
+});
+chrome.runtime.onStartup.addListener(() => { bootstrapOpenDiscordTabs().catch(() => {}); });

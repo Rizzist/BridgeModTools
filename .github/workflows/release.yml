@@ -1,0 +1,67 @@
+name: Release
+
+"on":
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Test, package, and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: "22"
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "require('./package.json').version")"
+          manifest_version="$(node -p "require('./manifest.json').version")"
+          test "$package_version" = "$manifest_version"
+          test "$GITHUB_REF_NAME" = "v${package_version}"
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build unpacked-extension archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_name="BridgeModTools-${GITHUB_REF_NAME}.zip"
+          mkdir -p dist/BridgeModTools
+          cp README.md manifest.json dist/BridgeModTools/
+          cp -R src popup history media demo dist/BridgeModTools/
+          (
+            cd dist
+            zip -qr "$asset_name" BridgeModTools
+            sha256sum "$asset_name" > "${asset_name}.sha256"
+          )
+
+      - name: Publish latest GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_name="BridgeModTools-${GITHUB_REF_NAME}.zip"
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/$asset_name" \
+            "dist/${asset_name}.sha256" \
+            --title "BridgeModTools $GITHUB_REF_NAME" \
+            --generate-notes \
+            --latest \
+            --verify-tag

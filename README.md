@@ -12,6 +12,10 @@ Version 2.2.2 fixes live deletion recovery for the entire archived row. If Disco
 
 Version 2.3 adds local edit history. A genuine Discord `MESSAGE_UPDATE` with a new edited timestamp stages the currently rendered payload before Discord applies the edit, then commits it only after the isolated script observes that exact row's text/media payload change. Earlier text, links, attachments, embeds, and media appear oldest-to-newest in dark yellow with an explicit **EDITED** marker while Discord's real latest row remains untouched. Multiple edits are preserved, and a later deletion composes the yellow edit trail with the latest red **DELETED** version. Ordinary DOM churn, lazy embeds, reactions, presentation changes, and scrolling do not create revisions. Each record keeps its original plus the newest revisions within a 20-revision/512-KiB bound.
 
+Version 2.3.1 fixes cold-start capture. The document-start lifecycle hook now installs on every `discord.com` application route, survives Discord's `/app`/login-to-channel soft navigation, and is idempotently re-ensured for restored tabs, extension updates, browser startup, and History API navigation. A document-scoped watchdog forces Discord Webpack rescans and repairs replaced MessageStore handlers without requiring a page refresh.
+
+An extension update automatically reloads any already-open Discord tabs once so the new MAIN-world controller replaces the previous bundle cleanly. This is automatic and does not happen on ordinary Discord launches or route changes.
+
 Restored visual media now uses Discord-like inline sizing and spacing instead of a fixed-height generic card. Images and videos retain intrinsic dimensions up to a 550×350-pixel display box, small GIFs stay small, multiple visuals use a compact grid, and audio remains a compact native player. Cached files and plain links keep a small labeled tile.
 
 Version 2 also captures links and rendered upload/embed media. Discord-hosted images, videos, audio, voice messages, and files are downloaded immediately into an extension-owned local cache; direct third-party media can be enabled per site from the popup. Restored deleted rows and full history use the cached bytes, so supported media remains viewable or playable after the original message disappears.
@@ -32,7 +36,7 @@ Stable downloads: [github.com/Rizzist/BridgeModTools/releases/latest](https://gi
 4. Turn on **Developer mode**.
 5. Click **Load unpacked**.
 6. Select the extracted `BridgeModTools-main` folder—the folder containing `manifest.json`.
-7. Open or reload Discord, visit a DM, group DM, or server channel, and open the BridgeModTools toolbar popup.
+7. Open Discord, visit a DM, group DM, or server channel, and open the BridgeModTools toolbar popup. A manual Discord refresh is not required.
 8. Wait until the popup reports **Active: Discord MessageStore edit history and deletion retention are active.**
 
 Chrome cannot install an unpacked extension directly from a GitHub URL. Each user must approve the local folder through `chrome://extensions`.
@@ -49,7 +53,7 @@ Then use **Load unpacked** in `chrome://extensions` and select the cloned `Bridg
 
 - Git install: run `git pull` inside the repository.
 - ZIP install: download the latest ZIP and replace the old extracted files.
-- In both cases, click **Reload** on the BridgeModTools card in `chrome://extensions`, then reload Discord once.
+- In both cases, click **Reload** on the BridgeModTools card in `chrome://extensions`. BridgeModTools reconnects already-open Discord tabs automatically.
 
 ### First test
 
@@ -62,8 +66,8 @@ The toolbar popup shows archived, edited, saved-deleted, and cached-media counts
 
 ## Privacy and security properties
 
-- Manifest permissions: `storage`, `offscreen`, and `unlimitedStorage`. Required hosts are limited to Discord's CDN/media proxy domains. Arbitrary HTTPS is optional; Chrome prompts only when you click the popup button for the exact origins currently waiting.
-- Page match: `https://discord.com/channels/*` only.
+- Manifest permissions: `storage`, `offscreen`, `unlimitedStorage`, `scripting`, and `webNavigation`. Required hosts are limited to the exact Discord application origin plus Discord's CDN/media proxy domains. Arbitrary HTTPS is optional; Chrome prompts only when you click the popup button for the exact origins currently waiting.
+- Bootstrap page match: `https://discord.com/*`. Message capture remains route-gated internally to real `/channels/<guild-or-@me>/<channelId>` views.
 - One local service worker serializes every archive read/write; content and UI pages cannot access storage directly.
 - A `document_start`, main-world adapter discovers Discord's `MessageStore`, signals genuine edits, and retains cached records during single or bulk deletion. It sends only validated channel/message IDs plus an edit timestamp/ordering token to the isolated content script. Message content, tokens, cookies, and store objects never cross that bridge.
 - Clear, per-record delete, and pause/resume advance an archive generation. Stale in-flight capture or inference writes are rejected.
