@@ -435,7 +435,7 @@ test("deleted message username resolution receives only the exact trusted archiv
   harness.setStoredArchive({
     generation: 3,
     records: [
-      { channelId, messageId, authorId: userId, status: "confirmed_deleted" },
+      { channelId, messageId, authorId: userId, authorUsername: "curiousbro", status: "confirmed_deleted" },
       { channelId, messageId: seenMessageId, authorId: "999999999999999992", status: "seen" }
     ]
   });
@@ -460,7 +460,7 @@ test("deleted message username resolution receives only the exact trusted archiv
   assert.deepEqual(plain(received), [{
     receivedChannelId: channelId,
     ids: [messageId, seenMessageId],
-    fallbackUsers: [{ messageId, userId }]
+    fallbackUsers: [{ messageId, userId, username: "curiousbro" }]
   }]);
 });
 

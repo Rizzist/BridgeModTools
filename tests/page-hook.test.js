@@ -76,8 +76,7 @@ function runHook(options) {
     _dispatcher: dispatcher,
     getName() { return "UserStore"; },
     getDispatchToken() { return "user_store_token"; },
-    getUser(id) { return users.get(id); },
-    getCurrentUser() { return users.get("999999999999999991"); }
+    getUser(id) { return users.get(id); }
   };
   const rejectingDispatcher = {
     dispatch() {},
@@ -133,6 +132,7 @@ function runHook(options) {
     return Array.prototype.push.call(this, chunk);
   };
   const window = {
+    location: { reload() { settings.reloads = (settings.reloads || 0) + 1; } },
     addEventListener(type, callback) {
       if (!listeners.has(type)) listeners.set(type, []);
       listeners.get(type).push(callback);
@@ -148,6 +148,11 @@ function runHook(options) {
       for (const callback of listeners.get("message") || []) callback(event);
     }
   };
+  if (settings.legacyController) {
+    window[Symbol.for("BridgeModTools.pageHook.v1")] = {
+      recover() { settings.legacyRecoveries = (settings.legacyRecoveries || 0) + 1; }
+    };
+  }
   class CustomEvent {
     constructor(type, options) { this.type = type; this.detail = options?.detail; }
   }
@@ -170,7 +175,9 @@ function runHook(options) {
   const ready = () => window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "isolated-ready" }, "*");
   if (!settings.deferReady && !settings.readyBeforeHook) ready();
   return {
-    posted, dispatched, subscriptions, fallbackSubscriptions, handlerNode, messages, dispatcher, window, ready,
+    posted, dispatched, subscriptions, fallbackSubscriptions, handlerNode, messages, users, dispatcher, window, ready,
+    reloads: () => settings.reloads || 0,
+    legacyRecoveries: () => settings.legacyRecoveries || 0,
     userActionCalls,
     profileExportUsesGetter: typeof Object.getOwnPropertyDescriptor(userActionExports, "openUserProfileModal").get === "function",
     invokeUserAction(action, payload) {
@@ -225,6 +232,7 @@ function runHook(options) {
 test("duplicate page-hook injection recovers in place without duplicate listeners, timers, wrappers, or events", () => {
   const result = runHook();
   const originalDeleteWrapper = result.handlerNode.actionHandler.MESSAGE_DELETE;
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 2);
   assert.equal(result.intervalCount(), 1);
   assert.equal(result.listenerCount("message"), 1);
 
@@ -232,6 +240,7 @@ test("duplicate page-hook injection recovers in place without duplicate listener
   assert.equal(result.intervalCount(), 1);
   assert.equal(result.listenerCount("message"), 1);
   assert.equal(result.handlerNode.actionHandler.MESSAGE_DELETE, originalDeleteWrapper);
+  assert.equal(result.reloads(), 0);
 
   result.handlerNode.actionHandler.MESSAGE_DELETE({
     channelId: "777777777777777777",
@@ -575,13 +584,29 @@ test("author resolution returns exact IDs and usernames for current, retained, o
     reason: "resolved",
     authors: []
   });
+  result.users.delete("999999999999999991");
   assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId], [{
     messageId,
-    userId: "999999999999999991"
+    userId: "999999999999999991",
+    username: "archive_name"
   }]))), {
     ok: true,
     reason: "resolved",
-    authors: [{ messageId, userId: "999999999999999991", username: "curiousbro" }]
+    authors: [{ messageId, userId: "999999999999999991", username: "archive_name" }]
+  });
+  result.messages.set(messageId, {
+    id: messageId,
+    channel_id: channelId,
+    author: { id: "999999999999999992" }
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId], [{
+    messageId,
+    userId: "999999999999999991",
+    username: "must_not_cross"
+  }]))), {
+    ok: true,
+    reason: "resolved",
+    authors: [{ messageId, userId: "999999999999999992" }]
   });
   result.messages.set(messageId, {
     id: messageId,
@@ -598,6 +623,16 @@ test("author resolution returns exact IDs and usernames for current, retained, o
     reason: "invalid-request",
     authors: []
   });
+});
+
+test("a newer page hook reloads once instead of retaining an older controller contract", () => {
+  const settings = { legacyController: true };
+  const result = runHook(settings);
+  assert.equal(result.legacyRecoveries(), 1);
+  assert.equal(result.reloads(), 1);
+  result.reinject();
+  assert.equal(result.legacyRecoveries(), 2);
+  assert.equal(result.reloads(), 1);
 });
 
 test("native profile and fixed seven-day timeout actions receive only normalized identity context", async () => {

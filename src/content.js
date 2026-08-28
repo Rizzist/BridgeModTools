@@ -978,9 +978,14 @@
       return allowStoredFallback ? fallback : null;
     }
     const key = `${context.channelId}:${context.messageId}`;
+    const matchedUserId = String(match.userId);
     const identity = {
-      userId: String(match.userId),
-      username: Core.discordUsernameValue(match.username)
+      userId: matchedUserId,
+      // A legacy page-world controller can return the newly verified ID but
+      // not the newer username field. Preserve an already cached username only
+      // when it belongs to that exact verified author.
+      username: Core.discordUsernameValue(match.username) ||
+        (fallback.userId === matchedUserId ? fallback.username : null)
     };
     state.resolvedAuthorIds.set(key, identity.userId);
     if (identity.username) state.resolvedAuthorUsernames.set(key, identity.username);
@@ -1053,9 +1058,15 @@
       copyBusy = true;
       copyAction.disabled = true;
       const context = currentContext();
-      const identity = context && await resolveActionAuthorIdentity(context, true);
-      const copied = Boolean(identity?.username && currentContext() && await copyDiscordUsername(identity.username));
-      feedback(copyAction, copied ? "✓" : "!", copied ? "Discord username copied" : "Discord username unavailable", !copied);
+      let username = Core.discordUsernameValue(context?.username);
+      let copied = Boolean(username && currentContext() && await copyDiscordUsername(username));
+      if (!copied && currentContext()) {
+        const identity = await resolveActionAuthorIdentity(context, true);
+        username = Core.discordUsernameValue(identity?.username);
+        copied = Boolean(username && currentContext() && await copyDiscordUsername(username));
+      }
+      feedback(copyAction, copied ? "✓" : "!", copied ? "Discord username copied" :
+        username ? "Clipboard access unavailable" : "Discord username unavailable", !copied);
       copyAction.disabled = false;
       copyBusy = false;
     });

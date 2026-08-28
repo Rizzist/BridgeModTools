@@ -24,6 +24,8 @@ Version 2.6 adds two compact author actions beside the name and timestamp on hov
 
 Version 2.6.1 changes the copy action to **@** and copies the account's real Discord username (for example, `curiousbro`, without an `@`) instead of its numeric snowflake. Usernames are cached with archived records, and saved deleted messages can recover a missing username after reload through Discord's UserStore using only the exact trusted archived author binding.
 
+Version 2.6.2 fixes the **@** action showing `!` after an extension update. It versions the page-world resolver so a surviving older Discord hook is replaced by one automatic page refresh, supports Discord UserStore builds without `getCurrentUser`, preserves an exact verified cached username when an older resolver returns only the author ID, and carries trusted cached usernames for restored deleted rows. Clipboard failures and genuinely unavailable usernames now report distinct status text.
+
 Restored visual media now uses Discord-like inline sizing and spacing instead of a fixed-height generic card. Images and videos retain intrinsic dimensions up to a 550×350-pixel display box, small GIFs stay small, multiple visuals use a compact grid, and audio remains a compact native player. Cached files and plain links keep a small labeled tile.
 
 Version 2 also captures links and rendered upload/embed media. Discord-hosted images, videos, audio, voice messages, and files are downloaded immediately into an extension-owned local cache; direct third-party media can be enabled per site from the popup. Restored deleted rows and full history use the cached bytes, so supported media remains viewable or playable after the original message disappears.

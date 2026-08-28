@@ -35,7 +35,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.6.1");
+  assert.equal(manifest.version, "2.6.2");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -267,6 +267,7 @@ test("persistent replacements use a Discord-style row and hide the retained nati
 
 test("live and deleted rows expose exactly two header-adjacent hover actions", () => {
   const content = fs.readFileSync(path.join(root, "src", "content.js"), "utf8");
+  const hook = fs.readFileSync(path.join(root, "src", "page-hook.js"), "utf8");
   const hostCss = fs.readFileSync(path.join(root, "src", "content.css"), "utf8");
 
   assert.match(content, /const avatar = document\.createElement\("button"\)/);
@@ -303,10 +304,17 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.match(content, /timeoutAction\.hidden = !SNOWFLAKE\.test\(String\(context\?\.guildId/);
   assert.match(content, /type: RESOLVE_MESSAGE_AUTHORS, messageIds: \[context\.messageId\]/);
   assert.match(content, /const identity = context && await resolveActionAuthorIdentity\(context, true\)/);
-  assert.match(content, /copyDiscordUsername\(identity\.username\)/);
+  assert.match(content, /let username = Core\.discordUsernameValue\(context\?\.username\)/);
+  assert.match(content, /await resolveActionAuthorIdentity\(context, true\)/);
+  assert.match(content, /copyDiscordUsername\(username\)/);
+  assert.match(content, /Clipboard access unavailable/);
   assert.match(content, /background independently proves/);
   assert.match(content, /function removeLiveAuthorActions/);
   assert.match(content, /removeLiveAuthorActions\(\)/);
+  assert.match(hook, /const HOOK_API_VERSION = 2/);
+  assert.match(hook, /existingController\.apiVersion !== HOOK_API_VERSION/);
+  assert.match(hook, /window\.location\.reload\(\)/);
+  assert.match(hook, /storeInfo\.name === "UserStore" && dataFunction\(value, "getUser"\)/);
   assert.match(content, /event\.stopPropagation\(\)/);
   assert.match(hostCss, /\[data-ldma-author-actions-host="true"\]/);
   assert.match(hostCss, /:hover \[data-ldma-author-actions-host="true"\]/);

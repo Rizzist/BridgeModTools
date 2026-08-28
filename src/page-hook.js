@@ -1,13 +1,22 @@
 (function installLocalDiscordLifecycleHook() {
   "use strict";
 
+  const HOOK_API_VERSION = 2;
   const INSTALL_KEY = Symbol.for("BridgeModTools.pageHook.v1");
   const existingController = window[INSTALL_KEY];
   if (existingController && typeof existingController.recover === "function") {
     existingController.recover("duplicate-injection");
+    // Reloading an unpacked extension replaces its isolated world, but the old
+    // page-world controller can survive in Discord's document. A newer content
+    // script must never keep talking to an older controller contract.
+    if (existingController.apiVersion !== HOOK_API_VERSION && !existingController.upgradeReloadScheduled) {
+      existingController.upgradeReloadScheduled = true;
+      try { window.location.reload(); } catch (_error) {}
+    }
     return;
   }
   const controller = {
+    apiVersion: HOOK_API_VERSION,
     pendingRecovery: false,
     recover() { this.pendingRecovery = true; }
   };
@@ -597,8 +606,11 @@
       if (storeInfo) {
         const usableMessageStore = storeInfo.name === "MessageStore" &&
           dataFunction(value, "getMessage") && dataFunction(value, "getMessages");
-        const usableUserStore = storeInfo.name === "UserStore" &&
-          dataFunction(value, "getUser") && dataFunction(value, "getCurrentUser");
+        // Discord's UserStore surface is not stable across client builds. Its
+        // exact Flux store name plus the ID-keyed getter is sufficient here;
+        // getCurrentUser is unrelated to resolving another message author and
+        // has disappeared from some builds.
+        const usableUserStore = storeInfo.name === "UserStore" && dataFunction(value, "getUser");
         if (usableUserStore) userStoreCandidate = value;
         // Do not let a decoy/partial named store claim global hook health. Its
         // dispatcher must first pass subscription and become the accepted core
@@ -761,7 +773,7 @@
       const messageId = cleanId(item?.messageId);
       const userId = cleanId(item?.userId);
       if (messageId && userId && ids.includes(messageId) && !fallbackUsers.has(messageId)) {
-        fallbackUsers.set(messageId, userId);
+        fallbackUsers.set(messageId, { userId, username: cleanUsername(item?.username) });
       }
     }
     if (!messageStoreCandidate || typeof messageStoreCandidate?.getMessage !== "function") {
@@ -784,8 +796,9 @@
       const resolvedMessageId = cleanId(message?.id);
       const resolvedChannelId = cleanId(message?.channelId || message?.channel_id);
       const exactMessage = resolvedMessageId === messageId && resolvedChannelId === channelId ? message : null;
+      const fallbackUser = fallbackUsers.get(messageId);
       const userId = cleanId(exactMessage?.author?.id || exactMessage?.authorId || exactMessage?.author_id) ||
-        fallbackUsers.get(messageId) || null;
+        fallbackUser?.userId || null;
       if (!userId) continue;
       let username = cleanUsername(exactMessage?.author?.username);
       if (!username && getUser) {
@@ -801,6 +814,7 @@
         try { user = getUser?.call(userStoreCandidate, userId); } catch (_error) {}
         if (cleanId(user?.id) === userId) username = cleanUsername(user?.username);
       }
+      if (!username && fallbackUser?.userId === userId) username = fallbackUser.username;
       const item = { messageId, userId };
       if (username) item.username = username;
       authors.push(item);

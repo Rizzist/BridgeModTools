@@ -575,7 +575,9 @@ async function handleResolveMessageAuthors(command, sender) {
       if (!Core.isDeletedStatus(record.status) || record.channelId !== context.channelId ||
         !requested.has(record.messageId)) return null;
       const userId = Core.snowflakeValue(record.authorId);
-      return userId ? { messageId: record.messageId, userId } : null;
+      if (!userId) return null;
+      const username = Core.discordUsernameValue(record.authorUsername);
+      return Object.assign({ messageId: record.messageId, userId }, username ? { username } : {});
     }).filter(Boolean);
   } catch (_error) {}
   let execution;
