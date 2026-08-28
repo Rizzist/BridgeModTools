@@ -93,7 +93,9 @@ async function ensureDiscordBootstrap(tabId, documentId, full) {
     const pageProbe = await chrome.scripting.executeScript({
       target,
       world: "MAIN",
-      func(expectedApiVersion) {
+      // executeScript serializes this as a standalone expression. Method
+      // shorthand (`func(...) {}`) is not parseable after Chromium wraps it.
+      func: (expectedApiVersion) => {
         const controller = globalThis[Symbol.for("BridgeModTools.pageHook.v1")];
         return {
           apiVersion: Number(controller?.apiVersion) || 0,
@@ -105,7 +107,13 @@ async function ensureDiscordBootstrap(tabId, documentId, full) {
       },
       args: [PAGE_HOOK_API_VERSION]
     });
-    const pageState = pageProbe.find((result) => result && result.result)?.result || {};
+    const pageState = Array.isArray(pageProbe)
+      ? pageProbe.find((result) => result && result.result)?.result : null;
+    // A failed injection can resolve with a null result. That is not evidence
+    // of an old controller and must never trigger a speculative page reload.
+    if (!pageState || typeof pageState.ready !== "boolean" || !Number.isFinite(pageState.apiVersion)) {
+      return { ok: false, reason: "page-hook-probe-unavailable" };
+    }
     if (!pageState.ready) {
       if (!await claimPageHookReload(tabId)) {
         return { ok: false, reason: "page-hook-upgrade-pending" };
@@ -123,7 +131,7 @@ async function ensureDiscordBootstrap(tabId, documentId, full) {
       const probe = await chrome.scripting.executeScript({
         target,
         world: "ISOLATED",
-        func() {
+        func: () => {
           const controller = globalThis[Symbol.for("BridgeModTools.contentScript.v1")];
           const contentInstalled = Boolean(controller && typeof controller.recover === "function");
           if (contentInstalled) controller.recover("background-bootstrap");
@@ -133,13 +141,16 @@ async function ensureDiscordBootstrap(tabId, documentId, full) {
           };
         }
       });
-      const state = probe.find((result) => result && result.result)?.result || {};
+      const state = Array.isArray(probe) ? probe.find((result) => result && result.result)?.result : null;
+      if (!state || typeof state.contentInstalled !== "boolean" || typeof state.styleInstalled !== "boolean") {
+        return { ok: false, reason: "content-probe-unavailable" };
+      }
       if (!state.styleInstalled) {
         await chrome.scripting.insertCSS({ target, files: ["src/content.css"] });
         await chrome.scripting.executeScript({
           target,
           world: "ISOLATED",
-          func() {
+          func: () => {
             globalThis[Symbol.for("BridgeModTools.contentStyle.v1")] = true;
           }
         });
@@ -557,20 +568,22 @@ async function handleUserAction(command, sender) {
     execution = await chrome.scripting.executeScript({
       target: { tabId: sender.tab.id, documentIds: [sender.documentId] },
       world: "MAIN",
-      async func(actionName, actionPayload, route, trustedArchivedAuthorId) {
+      func: async (actionName, actionPayload, route, trustedArchivedAuthorId) => {
         try {
           const current = new URL(globalThis.location.href);
           const match = /^\/channels\/(@me|\d{15,25})\/(\d{15,25})\/?$/.exec(current.pathname);
           const currentGuildId = match && match[1] !== "@me" ? match[1] : null;
+          // Chrome's `any` argument conversion can omit null object fields.
+          const expectedGuildId = route.guildId ?? null;
           if (current.protocol !== "https:" || current.hostname !== "discord.com" || current.port !== "" ||
-            !match || currentGuildId !== route.guildId || match[2] !== route.channelId) {
+            !match || currentGuildId !== expectedGuildId || match[2] !== route.channelId) {
             return { ok: false, reason: "user-action-route-changed" };
           }
           const controller = globalThis[Symbol.for("BridgeModTools.pageHook.v1")];
           if (!controller || typeof controller.invokeUserAction !== "function") {
             return { ok: false, reason: "user-action-controller-unavailable" };
           }
-          let verifiedPayload = { userId: actionPayload.userId, guildId: actionPayload.guildId };
+          let verifiedPayload = { userId: actionPayload.userId, guildId: actionPayload.guildId ?? null };
           if (actionName === "timeout-7d") {
             let resolvedUserId = null;
             if (typeof controller.resolveMessageAuthors === "function") {
@@ -616,6 +629,9 @@ async function handleUserAction(command, sender) {
 }
 
 function safeResolvedAuthors(value, requestedIds) {
+  if (!value || typeof value.ok !== "boolean" || !Array.isArray(value.authors)) {
+    return { ok: false, reason: "author-resolution-result-unavailable", authors: [] };
+  }
   const requested = new Set(requestedIds);
   const authors = [];
   const seen = new Set();
@@ -633,7 +649,10 @@ function safeResolvedAuthors(value, requestedIds) {
     ["resolved", "message-authors-resolved"],
     ["resolved-from-trusted-archive", "message-authors-resolved-from-archive"],
     ["resolved-author-ids-only", "message-usernames-unavailable"],
-    ["message-store-unavailable", "message-store-unavailable"]
+    ["message-store-unavailable", "message-store-unavailable"],
+    ["author-resolution-route-changed", "author-resolution-route-changed"],
+    ["author-resolution-controller-unavailable", "author-resolution-controller-unavailable"],
+    ["author-resolution-controller-error", "author-resolution-controller-error"]
   ]);
   return {
     ok: value?.ok === true,
@@ -673,13 +692,14 @@ async function handleResolveMessageAuthors(command, sender) {
     return chrome.scripting.executeScript({
       target: { tabId: sender.tab.id, documentIds: [sender.documentId] },
       world: "MAIN",
-      func(ids, route, fallbackUsers) {
+      func: (ids, route, fallbackUsers) => {
         try {
           const current = new URL(globalThis.location.href);
           const match = /^\/channels\/(@me|\d{15,25})\/(\d{15,25})\/?$/.exec(current.pathname);
           const currentGuildId = match && match[1] !== "@me" ? match[1] : null;
+          const expectedGuildId = route.guildId ?? null;
           if (current.protocol !== "https:" || current.hostname !== "discord.com" || current.port !== "" ||
-            !match || currentGuildId !== route.guildId || match[2] !== route.channelId) {
+            !match || currentGuildId !== expectedGuildId || match[2] !== route.channelId) {
             return { ok: false, reason: "author-resolution-route-changed", authors: [] };
           }
           const controller = globalThis[Symbol.for("BridgeModTools.pageHook.v1")];

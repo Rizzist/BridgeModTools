@@ -1015,6 +1015,19 @@
     return identity;
   }
 
+  function authorResolutionFailureTitle(reason) {
+    const titles = {
+      "message-store-unavailable": "Discord message data unavailable",
+      "author-resolution-controller-unavailable": "Discord author resolver unavailable",
+      "author-resolution-controller-error": "Discord author lookup failed",
+      "author-resolution-route-changed": "Discord channel changed",
+      "author-resolution-result-unavailable": "Discord author lookup returned no result",
+      "author-resolution-injection-failed": "Discord author lookup could not run",
+      "message-author-resolution-failed": "Discord author lookup failed"
+    };
+    return Object.prototype.hasOwnProperty.call(titles, reason) ? titles[reason] : "Discord username unavailable";
+  }
+
   function createAuthorActionControls(label, getContext) {
     const actions = document.createElement("span");
     actions.className = "author-actions";
@@ -1078,11 +1091,7 @@
         username = Core.discordUsernameValue(identity?.username);
         copied = Boolean(username && currentContext() && await copyDiscordUsername(username));
       }
-      const unavailableTitle = resolutionReason === "message-store-unavailable"
-        ? "Discord message data unavailable"
-        : resolutionReason === "message-author-resolution-failed"
-          ? "Discord author resolver unavailable"
-          : "Discord username unavailable";
+      const unavailableTitle = authorResolutionFailureTitle(resolutionReason);
       feedback(copyAction, copied ? "✓" : "!", copied ? "Discord username copied" :
         username ? "Clipboard access unavailable" : unavailableTitle, !copied);
       copyAction.disabled = false;

@@ -17,6 +17,23 @@ function eventSlot() {
   };
 }
 
+// Chromium serializes functions verbatim and evaluates `(<source>)(<JSON args>)`.
+// Directly calling options.func here hides invalid method syntax and closures
+// that disappear when an extension crosses into MAIN or ISOLATED worlds.
+function chromeArgumentValue(value) {
+  // API `any` arguments omit null object properties; array nulls are preserved.
+  if (Array.isArray(value)) return value.map(chromeArgumentValue);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value)
+    .filter(([, item]) => item !== null).map(([key, item]) => [key, chromeArgumentValue(item)]));
+  return value;
+}
+
+function serializedInjectionScript(options) {
+  const source = Function.prototype.toString.call(options.func);
+  const args = (options.args || []).map((value) => JSON.stringify(chromeArgumentValue(value))).join(",");
+  return new vm.Script(`(${source})(${args})`, { filename: "chrome-script-injection.js" });
+}
+
 function backgroundHarness(options) {
   const calls = [];
   const events = {
@@ -24,10 +41,11 @@ function backgroundHarness(options) {
     committed: eventSlot(), history: eventSlot(), replaced: eventSlot(), activated: eventSlot(), removed: eventSlot()
   };
   const sessionData = options?.sessionData || {};
-  let isolatedInstalled = false;
-  let styleInstalled = false;
-  let pageHookProbeState = { apiVersion: 3, ready: true };
   let pageHookFileInstallController = null;
+  const mainWorld = vm.createContext({ URL,
+    location: { href: "https://discord.com/channels/@me/777777777777777777" } });
+  const isolatedWorld = vm.createContext({});
+  const injectionErrors = [];
   let queriedTabs = [];
   let storedArchive = null;
   let storageBytesInUse = 0;
@@ -38,7 +56,7 @@ function backgroundHarness(options) {
   const chrome = {
     runtime: {
       id: "extension-id",
-      getManifest() { return { version: options?.version || "2.6.5" }; },
+      getManifest() { return { version: options?.version || "2.6.6" }; },
       getURL(relative) { return `chrome-extension://extension-id/${relative}`; },
       onMessage: events.message,
       onConnect: events.connect,
@@ -50,21 +68,21 @@ function backgroundHarness(options) {
       async executeScript(options) {
         calls.push({ kind: "script", options });
         if (Array.isArray(options.files) && options.files.includes("src/page-hook.js") &&
-          pageHookFileInstallController && !context[Symbol.for("BridgeModTools.pageHook.v1")]) {
-          context[Symbol.for("BridgeModTools.pageHook.v1")] = pageHookFileInstallController;
+          !mainWorld[Symbol.for("BridgeModTools.pageHook.v1")]) {
+          mainWorld[Symbol.for("BridgeModTools.pageHook.v1")] = pageHookFileInstallController || {
+            apiVersion: 3, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}
+          };
         }
         if (typeof options.func === "function") {
-          if (/expectedApiVersion/.test(String(options.func)) && /BridgeModTools\.pageHook\.v1/.test(String(options.func))) {
-            return [{ result: pageHookProbeState }];
+          let result = null;
+          try {
+            const script = serializedInjectionScript(options);
+            const value = await script.runInContext(options.world === "MAIN" ? mainWorld : isolatedWorld);
+            result = value === undefined ? null : plain(value);
+          } catch (error) {
+            injectionErrors.push(error);
           }
-          if (/invokeUserAction|resolveMessageAuthors/.test(String(options.func))) {
-            return [{ result: await options.func(...(options.args || [])) }];
-          }
-          if (/contentStyle\.v1"\)\]\s*=\s*true/.test(String(options.func))) {
-            styleInstalled = true;
-            return [{ result: true }];
-          }
-          return [{ result: { contentInstalled: isolatedInstalled, styleInstalled } }];
+          return [{ result, frameId: 0, documentId: options.target.documentIds[0] }];
         }
         return [];
       },
@@ -113,7 +131,6 @@ function backgroundHarness(options) {
     self: { clients: { async matchAll() { return []; } } },
     crypto: { getRandomValues(bytes) { bytes.fill(1); return bytes; } },
     URL, Date, Promise, Map, Set, WeakMap, Uint8Array, Object, Array, String, Number, Boolean, RegExp,
-    location: { href: "https://discord.com/channels/@me/777777777777777777" },
     async fetch(...args) { networkCalls.push(args); return { ok: true }; },
     LocalDiscordArchiveProtocol: { TYPES, normalizeArchive: (value) => value || { records: [], generation: 0 } },
     LocalDiscordArchiveCore: {
@@ -137,20 +154,58 @@ function backgroundHarness(options) {
   return {
     api: context.__testApi,
     calls,
+    injectionErrors,
     storageWrites,
     networkCalls,
     events,
-    setLocation(href) { context.location.href = href; },
-    setMainController(controller) { context[Symbol.for("BridgeModTools.pageHook.v1")] = controller; },
+    installRealPageHook(moduleCache) {
+      mainWorld.addEventListener = () => {};
+      mainWorld.postMessage = () => {};
+      mainWorld.setInterval = () => 1;
+      vm.runInContext("globalThis.window = globalThis;", mainWorld);
+      const webpackRequire = () => {};
+      webpackRequire.c = moduleCache;
+      const chunks = [];
+      chunks.push = (chunk) => { chunk[2]?.(webpackRequire); return 1; };
+      mainWorld.webpackChunkdiscord_app = chunks;
+      vm.runInContext(fs.readFileSync(path.resolve(__dirname, "../src/page-hook.js"), "utf8"), mainWorld);
+    },
+    setLocation(href) { mainWorld.location.href = href; },
+    setMainController(controller) { mainWorld[Symbol.for("BridgeModTools.pageHook.v1")] = controller; },
     setStoredArchive(value) { storedArchive = value; },
     setStorageBytesInUse(value) { storageBytesInUse = value; },
     setMediaStats(value) { mediaStats = value; },
-    setPageHookProbeState(value) { pageHookProbeState = value; },
+    setPageHookProbeState(value) {
+      mainWorld[Symbol.for("BridgeModTools.pageHook.v1")] = value.ready
+        ? { apiVersion: value.apiVersion, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {} }
+        : { apiVersion: value.apiVersion, recover() {} };
+    },
     setPageHookFileInstallController(value) { pageHookFileInstallController = value; },
-    setIsolatedInstalled(value) { isolatedInstalled = value; styleInstalled = value; },
+    setIsolatedInstalled(value) {
+      isolatedWorld[Symbol.for("BridgeModTools.contentScript.v1")] = value ? { recover() {} } : null;
+      isolatedWorld[Symbol.for("BridgeModTools.contentStyle.v1")] = value;
+    },
     setQueriedTabs(value) { queriedTabs = value; }
   };
 }
+
+test("Chrome-shaped serialization rejects method shorthand and loses worker closures", () => {
+  assert.throws(() => serializedInjectionScript({ func() { return true; } }), SyntaxError);
+  assert.throws(() => serializedInjectionScript({ async func() { return true; } }), SyntaxError);
+  const workerOnly = "must-not-leak-into-page";
+  const callback = () => workerOnly;
+  assert.equal(callback(), workerOnly);
+  assert.throws(() => serializedInjectionScript({ func: callback }).runInNewContext(),
+    { name: "ReferenceError" });
+});
+
+test("Chrome argument transport omits null object properties without dropping array slots", () => {
+  const result = serializedInjectionScript({
+    func: (value) => value,
+    args: [{ guildId: null, nested: { omitted: null, present: "value" }, array: [null, { guildId: null }] }]
+  }).runInNewContext();
+  assert.deepEqual(plain(result), { nested: { present: "value" }, array: [null, {}] });
+});
 
 function discordSender(overrides) {
   return Object.assign({
@@ -179,6 +234,19 @@ test("document-bound full bootstrap installs once and later recovers without dup
   assert.equal(second.ok, true);
   assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script", "script"]);
   assert.equal(harness.calls.some((call) => call.kind === "css"), false);
+  assert.deepEqual(harness.injectionErrors, []);
+});
+
+test("an unparseable or failed page probe never masquerades as a stale controller or reloads Discord", async () => {
+  const harness = backgroundHarness();
+  harness.setMainController({
+    get apiVersion() { throw new Error("page-probe-failure"); },
+    recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}
+  });
+  const result = await harness.api.ensureDiscordBootstrap(1, "document-1", true);
+  assert.deepEqual(plain(result), { ok: false, reason: "page-hook-probe-unavailable" });
+  assert.equal(harness.injectionErrors.length, 1);
+  assert.equal(harness.calls.some((call) => call.kind === "reload" || call.kind === "css"), false);
 });
 
 test("a content watchdog request performs full hook, style, and isolated-world recovery", async () => {
@@ -535,6 +603,7 @@ test("message author resolution is document-bound, route-bound, and returns only
   const call = harness.calls.at(-1);
   assert.equal(call.options.world, "MAIN");
   assert.deepEqual(Array.from(call.options.target.documentIds), ["document-6"]);
+  assert.deepEqual(harness.injectionErrors, []);
 });
 
 test("message author resolution repairs a missing page controller and retries the same copy request", async () => {
@@ -564,6 +633,46 @@ test("message author resolution repairs a missing page controller and retries th
   const resolverCalls = harness.calls.filter((call) =>
     typeof call.options.func === "function" && /author-resolution-controller-unavailable/.test(String(call.options.func)));
   assert.equal(resolverCalls.length, 2);
+  assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
+  assert.deepEqual(harness.injectionErrors, []);
+});
+
+test("serialized broker callbacks reach the real page hook for live and deleted author identities", async () => {
+  const harness = backgroundHarness();
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const deletedId = "888888888888888882";
+  const userId = "999999999999999991";
+  const dispatcher = { dispatch() {}, subscribe() {}, unsubscribe() {} };
+  const messageStore = {
+    _dispatcher: dispatcher,
+    getName() { return "MessageStore"; },
+    getMessage(channel, id) {
+      return channel === channelId && id === messageId
+        ? { id, channel_id: channel, author: { id: userId, username: "curiousbro" } } : null;
+    },
+    getMessages() { return []; }
+  };
+  const userStore = {
+    getUser(id) { return id === userId ? { id, username: "curiousbro" } : null; },
+    getUsers() { return {}; }
+  };
+  harness.installRealPageHook({ messageStore: { exports: messageStore }, userStore: { exports: userStore } });
+  harness.setStoredArchive({ generation: 0, records: [
+    { channelId, messageId: deletedId, authorId: userId, status: "confirmed_deleted" }
+  ] });
+  assert.equal((await harness.api.ensureDiscordBootstrap(1, "document-1", true)).ok, true);
+  const result = await harness.api.handleResolveMessageAuthors({
+    type: "LDMA_RESOLVE_MESSAGE_AUTHORS", messageIds: [messageId, deletedId]
+  }, discordSender());
+  assert.deepEqual(plain(result), {
+    ok: true, reason: "message-authors-resolved",
+    authors: [
+      { messageId, userId, username: "curiousbro" },
+      { messageId: deletedId, userId, username: "curiousbro" }
+    ]
+  });
+  assert.deepEqual(harness.injectionErrors, []);
   assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
 });
 
@@ -676,7 +785,30 @@ test("message author resolution rejects malformed, untrusted, and route-stale re
   harness.setLocation("https://discord.com/channels/@me/888888888888888888");
   harness.setMainController({ resolveMessageAuthors() { throw new Error("must not run"); } });
   const changed = await harness.api.handleResolveMessageAuthors(valid, discordSender());
-  assert.deepEqual(plain(changed), { ok: false, reason: "message-author-resolution-failed", authors: [] });
+  assert.deepEqual(plain(changed), { ok: false, reason: "author-resolution-route-changed", authors: [] });
+  assert.equal(harness.calls.length, 1);
+  assert.deepEqual(harness.injectionErrors, []);
+});
+
+test("author diagnostics distinguish absent results, exceptions, and missing controllers", async () => {
+  for (const [controller, reason] of [
+    [{ resolveMessageAuthors() {} }, "author-resolution-result-unavailable"],
+    [{ resolveMessageAuthors() { return null; } }, "author-resolution-result-unavailable"],
+    [{ resolveMessageAuthors() { return { ok: true, authors: "bad-result" }; } }, "author-resolution-result-unavailable"],
+    [{ resolveMessageAuthors() { throw new Error("private-page-error"); } }, "author-resolution-controller-error"],
+    [{ resolveMessageAuthors() { return Promise.reject(new Error("private-page-error")); } }, "author-resolution-controller-error"],
+    [{ apiVersion: 2, recover() {} }, "author-resolution-controller-unavailable"]
+  ]) {
+    const harness = backgroundHarness();
+    harness.setMainController(controller);
+    const result = await harness.api.handleResolveMessageAuthors({
+      type: "LDMA_RESOLVE_MESSAGE_AUTHORS", messageIds: ["888888888888888881"]
+    }, discordSender());
+    assert.deepEqual(plain(result), { ok: false, reason, authors: [] });
+    assert.deepEqual(harness.injectionErrors, []);
+    assert.equal(harness.calls.some((call) => call.kind === "reload"),
+      reason === "author-resolution-controller-unavailable");
+  }
 });
 
 test("user action broker reports missing controllers and binds execution to the still-current route", async () => {
@@ -693,6 +825,20 @@ test("user action broker reports missing controllers and binds execution to the 
     type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222"
   }, sender);
   assert.deepEqual(plain(changed), { ok: false, reason: "user-action-route-changed" });
+});
+
+test("DM profile actions normalize the omitted guild argument back to an exact null context", async () => {
+  const harness = backgroundHarness();
+  const invoked = [];
+  harness.setMainController({
+    invokeUserAction(action, payload) { invoked.push({ action, payload }); return { ok: true, reason: "opened" }; }
+  });
+  const result = await harness.api.handleUserAction({
+    type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222"
+  }, discordSender());
+  assert.equal(result.ok, true);
+  assert.deepEqual(plain(invoked), [{ action: "open-profile", payload: { userId: "222222222222222222", guildId: null } }]);
+  assert.deepEqual(harness.injectionErrors, []);
 });
 
 test("user action broker rate limits each document and keeps limiter state bounded", async () => {
