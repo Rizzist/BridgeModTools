@@ -36,7 +36,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.6.4");
+  assert.equal(manifest.version, "2.6.5");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -72,6 +72,11 @@ test("background self-heals fresh, restored, updated, and SPA Discord documents"
   assert.match(background, /chrome\.tabs\.query\(\{ url: \[DISCORD_TAB_PATTERN\] \}\)/);
   assert.match(background, /chrome\.scripting\.executeScript/);
   assert.match(background, /files: \["src\/page-hook\.js"\][\s\S]*world: "MAIN"/);
+  assert.match(background, /PAGE_HOOK_API_VERSION = 3/);
+  assert.match(background, /chrome\.storage\.session\.get\(PAGE_HOOK_RELOAD_SESSION_KEY\)/);
+  assert.match(background, /if \(!await claimPageHookReload\(tabId\)\)/);
+  assert.match(background, /typeof controller\.resolveMessageAuthors === "function"/);
+  assert.match(background, /await chrome\.tabs\.reload\(tabId\)/);
   assert.match(background, /files: \["src\/core\.js", "src\/protocol\.js", "src\/content\.js"\][\s\S]*world: "ISOLATED"/);
   assert.match(background, /Symbol\.for\("BridgeModTools\.contentStyle\.v1"\)/);
   assert.match(background, /documentIds: \[documentId\]/);
@@ -95,6 +100,7 @@ test("background self-heals fresh, restored, updated, and SPA Discord documents"
 
   assert.match(hook, /Symbol\.for\("BridgeModTools\.pageHook\.v1"\)/);
   assert.match(hook, /existingController[\s\S]*recover\("duplicate-injection"\)/);
+  assert.equal(/(?:window|globalThis)\.location\.reload\s*\(/.test(hook), false);
   assert.match(hook, /scanWebpack\(requireFunction, true\)/);
   assert.match(hook, /bridgeMessage\("ready-request"\)/);
   assert.match(hook, /reconcileMessageStore/);

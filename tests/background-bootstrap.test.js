@@ -17,14 +17,17 @@ function eventSlot() {
   };
 }
 
-function backgroundHarness() {
+function backgroundHarness(options) {
   const calls = [];
   const events = {
     message: eventSlot(), connect: eventSlot(), installed: eventSlot(), startup: eventSlot(),
-    committed: eventSlot(), history: eventSlot(), replaced: eventSlot(), activated: eventSlot()
+    committed: eventSlot(), history: eventSlot(), replaced: eventSlot(), activated: eventSlot(), removed: eventSlot()
   };
+  const sessionData = options?.sessionData || {};
   let isolatedInstalled = false;
   let styleInstalled = false;
+  let pageHookProbeState = { apiVersion: 3, ready: true };
+  let pageHookFileInstallController = null;
   let queriedTabs = [];
   let storedArchive = null;
   let storageBytesInUse = 0;
@@ -35,6 +38,7 @@ function backgroundHarness() {
   const chrome = {
     runtime: {
       id: "extension-id",
+      getManifest() { return { version: options?.version || "2.6.5" }; },
       getURL(relative) { return `chrome-extension://extension-id/${relative}`; },
       onMessage: events.message,
       onConnect: events.connect,
@@ -45,7 +49,14 @@ function backgroundHarness() {
     scripting: {
       async executeScript(options) {
         calls.push({ kind: "script", options });
+        if (Array.isArray(options.files) && options.files.includes("src/page-hook.js") &&
+          pageHookFileInstallController && !context[Symbol.for("BridgeModTools.pageHook.v1")]) {
+          context[Symbol.for("BridgeModTools.pageHook.v1")] = pageHookFileInstallController;
+        }
         if (typeof options.func === "function") {
+          if (/expectedApiVersion/.test(String(options.func)) && /BridgeModTools\.pageHook\.v1/.test(String(options.func))) {
+            return [{ result: pageHookProbeState }];
+          }
           if (/invokeUserAction|resolveMessageAuthors/.test(String(options.func))) {
             return [{ result: await options.func(...(options.args || [])) }];
           }
@@ -69,10 +80,16 @@ function backgroundHarness() {
     },
     tabs: {
       onActivated: events.activated,
+      onRemoved: events.removed,
       async query() { return queriedTabs; },
       async reload(tabId) { calls.push({ kind: "reload", tabId }); }
     },
-    storage: { local: {
+    storage: { session: {
+      async get(key) {
+        return Object.prototype.hasOwnProperty.call(sessionData, key) ? { [key]: sessionData[key] } : {};
+      },
+      async set(value) { Object.assign(sessionData, value); }
+    }, local: {
       async get() { return storedArchive ? { ldmaArchive: storedArchive } : {}; },
       async getBytesInUse() { return storageBytesInUse; },
       async set(value) {
@@ -128,6 +145,8 @@ function backgroundHarness() {
     setStoredArchive(value) { storedArchive = value; },
     setStorageBytesInUse(value) { storageBytesInUse = value; },
     setMediaStats(value) { mediaStats = value; },
+    setPageHookProbeState(value) { pageHookProbeState = value; },
+    setPageHookFileInstallController(value) { pageHookFileInstallController = value; },
     setIsolatedInstalled(value) { isolatedInstalled = value; styleInstalled = value; },
     setQueriedTabs(value) { queriedTabs = value; }
   };
@@ -148,7 +167,7 @@ test("document-bound full bootstrap installs once and later recovers without dup
   const harness = backgroundHarness();
   const first = await harness.api.ensureDiscordBootstrap(1, "document-1", true);
   assert.equal(first.ok, true);
-  assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script", "css", "script", "script"]);
+  assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script", "script", "css", "script", "script"]);
   for (const call of harness.calls) {
     assert.deepEqual(Array.from(call.options.target.documentIds), ["document-1"]);
     assert.equal("frameIds" in call.options.target, false);
@@ -158,7 +177,7 @@ test("document-bound full bootstrap installs once and later recovers without dup
   harness.setIsolatedInstalled(true);
   const second = await harness.api.ensureDiscordBootstrap(1, "document-1", true);
   assert.equal(second.ok, true);
-  assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script"]);
+  assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script", "script"]);
   assert.equal(harness.calls.some((call) => call.kind === "css"), false);
 });
 
@@ -173,7 +192,60 @@ test("a content watchdog request performs full hook, style, and isolated-world r
     assert.equal(asyncResponse, true);
   });
   assert.equal(response.ok, true);
-  assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script", "css", "script", "script"]);
+  assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script", "script", "css", "script", "script"]);
+});
+
+test("a stale page controller gets one bounded background reload and never loops", async () => {
+  const harness = backgroundHarness();
+  harness.setPageHookProbeState({ apiVersion: 2, ready: false });
+  const first = await harness.api.ensureDiscordBootstrap(12, "document-12", true);
+  assert.deepEqual(plain(first), { ok: false, reason: "page-hook-upgrade-reload-scheduled" });
+  assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script", "reload"]);
+
+  harness.calls.length = 0;
+  const pending = await harness.api.ensureDiscordBootstrap(12, "document-12", true);
+  assert.deepEqual(plain(pending), { ok: false, reason: "page-hook-upgrade-pending" });
+  assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script"]);
+  assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
+
+  harness.calls.length = 0;
+  harness.setPageHookProbeState({ apiVersion: 3, ready: true });
+  const recovered = await harness.api.ensureDiscordBootstrap(12, "document-13", true);
+  assert.equal(recovered.ok, true);
+  assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
+});
+
+test("the stale-controller reload latch survives a service-worker restart and clears on tab close", async () => {
+  const sessionData = {};
+  const firstWorker = backgroundHarness({ sessionData });
+  firstWorker.setPageHookProbeState({ apiVersion: 2, ready: false });
+  assert.equal((await firstWorker.api.ensureDiscordBootstrap(21, "document-21", true)).reason,
+    "page-hook-upgrade-reload-scheduled");
+  assert.equal(firstWorker.calls.filter((call) => call.kind === "reload").length, 1);
+
+  const restartedWorker = backgroundHarness({ sessionData });
+  restartedWorker.setPageHookProbeState({ apiVersion: 2, ready: false });
+  assert.equal((await restartedWorker.api.ensureDiscordBootstrap(21, "document-22", true)).reason,
+    "page-hook-upgrade-pending");
+  assert.equal(restartedWorker.calls.some((call) => call.kind === "reload"), false);
+
+  restartedWorker.events.removed.listener(21, { windowId: 1, isWindowClosing: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  const reusedTabWorker = backgroundHarness({ sessionData });
+  reusedTabWorker.setPageHookProbeState({ apiVersion: 2, ready: false });
+  assert.equal((await reusedTabWorker.api.ensureDiscordBootstrap(21, "document-23", true)).reason,
+    "page-hook-upgrade-reload-scheduled");
+});
+
+test("extension update and stale-controller recovery share one reload gate", async () => {
+  const harness = backgroundHarness();
+  harness.setQueriedTabs([{ id: 22 }]);
+  harness.setPageHookProbeState({ apiVersion: 2, ready: false });
+  harness.events.installed.listener({ reason: "update", previousVersion: "2.6.3" });
+  const bootstrap = harness.api.ensureDiscordBootstrap(22, "document-22", true);
+  await bootstrap;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.calls.filter((call) => call.kind === "reload").length, 1);
 });
 
 test("Discord and extension sender authorization rejects route, origin, frame, and lookalike confusion", () => {
@@ -250,7 +322,7 @@ test("activating a restored or discarded Discord tab resolves its current docume
   const harness = backgroundHarness();
   harness.events.activated.listener({ tabId: 8, windowId: 3 });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script", "css", "script", "script"]);
+  assert.deepEqual(harness.calls.map((call) => call.kind), ["script", "script", "script", "css", "script", "script"]);
   for (const call of harness.calls) assert.deepEqual(Array.from(call.options.target.documentIds), ["document-8"]);
 });
 
@@ -463,6 +535,36 @@ test("message author resolution is document-bound, route-bound, and returns only
   const call = harness.calls.at(-1);
   assert.equal(call.options.world, "MAIN");
   assert.deepEqual(Array.from(call.options.target.documentIds), ["document-6"]);
+});
+
+test("message author resolution repairs a missing page controller and retries the same copy request", async () => {
+  const harness = backgroundHarness();
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const userId = "999999999999999991";
+  const pageUrl = `https://discord.com/channels/111111111111111111/${channelId}`;
+  harness.setLocation(pageUrl);
+  harness.setPageHookFileInstallController({
+    apiVersion: 3,
+    recover() {},
+    invokeUserAction() { return { ok: true }; },
+    resolveMessageAuthors() {
+      return { ok: true, reason: "resolved", authors: [{ messageId, userId, username: "curiousbro" }] };
+    }
+  });
+  const result = await harness.api.handleResolveMessageAuthors({
+    type: "LDMA_RESOLVE_MESSAGE_AUTHORS",
+    messageIds: [messageId]
+  }, discordSender({ tab: { id: 19, url: pageUrl }, documentId: "document-19" }));
+  assert.deepEqual(plain(result), {
+    ok: true,
+    reason: "message-authors-resolved",
+    authors: [{ messageId, userId, username: "curiousbro" }]
+  });
+  const resolverCalls = harness.calls.filter((call) =>
+    typeof call.options.func === "function" && /author-resolution-controller-unavailable/.test(String(call.options.func)));
+  assert.equal(resolverCalls.length, 2);
+  assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
 });
 
 test("direct-message author resolution uses the exact @me channel route", async () => {

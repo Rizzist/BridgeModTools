@@ -19,7 +19,10 @@ const GET_LIVE_HEALTH = "LDMA_GET_LIVE_HEALTH";
 const USER_ACTION_COMMAND = "LDMA_USER_ACTION";
 const RESOLVE_MESSAGE_AUTHORS_COMMAND = "LDMA_RESOLVE_MESSAGE_AUTHORS";
 const DISCORD_TAB_PATTERN = "https://discord.com/*";
+const PAGE_HOOK_API_VERSION = 3;
+const PAGE_HOOK_RELOAD_SESSION_KEY = "ldmaPageHookUpgradeReloadsV1";
 const bootstrapJobs = new Map();
+let pageHookReloadQueue = Promise.resolve();
 const liveHealthByDocument = new Map();
 const userActionRateLimits = new Map();
 const timeoutActionsInFlight = new Set();
@@ -27,6 +30,48 @@ const USER_ACTION_RATE_WINDOW_MS = 10000;
 const USER_ACTION_RATE_MAX = 8;
 const USER_ACTION_RATE_BUCKET_MAX = 500;
 const SNOWFLAKE_PATTERN = /^\d{15,25}$/;
+
+function pageHookReloadToken() {
+  let version = "unknown";
+  try { version = String(chrome.runtime.getManifest().version || "unknown"); } catch (_error) {}
+  return `${version}:${PAGE_HOOK_API_VERSION}`;
+}
+
+function mutatePageHookReloadState(operation) {
+  pageHookReloadQueue = pageHookReloadQueue.catch(() => undefined).then(async () => {
+    const stored = await chrome.storage.session.get(PAGE_HOOK_RELOAD_SESSION_KEY);
+    const source = stored?.[PAGE_HOOK_RELOAD_SESSION_KEY];
+    const state = source && typeof source === "object" && !Array.isArray(source)
+      ? Object.assign({}, source) : {};
+    const outcome = operation(state) || {};
+    if (outcome.changed) {
+      const keys = Object.keys(state);
+      while (keys.length > 500) delete state[keys.shift()];
+      await chrome.storage.session.set({ [PAGE_HOOK_RELOAD_SESSION_KEY]: state });
+    }
+    return outcome.value;
+  });
+  return pageHookReloadQueue;
+}
+
+function claimPageHookReload(tabId) {
+  const key = String(tabId);
+  const token = pageHookReloadToken();
+  return mutatePageHookReloadState((state) => {
+    if (state[key] === token) return { changed: false, value: false };
+    state[key] = token;
+    return { changed: true, value: true };
+  });
+}
+
+function clearPageHookReload(tabId) {
+  const key = String(tabId);
+  return mutatePageHookReloadState((state) => {
+    if (!Object.prototype.hasOwnProperty.call(state, key)) return { changed: false, value: false };
+    delete state[key];
+    return { changed: true, value: true };
+  });
+}
 
 function injectionTarget(tabId, documentId) {
   if (!Number.isInteger(tabId) || !documentId) return null;
@@ -45,6 +90,35 @@ async function ensureDiscordBootstrap(tabId, documentId, full) {
       world: "MAIN",
       injectImmediately: true
     });
+    const pageProbe = await chrome.scripting.executeScript({
+      target,
+      world: "MAIN",
+      func(expectedApiVersion) {
+        const controller = globalThis[Symbol.for("BridgeModTools.pageHook.v1")];
+        return {
+          apiVersion: Number(controller?.apiVersion) || 0,
+          ready: Boolean(controller && controller.apiVersion === expectedApiVersion &&
+            typeof controller.recover === "function" &&
+            typeof controller.resolveMessageAuthors === "function" &&
+            typeof controller.invokeUserAction === "function")
+        };
+      },
+      args: [PAGE_HOOK_API_VERSION]
+    });
+    const pageState = pageProbe.find((result) => result && result.result)?.result || {};
+    if (!pageState.ready) {
+      if (!await claimPageHookReload(tabId)) {
+        return { ok: false, reason: "page-hook-upgrade-pending" };
+      }
+      try {
+        await chrome.tabs.reload(tabId);
+      } catch (error) {
+        await clearPageHookReload(tabId);
+        throw error;
+      }
+      return { ok: false, reason: "page-hook-upgrade-reload-scheduled" };
+    }
+    await clearPageHookReload(tabId);
     if (full) {
       const probe = await chrome.scripting.executeScript({
         target,
@@ -98,8 +172,15 @@ async function bootstrapOpenDiscordTabs() {
 async function reloadOpenDiscordTabs() {
   let tabs = [];
   try { tabs = await chrome.tabs.query({ url: [DISCORD_TAB_PATTERN] }); } catch (_error) {}
-  await Promise.allSettled(tabs.filter((tab) => Number.isInteger(tab.id))
-    .map((tab) => chrome.tabs.reload(tab.id)));
+  await Promise.allSettled(tabs.filter((tab) => Number.isInteger(tab.id)).map(async (tab) => {
+    if (!await claimPageHookReload(tab.id)) return;
+    try {
+      await chrome.tabs.reload(tab.id);
+    } catch (error) {
+      await clearPageHookReload(tab.id);
+      throw error;
+    }
+  }));
 }
 
 async function bootstrapDiscordTab(tabId, full) {
@@ -588,9 +669,8 @@ async function handleResolveMessageAuthors(command, sender) {
       return Object.assign({ messageId: record.messageId, userId }, username ? { username } : {});
     }).filter(Boolean);
   } catch (_error) {}
-  let execution;
-  try {
-    execution = await chrome.scripting.executeScript({
+  async function resolveInMain() {
+    return chrome.scripting.executeScript({
       target: { tabId: sender.tab.id, documentIds: [sender.documentId] },
       world: "MAIN",
       func(ids, route, fallbackUsers) {
@@ -616,12 +696,29 @@ async function handleResolveMessageAuthors(command, sender) {
       },
       args: [messageIds, expectedRoute, trustedFallbacks]
     });
+  }
+  let execution;
+  try {
+    execution = await resolveInMain();
   } catch (_error) {
     return { ok: false, reason: "author-resolution-injection-failed", authors: [] };
   }
-  const result = Array.isArray(execution)
+  let result = Array.isArray(execution)
     ? execution.find((item) => item && Object.prototype.hasOwnProperty.call(item, "result"))?.result
     : null;
+  if (result?.reason === "author-resolution-controller-unavailable") {
+    const recovery = await ensureDiscordBootstrap(sender.tab.id, sender.documentId, true);
+    if (recovery.ok) {
+      try {
+        execution = await resolveInMain();
+        result = Array.isArray(execution)
+          ? execution.find((item) => item && Object.prototype.hasOwnProperty.call(item, "result"))?.result
+          : null;
+      } catch (_error) {
+        return { ok: false, reason: "author-resolution-injection-failed", authors: [] };
+      }
+    }
+  }
   return safeResolvedAuthors(result, messageIds);
 }
 
@@ -859,6 +956,7 @@ chrome.webNavigation.onTabReplaced.addListener((details) => {
 chrome.tabs.onActivated.addListener((details) => {
   bootstrapDiscordTab(details.tabId, true).catch(() => {});
 });
+chrome.tabs.onRemoved.addListener((tabId) => { clearPageHookReload(tabId).catch(() => {}); });
 chrome.runtime.onInstalled.addListener((details) => {
   // A MAIN-world controller belongs to the JavaScript bundle version that
   // installed it and cannot be safely replaced in place. Extension updates are
