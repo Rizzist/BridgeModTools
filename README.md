@@ -28,6 +28,8 @@ Version 2.6.2 fixes the **@** action showing `!` after an extension update. It v
 
 Version 2.6.3 grants the **@** action Chrome's write-only clipboard capability so resolved usernames are actually copied; the extension never reads the clipboard. The popup also displays combined local data usage—message metadata plus cached-media payload bytes—while retaining the separate media-cache total.
 
+Version 2.6.4 fixes canonical username copying across Discord's current UserStore module shapes, DMs, restored deleted messages, and legacy ID-only archive records. Every username remains atomically bound to its exact verified Discord user ID, structural store conflicts fail closed, and bulk recovery performs at most one bounded module refresh. It also removes page-hook-initiated reloads entirely, preventing unpacked-extension upgrades from putting Discord into a refresh loop; only the background update handler may reload an existing Discord tab once.
+
 Restored visual media now uses Discord-like inline sizing and spacing instead of a fixed-height generic card. Images and videos retain intrinsic dimensions up to a 550×350-pixel display box, small GIFs stay small, multiple visuals use a compact grid, and audio remains a compact native player. Cached files and plain links keep a small labeled tile.
 
 Version 2 also captures links and rendered upload/embed media. Discord-hosted images, videos, audio, voice messages, and files are downloaded immediately into an extension-owned local cache; direct third-party media can be enabled per site from the popup. Restored deleted rows and full history use the cached bytes, so supported media remains viewable or playable after the original message disappears.

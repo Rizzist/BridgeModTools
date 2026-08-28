@@ -16,19 +16,29 @@ function runHook(options) {
   const messages = new Map();
   const users = new Map();
   const userActionCalls = { profile: [], until: [] };
-  const makeMessage = (id, deleted, content, editedTimestamp) => ({
-    id,
-    channel_id: "777777777777777777",
-    content: content || "retained content",
-    editedTimestamp: editedTimestamp || null,
-    author: { id: "999999999999999991", username: "curiousbro" },
-    deleted: Boolean(deleted),
-    set(key, value) {
-      const next = makeMessage(this.id, key === "deleted" ? value : this.deleted, this.content, this.editedTimestamp);
-      next.author = this.author;
-      return next;
-    }
-  });
+  const makeMessage = (id, deleted, content, editedTimestamp) => {
+    const authorId = "999999999999999991";
+    const author = settings.messageAuthorAsId
+      ? authorId
+      : settings.messageAuthorUnboundUsername
+        ? { username: "must_not_bind" }
+        : Object.assign({ id: authorId }, settings.messageAuthorWithoutUsername ? {} : { username: "curiousbro" });
+    const message = {
+      id,
+      channel_id: "777777777777777777",
+      content: content || "retained content",
+      editedTimestamp: editedTimestamp || null,
+      author,
+      deleted: Boolean(deleted),
+      set(key, value) {
+        const next = makeMessage(this.id, key === "deleted" ? value : this.deleted, this.content, this.editedTimestamp);
+        next.author = this.author;
+        return next;
+      }
+    };
+    if (settings.messageAuthorUnboundUsername) message.authorId = authorId;
+    return message;
+  };
   messages.set("888888888888888881", makeMessage("888888888888888881", false));
   users.set("999999999999999991", { id: "999999999999999991", username: "curiousbro" });
   const handlerNode = {
@@ -76,7 +86,20 @@ function runHook(options) {
     _dispatcher: dispatcher,
     getName() { return "UserStore"; },
     getDispatchToken() { return "user_store_token"; },
-    getUser(id) { return users.get(id); }
+    getUser(id) { return users.get(id); },
+    getUsers() { return Object.fromEntries(users); },
+    getCurrentUser() { return users.get("999999999999999991"); }
+  };
+  const structuralUserStore = {};
+  Object.defineProperties(structuralUserStore, {
+    getUser: { enumerable: true, get() { return (id) => users.get(id); } },
+    getUsers: { enumerable: true, get() { return () => Object.fromEntries(users); } },
+    getCurrentUser: { enumerable: true, get() { return () => users.get("999999999999999991"); } }
+  });
+  const conflictingStructuralUserStore = {
+    getUser(id) { return id === "999999999999999991" ? { id, username: "conflicting_name" } : null; },
+    getUsers() { return {}; },
+    getCurrentUser() { return null; }
   };
   const rejectingDispatcher = {
     dispatch() {},
@@ -124,7 +147,8 @@ function runHook(options) {
     "1": { exports: { fallbackDispatcher } },
     "21": { exports: userActionExports },
     "42": { exports: moduleExports },
-    "43": { exports: { Z: userStore } }
+    "43": { exports: settings.noUserStore ? {} : { Z: settings.structuralUserStoreOnly ? structuralUserStore : userStore } },
+    "44": { exports: settings.conflictingStructuralUserStores ? { Z: conflictingStructuralUserStore } : {} }
   };
   const chunks = [];
   chunks.push = function push(chunk) {
@@ -232,7 +256,7 @@ function runHook(options) {
 test("duplicate page-hook injection recovers in place without duplicate listeners, timers, wrappers, or events", () => {
   const result = runHook();
   const originalDeleteWrapper = result.handlerNode.actionHandler.MESSAGE_DELETE;
-  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 2);
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 3);
   assert.equal(result.intervalCount(), 1);
   assert.equal(result.listenerCount("message"), 1);
 
@@ -605,7 +629,7 @@ test("author resolution returns exact IDs and usernames for current, retained, o
     username: "must_not_cross"
   }]))), {
     ok: true,
-    reason: "resolved",
+    reason: "resolved-author-ids-only",
     authors: [{ messageId, userId: "999999999999999992" }]
   });
   result.messages.set(messageId, {
@@ -625,14 +649,99 @@ test("author resolution returns exact IDs and usernames for current, retained, o
   });
 });
 
-test("a newer page hook reloads once instead of retaining an older controller contract", () => {
+test("author resolution accepts an ID-only message and a structurally discovered UserStore", () => {
+  const result = runHook({ messageAuthorAsId: true, structuralUserStoreOnly: true });
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId]))), {
+    ok: true,
+    reason: "resolved",
+    authors: [{ messageId, userId: "999999999999999991", username: "curiousbro" }]
+  });
+});
+
+test("author resolution refuses an unbound embedded username and conflicting structural stores", () => {
+  const unbound = runHook({ messageAuthorUnboundUsername: true, noUserStore: true });
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  assert.deepEqual(JSON.parse(JSON.stringify(unbound.resolveMessageAuthors(channelId, [messageId]))), {
+    ok: true,
+    reason: "resolved-author-ids-only",
+    authors: [{ messageId, userId: "999999999999999991" }]
+  });
+
+  const conflicting = runHook({
+    messageAuthorAsId: true,
+    structuralUserStoreOnly: true,
+    conflictingStructuralUserStores: true
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(conflicting.resolveMessageAuthors(channelId, [messageId]))), {
+    ok: true,
+    reason: "resolved-author-ids-only",
+    authors: [{ messageId, userId: "999999999999999991" }]
+  });
+});
+
+test("author resolution reports an exact author ID when no username cache is available", () => {
+  const result = runHook({ messageAuthorAsId: true, noUserStore: true });
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId]))), {
+    ok: true,
+    reason: "resolved-author-ids-only",
+    authors: [{ messageId, userId: "999999999999999991" }]
+  });
+});
+
+test("a trusted deleted archive identity resolves even while MessageStore is unavailable", () => {
+  const result = runHook({ delayedStore: true, noUserStore: true });
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId], [{
+    messageId,
+    userId: "999999999999999991",
+    username: "curiousbro"
+  }]))), {
+    ok: true,
+    reason: "resolved-from-trusted-archive",
+    authors: [{ messageId, userId: "999999999999999991", username: "curiousbro" }]
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId]))), {
+    ok: false,
+    reason: "message-store-unavailable",
+    authors: []
+  });
+
+  const idOnlyArchive = runHook({ delayedStore: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(idOnlyArchive.resolveMessageAuthors(channelId, [messageId], [{
+    messageId,
+    userId: "999999999999999991"
+  }]))), {
+    ok: true,
+    reason: "resolved-from-trusted-archive",
+    authors: [{ messageId, userId: "999999999999999991", username: "curiousbro" }]
+  });
+
+  const idOnlyWithoutUserStore = runHook({ delayedStore: true, noUserStore: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(idOnlyWithoutUserStore.resolveMessageAuthors(channelId, [messageId], [{
+    messageId,
+    userId: "999999999999999991"
+  }]))), {
+    ok: true,
+    reason: "resolved-author-ids-only",
+    authors: [{ messageId, userId: "999999999999999991" }]
+  });
+});
+
+test("a newer page hook never self-reloads an older controller contract", () => {
   const settings = { legacyController: true };
   const result = runHook(settings);
-  assert.equal(result.legacyRecoveries(), 1);
-  assert.equal(result.reloads(), 1);
+  assert.equal(result.legacyRecoveries(), 0);
+  assert.equal(result.reloads(), 0);
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].upgradeRequired, 3);
   result.reinject();
-  assert.equal(result.legacyRecoveries(), 2);
-  assert.equal(result.reloads(), 1);
+  assert.equal(result.legacyRecoveries(), 0);
+  assert.equal(result.reloads(), 0);
 });
 
 test("native profile and fixed seven-day timeout actions receive only normalized identity context", async () => {

@@ -118,6 +118,20 @@
     return /^[a-z0-9._]{1,32}$/i.test(username) ? username : null;
   }
 
+  function boundAuthorIdentity(resolvedUserIdValue, resolvedUsernameValue, fallbackUserIdValue, fallbackUsernameValue) {
+    const resolvedUserId = snowflakeValue(resolvedUserIdValue);
+    const fallbackUserId = snowflakeValue(fallbackUserIdValue);
+    const resolvedUsername = discordUsernameValue(resolvedUsernameValue);
+    const fallbackUsername = fallbackUserId ? discordUsernameValue(fallbackUsernameValue) : null;
+    if (resolvedUserId) {
+      return {
+        userId: resolvedUserId,
+        username: resolvedUsername || (resolvedUserId === fallbackUserId ? fallbackUsername : null)
+      };
+    }
+    return { userId: fallbackUserId, username: fallbackUsername };
+  }
+
   function avatarAuthorId(value) {
     const safe = safeDiscordAssetUrl(value);
     if (!safe) return null;
@@ -680,6 +694,15 @@
         firstCapturedAt: old.firstCapturedAt || record.firstCapturedAt || record.capturedAt || now,
         updatedAt: now
       });
+      const oldAuthorId = snowflakeValue(old.authorId);
+      const incomingAuthorId = snowflakeValue(safeRecord.authorId);
+      const incomingAuthorUsername = discordUsernameValue(safeRecord.authorUsername);
+      // A canonical username is meaningful only while it remains bound to the
+      // exact verified Discord account. Never carry one across an author-ID
+      // correction merely because Object.assign retained the older field.
+      if (incomingAuthorId && oldAuthorId !== incomingAuthorId && !incomingAuthorUsername) {
+        delete merged.authorUsername;
+      }
       if (isDeletedStatus(old.status) && !isDeletedStatus(record.status)) {
         merged.status = old.status;
         merged.inferredDeletedAt = old.inferredDeletedAt;
@@ -779,6 +802,7 @@
     messageUsernameLabelId,
     snowflakeValue,
     discordUsernameValue,
+    boundAuthorIdentity,
     avatarAuthorId,
     snowflakeTimestamp,
     sameContinuationAuthor,

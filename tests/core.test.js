@@ -145,6 +145,67 @@ test("merge never downgrades a Discord-confirmed deletion", () => {
   assert.equal(merged[0].content, "old");
 });
 
+test("merge keeps Discord author IDs and canonical usernames atomically bound", () => {
+  const base = {
+    channelId: "111111111111111",
+    messageId: "222222222222222",
+    authorId: "333333333333333",
+    authorUsername: "original_name",
+    status: "seen"
+  };
+  const sameAuthor = Core.mergeRecords([base], [{
+    channelId: base.channelId,
+    messageId: base.messageId,
+    authorId: base.authorId,
+    status: "seen"
+  }], { now: 2 })[0];
+  assert.equal(sameAuthor.authorUsername, "original_name");
+
+  const changedWithoutUsername = Core.mergeRecords([base], [{
+    channelId: base.channelId,
+    messageId: base.messageId,
+    authorId: "444444444444444",
+    status: "seen"
+  }], { now: 3 })[0];
+  assert.equal(changedWithoutUsername.authorId, "444444444444444");
+  assert.equal(changedWithoutUsername.authorUsername, undefined);
+
+  const changedWithUsername = Core.mergeRecords([base], [{
+    channelId: base.channelId,
+    messageId: base.messageId,
+    authorId: "444444444444444",
+    authorUsername: "replacement_name",
+    status: "seen"
+  }], { now: 4 })[0];
+  assert.equal(changedWithUsername.authorId, "444444444444444");
+  assert.equal(changedWithUsername.authorUsername, "replacement_name");
+});
+
+test("resolved and fallback Discord author identity is selected as one bound pair", () => {
+  const authorA = "333333333333333";
+  const authorB = "444444444444444";
+  assert.deepEqual(Core.boundAuthorIdentity(authorB, null, authorA, "old_name"), {
+    userId: authorB,
+    username: null
+  });
+  assert.deepEqual(Core.boundAuthorIdentity(authorB, "new_name", authorA, "old_name"), {
+    userId: authorB,
+    username: "new_name"
+  });
+  assert.deepEqual(Core.boundAuthorIdentity(authorA, null, authorA, "legacy_name"), {
+    userId: authorA,
+    username: "legacy_name"
+  });
+  assert.deepEqual(Core.boundAuthorIdentity(null, null, authorA, "fallback_name"), {
+    userId: authorA,
+    username: "fallback_name"
+  });
+  assert.deepEqual(Core.boundAuthorIdentity(authorB, null, null, "unbound_name"), {
+    userId: authorB,
+    username: null
+  });
+});
+
 test("edit payload signatures ignore presentation churn but detect text and media changes", () => {
   const base = {
     content: "hello   world",

@@ -1,18 +1,19 @@
 (function installLocalDiscordLifecycleHook() {
   "use strict";
 
-  const HOOK_API_VERSION = 2;
+  const HOOK_API_VERSION = 3;
   const INSTALL_KEY = Symbol.for("BridgeModTools.pageHook.v1");
   const existingController = window[INSTALL_KEY];
   if (existingController && typeof existingController.recover === "function") {
-    existingController.recover("duplicate-injection");
-    // Reloading an unpacked extension replaces its isolated world, but the old
-    // page-world controller can survive in Discord's document. A newer content
-    // script must never keep talking to an older controller contract.
-    if (existingController.apiVersion !== HOOK_API_VERSION && !existingController.upgradeReloadScheduled) {
-      existingController.upgradeReloadScheduled = true;
-      try { window.location.reload(); } catch (_error) {}
+    // MAIN-world controllers cannot be replaced safely in place. Never reload
+    // from the page hook: unpacked-extension updates can briefly overlap two
+    // script generations and turn a self-reload into a loop. The background's
+    // onInstalled path owns the single bounded document reload instead.
+    if (existingController.apiVersion !== HOOK_API_VERSION) {
+      try { existingController.upgradeRequired = HOOK_API_VERSION; } catch (_error) {}
+      return;
     }
+    existingController.recover("duplicate-injection");
     return;
   }
   const controller = {
@@ -49,6 +50,7 @@
   let fallbackDispatcher = null;
   let messageStoreCandidate = null;
   let userStoreCandidate = null;
+  const structuralUserStoreCandidates = new Set();
   let userProfileActionsCandidate = null;
   let timeoutUntilActionsCandidate = null;
   let messageStorePatched = false;
@@ -257,6 +259,72 @@
       try { current = Object.getPrototypeOf(current); } catch (_error) { return null; }
     }
     return null;
+  }
+
+  function userStoreFunctions(value) {
+    const getUser = moduleExportFunction(value, "getUser");
+    const getUsers = moduleExportFunction(value, "getUsers");
+    const getCurrentUser = moduleExportFunction(value, "getCurrentUser");
+    return getUser && (getUsers || getCurrentUser) ? { getUser, getUsers, getCurrentUser } : null;
+  }
+
+  function exactUserFromStore(store, userId) {
+    if (!store || !userId) return null;
+    const functions = userStoreFunctions(store) || {
+      getUser: moduleExportFunction(store, "getUser"),
+      getUsers: moduleExportFunction(store, "getUsers"),
+      getCurrentUser: moduleExportFunction(store, "getCurrentUser")
+    };
+    let user = null;
+    try { user = functions.getUser?.call(store, userId); } catch (_error) {}
+    if (cleanId(user?.id) === userId) return user;
+    if (functions.getUsers) {
+      let users = null;
+      try { users = functions.getUsers.call(store); } catch (_error) {}
+      try {
+        if (users instanceof Map) user = users.get(userId);
+        else if (Array.isArray(users)) user = users.find((item) => cleanId(item?.id) === userId);
+        else if (users && typeof users === "object") user = users[userId];
+      } catch (_error) { user = null; }
+      if (cleanId(user?.id) === userId) return user;
+    }
+    if (functions.getCurrentUser) {
+      try { user = functions.getCurrentUser.call(store); } catch (_error) { user = null; }
+      if (cleanId(user?.id) === userId) return user;
+    }
+    return null;
+  }
+
+  function messageAuthorIdentity(message) {
+    const candidates = [message?.author, message?.user, message?.member?.user];
+    let userId = cleanId(message?.authorId || message?.author_id || message?.userId || message?.user_id);
+    let username = null;
+    for (const candidate of candidates) {
+      const candidateId = cleanId(candidate) || cleanId(candidate?.id || candidate?.userId || candidate?.user_id);
+      if (!userId && candidateId) userId = candidateId;
+      if (candidateId && userId && candidateId !== userId) continue;
+      if (candidateId === userId) username = cleanUsername(candidate?.username) || username;
+    }
+    return { userId, username };
+  }
+
+  function cachedUser(userId) {
+    const resolve = () => {
+      const named = exactUserFromStore(userStoreCandidate, userId);
+      if (named && cleanUsername(named.username)) return named;
+      let resolved = null;
+      let resolvedUsername = null;
+      for (const candidate of structuralUserStoreCandidates) {
+        const user = exactUserFromStore(candidate, userId);
+        const username = cleanUsername(user?.username);
+        if (!user || !username) continue;
+        if (resolvedUsername && resolvedUsername !== username) return null;
+        resolved = user;
+        resolvedUsername = username;
+      }
+      return resolved;
+    };
+    return resolve();
   }
 
   function isDispatcher(value) {
@@ -602,6 +670,13 @@
       inspected += 1;
       if (shouldIgnoreValue(value)) continue;
       inspectUserActionExports(value);
+      if (userStoreFunctions(value)) {
+        structuralUserStoreCandidates.delete(value);
+        structuralUserStoreCandidates.add(value);
+        while (structuralUserStoreCandidates.size > 12) {
+          structuralUserStoreCandidates.delete(structuralUserStoreCandidates.values().next().value);
+        }
+      }
       const storeInfo = coreStoreInfo(value);
       if (storeInfo) {
         const usableMessageStore = storeInfo.name === "MessageStore" &&
@@ -610,7 +685,7 @@
         // exact Flux store name plus the ID-keyed getter is sufficient here;
         // getCurrentUser is unrelated to resolving another message author and
         // has disappeared from some builds.
-        const usableUserStore = storeInfo.name === "UserStore" && dataFunction(value, "getUser");
+        const usableUserStore = storeInfo.name === "UserStore" && moduleExportFunction(value, "getUser");
         if (usableUserStore) userStoreCandidate = value;
         // Do not let a decoy/partial named store claim global hook health. Its
         // dispatcher must first pass subscription and become the accepted core
@@ -776,20 +851,39 @@
         fallbackUsers.set(messageId, { userId, username: cleanUsername(item?.username) });
       }
     }
-    if (!messageStoreCandidate || typeof messageStoreCandidate?.getMessage !== "function") {
+    let userStoresRefreshed = false;
+    const resolveCachedUser = (userId) => {
+      let user = cachedUser(userId);
+      if (user || userStoresRefreshed) return user;
+      userStoresRefreshed = true;
+      for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
+      return cachedUser(userId);
+    };
+    if (!messageStoreCandidate || !moduleExportFunction(messageStoreCandidate, "getMessage")) {
       recoverHook("author-resolution");
     } else {
       reconcileMessageStore("author-resolution");
     }
-    const getMessage = dataFunction(messageStoreCandidate, "getMessage");
-    if (!getMessage) return { ok: false, reason: "message-store-unavailable", authors: [] };
-    let rescannedUserStore = false;
-    if (!userStoreCandidate || !dataFunction(userStoreCandidate, "getUser")) {
-      rescannedUserStore = true;
-      for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
+    const getMessage = moduleExportFunction(messageStoreCandidate, "getMessage");
+    if (!getMessage) {
+      let usernamesMissing = 0;
+      const authors = ids.map((messageId) => {
+        const fallbackUser = fallbackUsers.get(messageId);
+        if (!fallbackUser) return null;
+        const username = fallbackUser.username || cleanUsername(resolveCachedUser(fallbackUser.userId)?.username);
+        if (!username) usernamesMissing += 1;
+        return Object.assign({ messageId, userId: fallbackUser.userId }, username ? { username } : {});
+      }).filter(Boolean);
+      return {
+        ok: authors.length > 0,
+        reason: authors.length > 0
+          ? usernamesMissing ? "resolved-author-ids-only" : "resolved-from-trusted-archive"
+          : "message-store-unavailable",
+        authors
+      };
     }
-    let getUser = dataFunction(userStoreCandidate, "getUser");
     const authors = [];
+    let usernamesMissing = 0;
     for (const messageId of ids) {
       let message = null;
       try { message = getMessage.call(messageStoreCandidate, channelId, messageId); } catch (_error) {}
@@ -797,29 +891,19 @@
       const resolvedChannelId = cleanId(message?.channelId || message?.channel_id);
       const exactMessage = resolvedMessageId === messageId && resolvedChannelId === channelId ? message : null;
       const fallbackUser = fallbackUsers.get(messageId);
-      const userId = cleanId(exactMessage?.author?.id || exactMessage?.authorId || exactMessage?.author_id) ||
+      const messageAuthor = messageAuthorIdentity(exactMessage);
+      const userId = messageAuthor.userId ||
         fallbackUser?.userId || null;
       if (!userId) continue;
-      let username = cleanUsername(exactMessage?.author?.username);
-      if (!username && getUser) {
-        let user = null;
-        try { user = getUser.call(userStoreCandidate, userId); } catch (_error) {}
-        if (cleanId(user?.id) === userId) username = cleanUsername(user?.username);
-      }
-      if (!username && !rescannedUserStore) {
-        rescannedUserStore = true;
-        for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
-        getUser = dataFunction(userStoreCandidate, "getUser");
-        let user = null;
-        try { user = getUser?.call(userStoreCandidate, userId); } catch (_error) {}
-        if (cleanId(user?.id) === userId) username = cleanUsername(user?.username);
-      }
+      let username = messageAuthor.username;
+      if (!username) username = cleanUsername(resolveCachedUser(userId)?.username);
       if (!username && fallbackUser?.userId === userId) username = fallbackUser.username;
       const item = { messageId, userId };
       if (username) item.username = username;
+      else usernamesMissing += 1;
       authors.push(item);
     }
-    return { ok: true, reason: "resolved", authors };
+    return { ok: true, reason: usernamesMissing ? "resolved-author-ids-only" : "resolved", authors };
   }
 
   async function invokeUserAction(action, payload) {

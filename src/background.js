@@ -548,9 +548,17 @@ function safeResolvedAuthors(value, requestedIds) {
     const username = Core.discordUsernameValue(item?.username);
     authors.push(Object.assign({ messageId, userId }, username ? { username } : {}));
   }
+  const safeReasons = new Map([
+    ["resolved", "message-authors-resolved"],
+    ["resolved-from-trusted-archive", "message-authors-resolved-from-archive"],
+    ["resolved-author-ids-only", "message-usernames-unavailable"],
+    ["message-store-unavailable", "message-store-unavailable"]
+  ]);
   return {
     ok: value?.ok === true,
-    reason: value?.ok === true ? "message-authors-resolved" : "message-author-resolution-failed",
+    reason: value?.ok === true
+      ? safeReasons.get(value?.reason) || "message-authors-resolved"
+      : safeReasons.get(value?.reason) || "message-author-resolution-failed",
     authors
   };
 }

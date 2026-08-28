@@ -465,6 +465,37 @@ test("message author resolution is document-bound, route-bound, and returns only
   assert.deepEqual(Array.from(call.options.target.documentIds), ["document-6"]);
 });
 
+test("direct-message author resolution uses the exact @me channel route", async () => {
+  const harness = backgroundHarness();
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const userId = "999999999999999991";
+  const pageUrl = `https://discord.com/channels/@me/${channelId}`;
+  harness.setLocation(pageUrl);
+  const received = [];
+  harness.setMainController({
+    resolveMessageAuthors(receivedChannelId, ids, fallbackUsers) {
+      received.push({ receivedChannelId, ids, fallbackUsers });
+      return {
+        ok: true,
+        reason: "resolved",
+        authors: [{ messageId, userId, username: "curiousbro" }]
+      };
+    }
+  });
+  const result = await harness.api.handleResolveMessageAuthors({
+    type: "LDMA_RESOLVE_MESSAGE_AUTHORS",
+    messageIds: [messageId]
+  }, discordSender({ tab: { id: 16, url: pageUrl }, documentId: "document-16" }));
+  assert.deepEqual(plain(result), {
+    ok: true,
+    reason: "message-authors-resolved",
+    authors: [{ messageId, userId, username: "curiousbro" }]
+  });
+  assert.deepEqual(plain(received), [{ receivedChannelId: channelId, ids: [messageId], fallbackUsers: [] }]);
+  assert.equal(harness.calls.at(-1).options.args[1].guildId, null);
+});
+
 test("deleted message username resolution receives only the exact trusted archive author fallback", async () => {
   const harness = backgroundHarness();
   const guildId = "111111111111111111";
@@ -502,6 +533,33 @@ test("deleted message username resolution receives only the exact trusted archiv
     ids: [messageId, seenMessageId],
     fallbackUsers: [{ messageId, userId, username: "curiousbro" }]
   }]);
+});
+
+test("message author resolution preserves safe username-stage diagnostics", async () => {
+  const harness = backgroundHarness();
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const userId = "999999999999999991";
+  const pageUrl = `https://discord.com/channels/111111111111111111/${channelId}`;
+  harness.setLocation(pageUrl);
+  harness.setMainController({
+    resolveMessageAuthors() {
+      return {
+        ok: true,
+        reason: "resolved-author-ids-only",
+        authors: [{ messageId, userId }]
+      };
+    }
+  });
+  const result = await harness.api.handleResolveMessageAuthors({
+    type: "LDMA_RESOLVE_MESSAGE_AUTHORS",
+    messageIds: [messageId]
+  }, discordSender({ tab: { id: 18, url: pageUrl }, documentId: "document-18" }));
+  assert.deepEqual(plain(result), {
+    ok: true,
+    reason: "message-usernames-unavailable",
+    authors: [{ messageId, userId }]
+  });
 });
 
 test("message author resolution rejects malformed, untrusted, and route-stale requests", async () => {
