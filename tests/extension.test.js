@@ -35,7 +35,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.5.0");
+  assert.equal(manifest.version, "2.6.0");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -202,7 +202,7 @@ test("persistent replacements use a Discord-style row and hide the retained nati
   assert.match(content, /function mountConfirmedFromSnapshots[\s\S]*const nativeRow = findMessage[\s\S]*insertTombstone\(archived, placement, nativeRow\)[\s\S]*nativeRow\.dataset\.ldmaNativeReplaced = "true"/);
   assert.match(content, /insertTombstone\(record, Object\.assign/);
   assert.match(content, /const mount = document\.createElement\("div"\)[\s\S]*host\.append\(mount\)[\s\S]*mount\.attachShadow\(\{ mode: "closed" \}\)/);
-  assert.equal(/host\.attachShadow/.test(content), false);
+  assert.match(content, /const shadow = host\.attachShadow\(\{ mode: "closed" \}\)/);
   assert.match(content, /createElement\("iframe"\)/);
   assert.match(content, /chrome\.runtime\.getURL\("media\/view\.html"\)/);
   assert.match(content, /function extensionFrameOrigin/);
@@ -240,7 +240,9 @@ test("persistent replacements use a Discord-style row and hide the retained nati
   assert.match(content, /render\.setContinuation/);
   assert.match(content, /host\.dataset\.ldmaContinuation = String\(continuation\)/);
   assert.match(content, /\.message\.continuation \{ min-height:22px; padding-block:0; \}/);
-  assert.match(content, /\.message\.continuation \.avatar,.message\.continuation \.header \{ display:none; \}/);
+  assert.match(content, /\.message\.continuation \.avatar \{ display:none; \}/);
+  assert.match(content, /\.message\.continuation \.header \{ position:absolute;/);
+  assert.match(content, /\.message\.continuation \.header \.author-group,.message\.continuation \.header \.timestamp \{ display:none; \}/);
   assert.match(content, /new CSSStyleSheet\(\)/);
   assert.match(content, /shadow\.adoptedStyleSheets = \[sheet\]/);
   for (const field of ["avatarUrl", "authorColor", "displayTimestamp", "replyPreview"]) {
@@ -263,28 +265,49 @@ test("persistent replacements use a Discord-style row and hide the retained nati
   assert.equal(/innerHTML/.test(content), false);
 });
 
-test("deleted rows expose identity-safe profile, copy, and confirmed seven-day timeout actions", () => {
+test("live and deleted rows expose exactly two header-adjacent hover actions", () => {
   const content = fs.readFileSync(path.join(root, "src", "content.js"), "utf8");
+  const hostCss = fs.readFileSync(path.join(root, "src", "content.css"), "utf8");
 
   assert.match(content, /const avatar = document\.createElement\("button"\)/);
   assert.match(content, /const author = document\.createElement\("button"\)/);
   assert.match(content, /avatar\.setAttribute\("aria-label", profileLabel\)/);
   assert.match(content, /author\.setAttribute\("aria-label", profileLabel\)/);
+  assert.match(content, /function createAuthorActionControls/);
   assert.match(content, /role", "toolbar"/);
-  for (const label of ["Open profile", "Copy ID", "Copy mention", "Timeout 7d"]) {
+  for (const label of ["Copy Discord ID", "Timeout user for 7 days"]) {
     assert.match(content, new RegExp(label));
   }
+  assert.match(content, /actions\.append\(copyAction, timeoutAction, status\)/);
+  assert.equal(/copyMentionAction|profileAction/.test(content), false);
+  assert.match(content, /header\.append\(authorGroup, timestamp, controls\.actions\)/);
+  assert.match(content, /function nativeHeaderActionInsertion/);
+  assert.match(content, /`\[id="message-username-\$\{messageId\}"\]`/);
+  assert.match(content, /function reconcileLiveAuthorActions/);
+  assert.match(content, /reconcileLiveAuthorActions\(active, records\)/);
+  assert.match(content, /data-ldma-author-actions-host/);
+  assert.match(content, /host\.attachShadow\(\{ mode: "closed" \}\)/);
+  assert.match(content, /child\.matches\("\[class\*='hiddenVisually_'\], \[aria-hidden='true'\], \[data-ldma-author-actions\]"\)/);
   assert.match(content, /navigator\.clipboard\.writeText\(value\)/);
   assert.match(content, /document\.execCommand\("copy"\)/);
-  assert.match(content, /`<@\$\{actionUserId\}>`/);
-  assert.match(content, /role", "status"/);
-  assert.match(content, /window\.confirm\(`Timeout \$\{actionAuthor\} for 7 days\?`\)/);
+  assert.match(content, /window\.confirm\(`Timeout \$\{author\} \(\$\{userId\}\) for 7 days\?`\)/);
   assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "open-profile",\s*userId: actionUserId,\s*guildId: actionGuildId/);
-  assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "timeout-7d",\s*userId: actionUserId,\s*guildId: actionGuildId/);
-  assert.match(content, /actions\.hidden = !nextUserId/);
-  assert.match(content, /timeoutAction\.hidden = !nextGuildId/);
-  assert.match(content, /SNOWFLAKE\.test\(String\(record\.authorId/);
+  assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "timeout-7d",\s*userId,\s*guildId: context\.guildId,\s*messageId: context\.messageId/);
+  assert.match(content, /Core\.messageRowOwnsElement\(row, host, identity\.messageId\)/);
+  assert.match(content, /pendingTimeoutActions\.has\(timeoutKey\)/);
+  assert.match(content, /role", "status"/);
+  assert.match(content, /aria-live", "polite"/);
+  assert.match(content, /timeoutAction\.hidden = !SNOWFLAKE\.test\(String\(context\?\.guildId/);
+  assert.match(content, /type: RESOLVE_MESSAGE_AUTHORS, messageIds: \[context\.messageId\]/);
+  assert.match(content, /const userId = context && await resolveActionAuthorId\(context, true\)/);
+  assert.match(content, /background independently proves/);
+  assert.match(content, /function removeLiveAuthorActions/);
+  assert.match(content, /removeLiveAuthorActions\(\)/);
   assert.match(content, /event\.stopPropagation\(\)/);
+  assert.match(hostCss, /\[data-ldma-author-actions-host="true"\]/);
+  assert.match(hostCss, /:hover \[data-ldma-author-actions-host="true"\]/);
+  assert.match(hostCss, /opacity:\s*0/);
+  assert.match(hostCss, /pointer-events:\s*none/);
   assert.equal(/\bfetch\s*\(/.test(content), false);
   assert.equal(/Authorization/i.test(content), false);
 });

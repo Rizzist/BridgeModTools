@@ -28,6 +28,7 @@
   const BRIDGE = "LDMA_BRIDGE_V1";
   const LIVE_HEALTH = "LDMA_REPORT_LIVE_HEALTH";
   const EDIT_EVENT = "LDMA_EDIT_BEFORE_V1";
+  const RESOLVE_MESSAGE_AUTHORS = "LDMA_RESOLVE_MESSAGE_AUTHORS";
   const SNOWFLAKE = /^\d{15,25}$/;
   const captureSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
   let captureSequence = 0;
@@ -39,8 +40,10 @@
     activeList: null, listIdentity: null, snapshots: new WeakMap(), signatures: new Map(),
     snapshotsByKey: new Map(), pageHookStatus: "searching", pageHookDetail: "Waiting for Discord's deletion event dispatcher.",
     pendingRecords: new Map(), pendingRetractions: new Set(), recentRemovals: new Map(), pendingRetainedKeys: new Set(), pendingReleaseKeys: new Set(), flushTimer: null, flushPromise: null,
-    healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), editRenderers: new Map(), spacingFrame: 0,
+    healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), editRenderers: new Map(), liveActionRenderers: new Map(), spacingFrame: 0,
     pendingConfirmedMounts: new Map(), pendingEdits: new Map(), stagedSelfEdits: new Map(),
+    resolvedAuthorIds: new Map(), authorResolutionAttempts: new Map(), pendingAuthorResolutionIds: new Set(),
+    authorResolutionTimer: null, pendingTimeoutActions: new Set(),
     lastMediaRecoveryAt: -Infinity,
     pageHookLastSeenAt: -Infinity, bootstrapRequestedAt: -Infinity, bootstrapPromise: null
   };
@@ -274,6 +277,59 @@
       }
     }
     return Core.avatarAuthorId(avatarUrl);
+  }
+
+  function resolvedAuthorId(channelId, messageId, fallback) {
+    if (SNOWFLAKE.test(String(channelId || "")) && SNOWFLAKE.test(String(messageId || ""))) {
+      const resolved = state.resolvedAuthorIds.get(`${channelId}:${messageId}`);
+      if (resolved) return resolved;
+    }
+    return Core.snowflakeValue(fallback);
+  }
+
+  function queueAuthorResolution(channelId, messageIds) {
+    if (state.route?.channelId !== channelId || !SNOWFLAKE.test(String(channelId || ""))) return;
+    const now = performance.now();
+    for (const messageId of messageIds || []) {
+      if (!SNOWFLAKE.test(String(messageId || ""))) continue;
+      const key = `${channelId}:${messageId}`;
+      if (state.resolvedAuthorIds.has(key) || now - (state.authorResolutionAttempts.get(key) || -Infinity) < 30000) continue;
+      state.pendingAuthorResolutionIds.add(key);
+    }
+    if (!state.pendingAuthorResolutionIds.size || state.authorResolutionTimer) return;
+    state.authorResolutionTimer = setTimeout(() => {
+      state.authorResolutionTimer = null;
+      const route = state.route;
+      if (!route) {
+        state.pendingAuthorResolutionIds.clear();
+        return;
+      }
+      const keys = [...state.pendingAuthorResolutionIds]
+        .filter((key) => key.startsWith(`${route.channelId}:`)).slice(0, 200);
+      for (const key of keys) state.pendingAuthorResolutionIds.delete(key);
+      if (!keys.length) return;
+      const attemptedAt = performance.now();
+      for (const key of keys) state.authorResolutionAttempts.set(key, attemptedAt);
+      const messageIdsForRequest = keys.map((key) => key.slice(key.indexOf(":") + 1));
+      const routeKey = route.routeKey;
+      send({ type: RESOLVE_MESSAGE_AUTHORS, messageIds: messageIdsForRequest }).then((response) => {
+        if (!response?.ok || state.route?.routeKey !== routeKey) return;
+        let changed = false;
+        for (const item of Array.isArray(response.authors) ? response.authors : []) {
+          const messageId = Core.snowflakeValue(item?.messageId);
+          const userId = Core.snowflakeValue(item?.userId);
+          if (!messageId || !userId || !messageIdsForRequest.includes(messageId)) continue;
+          const key = `${route.channelId}:${messageId}`;
+          if (state.resolvedAuthorIds.get(key) !== userId) changed = true;
+          state.resolvedAuthorIds.set(key, userId);
+        }
+        while (state.resolvedAuthorIds.size > 5000) state.resolvedAuthorIds.delete(state.resolvedAuthorIds.keys().next().value);
+        while (state.authorResolutionAttempts.size > 5000) state.authorResolutionAttempts.delete(state.authorResolutionAttempts.keys().next().value);
+        if (changed) requestAnimationFrame(() => snapshotRenderedMessages(true));
+      }).finally(() => {
+        if (state.pendingAuthorResolutionIds.size) queueAuthorResolution(state.route?.channelId, []);
+      });
+    }, 40);
   }
 
   function allContent(node, messageId) {
@@ -540,7 +596,7 @@
       }
     }
     for (const child of candidates) {
-      if (child === authorElement || child.contains(authorElement) || child.matches("[class*='hiddenVisually_'], [aria-hidden='true']")) continue;
+      if (child === authorElement || child.contains(authorElement) || child.matches("[class*='hiddenVisually_'], [aria-hidden='true'], [data-ldma-author-actions]")) continue;
       const label = describedLabel(child);
       const appText = Core.normalizeText((child.matches("[class*='botText_']") ? child : child.querySelector("[class*='botText_']"))?.textContent);
       if (/\bapp\b/i.test(label) || appText) {
@@ -599,6 +655,8 @@
   }
 
   function presentationFromNode(node, timeElement) {
+    const route = Core.parseDiscordRoute(location.pathname);
+    const identity = rowIdentity(node);
     const authorElement = authorNameElement(node);
     const authorStyle = captureAuthorStyle(authorElement);
     const presentationRow = authorElement?.closest(MESSAGE_SELECTOR) || node;
@@ -606,7 +664,8 @@
     const avatarUrl = safeAvatarUrl(presentationRow);
     return {
       avatarUrl,
-      authorId: authorIdFromNode(presentationRow, authorElement, avatarUrl),
+      authorId: resolvedAuthorId(route?.channelId, identity?.messageId,
+        authorIdFromNode(presentationRow, authorElement, avatarUrl)),
       authorColor: authorStyle?.color || null,
       authorStyle,
       authorBadges: captureAuthorBadges(authorElement),
@@ -737,6 +796,7 @@
     state.archive = archive;
     state.generation = incomingGeneration;
     state.paused = Boolean(archive.paused);
+    if (state.paused) removeLiveAuthorActions();
     if (wasPaused && !state.paused) state.lastMediaRecoveryAt = -Infinity;
     requestMediaRecovery(archive);
     reconcileTombstones();
@@ -841,6 +901,286 @@
 
   function replaceText(element, value) {
     element.replaceChildren(document.createTextNode(String(value || "")));
+  }
+
+  function suppressDiscordMessageGesture(element) {
+    for (const eventName of ["pointerdown", "mousedown", "mouseup", "click", "dblclick", "keydown"]) {
+      element.addEventListener(eventName, (event) => event.stopPropagation());
+    }
+  }
+
+  function legacyCopyText(value) {
+    const textArea = document.createElement("textarea");
+    textArea.value = value;
+    textArea.setAttribute("readonly", "");
+    textArea.style.position = "fixed";
+    textArea.style.left = "-9999px";
+    document.body.append(textArea);
+    textArea.select();
+    let copied = false;
+    try { copied = document.execCommand("copy"); } catch (_error) {}
+    textArea.remove();
+    return copied;
+  }
+
+  async function copyUserId(value) {
+    if (!SNOWFLAKE.test(String(value || ""))) return false;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard-api-unavailable");
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch (_error) {
+      return legacyCopyText(value);
+    }
+  }
+
+  async function resolveActionAuthorId(context, allowStoredFallback) {
+    if (!context || state.route?.channelId !== context.channelId || !SNOWFLAKE.test(String(context.messageId || ""))) return null;
+    const routeKey = state.route.routeKey;
+    const response = await send({ type: RESOLVE_MESSAGE_AUTHORS, messageIds: [context.messageId] });
+    if (!response?.ok || state.route?.routeKey !== routeKey) {
+      return allowStoredFallback ? resolvedAuthorId(context.channelId, context.messageId, context.userId) : null;
+    }
+    const match = (Array.isArray(response.authors) ? response.authors : []).find((item) =>
+      item?.messageId === context.messageId && SNOWFLAKE.test(String(item?.userId || "")));
+    if (!match) {
+      state.resolvedAuthorIds.delete(`${context.channelId}:${context.messageId}`);
+      return allowStoredFallback ? Core.snowflakeValue(context.userId) : null;
+    }
+    const key = `${context.channelId}:${context.messageId}`;
+    state.resolvedAuthorIds.set(key, String(match.userId));
+    while (state.resolvedAuthorIds.size > 5000) state.resolvedAuthorIds.delete(state.resolvedAuthorIds.keys().next().value);
+    return String(match.userId);
+  }
+
+  function createAuthorActionControls(label, getContext) {
+    const actions = document.createElement("span");
+    actions.className = "author-actions";
+    actions.dataset.ldmaAuthorActions = "true";
+    actions.setAttribute("role", "toolbar");
+    actions.setAttribute("aria-label", label);
+    const copyAction = document.createElement("button");
+    copyAction.type = "button";
+    copyAction.className = "author-action copy-id";
+    copyAction.textContent = "ID";
+    copyAction.title = "Copy Discord ID";
+    copyAction.setAttribute("aria-label", "Copy Discord ID");
+    const timeoutAction = document.createElement("button");
+    timeoutAction.type = "button";
+    timeoutAction.className = "author-action timeout";
+    timeoutAction.textContent = "7d";
+    timeoutAction.title = "Timeout for 7 days";
+    timeoutAction.setAttribute("aria-label", "Timeout user for 7 days");
+    const status = document.createElement("span");
+    status.className = "author-action-status";
+    status.setAttribute("role", "status");
+    status.setAttribute("aria-live", "polite");
+    actions.append(copyAction, timeoutAction, status);
+    suppressDiscordMessageGesture(actions);
+
+    let copyBusy = false;
+    let timeoutBusy = false;
+    const feedbackTimers = new Map();
+    const feedback = (button, text, title, error) => {
+      clearTimeout(feedbackTimers.get(button));
+      button.textContent = text;
+      button.title = title;
+      button.classList.toggle("error", Boolean(error));
+      status.textContent = title;
+      feedbackTimers.set(button, setTimeout(() => {
+        button.textContent = button === copyAction ? "ID" : "7d";
+        button.title = button === copyAction ? "Copy Discord ID" : "Timeout for 7 days";
+        button.classList.remove("error");
+        if (![...feedbackTimers.keys()].some((candidate) => candidate !== button)) status.textContent = "";
+        feedbackTimers.delete(button);
+      }, 1800));
+    };
+    const currentContext = () => {
+      const context = getContext();
+      if (!context || state.route?.channelId !== context.channelId || !SNOWFLAKE.test(String(context.messageId || "")) ||
+        (typeof context.isCurrent === "function" && !context.isCurrent())) return null;
+      return context;
+    };
+
+    copyAction.addEventListener("click", async () => {
+      if (copyBusy) return;
+      copyBusy = true;
+      copyAction.disabled = true;
+      const context = currentContext();
+      const userId = context && await resolveActionAuthorId(context, true);
+      const copied = Boolean(userId && currentContext() && await copyUserId(userId));
+      feedback(copyAction, copied ? "✓" : "!", copied ? "Discord ID copied" : "Discord ID unavailable", !copied);
+      copyAction.disabled = false;
+      copyBusy = false;
+    });
+
+    timeoutAction.addEventListener("click", async () => {
+      if (timeoutBusy) return;
+      timeoutBusy = true;
+      timeoutAction.disabled = true;
+      const context = currentContext();
+      // A tombstone can outlive Discord's MessageStore after reload. Use its
+      // stored ID as the candidate; the background independently proves that
+      // candidate against MessageStore or the exact deleted archive record.
+      const userId = context && await resolveActionAuthorId(context, true);
+      if (!userId || !context?.guildId || !currentContext()) {
+        feedback(timeoutAction, "!", "Timeout unavailable", true);
+        timeoutAction.disabled = false;
+        timeoutBusy = false;
+        return;
+      }
+      const timeoutKey = `${context.guildId}:${userId}`;
+      if (state.pendingTimeoutActions.has(timeoutKey)) {
+        feedback(timeoutAction, "…", "Timeout already in progress", false);
+        timeoutAction.disabled = false;
+        timeoutBusy = false;
+        return;
+      }
+      state.pendingTimeoutActions.add(timeoutKey);
+      const author = Core.normalizeText(context.author || "Unknown author").slice(0, 100) || "Unknown author";
+      try {
+        const confirmed = window.confirm(`Timeout ${author} (${userId}) for 7 days?`);
+        const latest = currentContext();
+        if (!confirmed || !latest || latest.channelId !== context.channelId || latest.messageId !== context.messageId ||
+          latest.guildId !== context.guildId) return;
+        const response = await send({
+          type: "LDMA_USER_ACTION",
+          action: "timeout-7d",
+          userId,
+          guildId: context.guildId,
+          messageId: context.messageId
+        });
+        feedback(timeoutAction, response?.ok ? "✓" : "!", response?.ok ? `Timed out ${author} for 7 days` : "Timeout unavailable", !response?.ok);
+      } finally {
+        state.pendingTimeoutActions.delete(timeoutKey);
+        timeoutAction.disabled = false;
+        timeoutBusy = false;
+      }
+    });
+
+    const update = (context) => {
+      actions.hidden = !context || !SNOWFLAKE.test(String(context.messageId || ""));
+      timeoutAction.hidden = !SNOWFLAKE.test(String(context?.guildId || ""));
+      if (context && !state.resolvedAuthorIds.has(`${context.channelId}:${context.messageId}`)) {
+        queueAuthorResolution(context.channelId, [context.messageId]);
+      }
+    };
+    update.dispose = () => {
+      for (const timer of feedbackTimers.values()) clearTimeout(timer);
+      feedbackTimers.clear();
+    };
+    return { actions, copyAction, timeoutAction, update };
+  }
+
+  function nativeHeaderActionInsertion(row, messageId) {
+    if (!row || !messageId) return null;
+    const username = row.querySelector(`[id="message-username-${messageId}"]`);
+    if (!username) return null;
+    const exactTimestamp = row.querySelector(`[id="message-timestamp-${messageId}"]`);
+    const time = exactTimestamp?.querySelector?.("time[datetime]") || exactTimestamp ||
+      [...row.querySelectorAll("time[datetime]")].find((candidate) =>
+        !candidate.closest("[class*='repliedMessage_'], [class*='reply_']"));
+    if (!time) return null;
+    let header = username.parentElement;
+    for (let depth = 0; header && header !== row && depth < 5; depth += 1, header = header.parentElement) {
+      if (!header.contains(time)) continue;
+      let timestampBranch = time;
+      while (timestampBranch.parentElement && timestampBranch.parentElement !== header) {
+        timestampBranch = timestampBranch.parentElement;
+      }
+      return timestampBranch.parentElement === header ? { header, timestampBranch } : null;
+    }
+    return null;
+  }
+
+  function removeLiveAuthorActions() {
+    for (const renderer of state.liveActionRenderers.values()) renderer.dispose();
+    state.liveActionRenderers.clear();
+    document.querySelectorAll("[data-ldma-author-actions-host]").forEach((host) => host.remove());
+  }
+
+  function createLiveAuthorActionRenderer(row, identity, insertion, route) {
+    const key = `${route.channelId}:${identity.messageId}`;
+    const host = document.createElement("span");
+    host.dataset.ldmaAuthorActionsHost = "true";
+    host.dataset.ldmaAuthorActions = "true";
+    host.dataset.ldmaMessageKey = key;
+    host.setAttribute("aria-label", "BridgeModTools author actions");
+    const shadow = host.attachShadow({ mode: "closed" });
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(`
+      :host { display:inline-flex; vertical-align:middle; }
+      * { box-sizing:border-box; }
+      .author-actions { display:inline-flex; align-items:center; gap:2px; }
+      .author-action { display:inline-grid; place-items:center; min-width:22px; height:20px; margin:0; padding:0 4px; border:0; border-radius:4px; background:#2b2d31; color:#b5bac1; font:700 10px/1 "gg sans","Noto Sans","Helvetica Neue",Helvetica,Arial,sans-serif; cursor:pointer; }
+      .author-action:hover { background:#404249; color:#f2f3f5; }
+      .author-action.timeout:hover { background:#da373c; color:#fff; }
+      .author-action:focus-visible { outline:2px solid #00a8fc; outline-offset:1px; }
+      .author-action:disabled { cursor:wait; opacity:.65; }
+      .author-action.error { color:#ff6b70; }
+      .author-action-status { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+      [hidden] { display:none !important; }
+    `);
+    shadow.adoptedStyleSheets = [sheet];
+    let context = null;
+    const controls = createAuthorActionControls("Actions for message author", () => context);
+    shadow.append(controls.actions);
+    insertion.header.insertBefore(host, insertion.timestampBranch.nextSibling);
+    const renderer = {
+      host,
+      row,
+      update(record, route) {
+        context = {
+          channelId: route.channelId,
+          messageId: identity.messageId,
+          guildId: route.guildId,
+          userId: resolvedAuthorId(route.channelId, identity.messageId, record?.authorId),
+          author: record?.author || visibleElementText(authorNameElement(row)) || "Unknown author",
+          isCurrent: () => Core.messageRowOwnsElement(row, host, identity.messageId) &&
+            state.route?.routeKey === route.routeKey
+        };
+        controls.update(context);
+      },
+      dispose() {
+        controls.update.dispose();
+        host.remove();
+      }
+    };
+    state.liveActionRenderers.set(key, renderer);
+    return renderer;
+  }
+
+  function reconcileLiveAuthorActions(active, records) {
+    const managedHosts = new Set([...state.liveActionRenderers.values()].map((renderer) => renderer.host));
+    document.querySelectorAll("[data-ldma-author-actions-host]").forEach((host) => {
+      if (!managedHosts.has(host)) host.remove();
+    });
+    const connected = new Set();
+    if (active) {
+      active.rows.forEach((row, index) => {
+        const identity = rowIdentity(row);
+        if (!identity || identity.channelId && identity.channelId !== active.route.channelId || row.dataset.ldmaNativeReplaced === "true") return;
+        const insertion = nativeHeaderActionInsertion(row, identity.messageId);
+        if (!insertion) return;
+        const key = `${active.route.channelId}:${identity.messageId}`;
+        let renderer = state.liveActionRenderers.get(key);
+        if (renderer && (renderer.row !== row || !renderer.host.isConnected || renderer.host.parentElement !== insertion.header)) {
+          renderer.dispose();
+          state.liveActionRenderers.delete(key);
+          renderer = null;
+        }
+        if (!renderer) renderer = createLiveAuthorActionRenderer(row, identity, insertion, active.route);
+        const record = records?.[index] || state.snapshotsByKey.get(key)?.record ||
+          state.archive.records.find((item) => Core.recordKey(item) === key) || groupingRecordFromNode(row);
+        renderer.update(record, active.route);
+        connected.add(key);
+      });
+    }
+    for (const [key, renderer] of [...state.liveActionRenderers]) {
+      if (connected.has(key) && renderer.host.isConnected) continue;
+      renderer.dispose();
+      state.liveActionRenderers.delete(key);
+    }
   }
 
   function storedTime(record) {
@@ -1062,8 +1402,11 @@
       .message { position:relative; display:grid; grid-template-columns:40px minmax(0,1fr); column-gap:16px; min-height:48px; padding:2px 16px; background:rgb(242 63 66 / 7.5%); }
       .message:hover { background:rgb(242 63 66 / 10%); }
       .message.continuation { min-height:22px; padding-block:0; }
-      .message.continuation .avatar,.message.continuation .header { display:none; }
+      .message.continuation .avatar { display:none; }
       .message.continuation .body { grid-column:2; }
+      .message.continuation .header { position:absolute; inset-inline-end:16px; top:0; z-index:1; }
+      .message.continuation .header .author-group,.message.continuation .header .timestamp { display:none; }
+      .message.continuation .header .author-actions { margin-left:0; }
       button { font:inherit; }
       .profile-trigger { border:0; cursor:pointer; }
       .profile-trigger:disabled { cursor:default; }
@@ -1096,15 +1439,16 @@
       .attachments { color:#00a8fc; font-size:14px; line-height:20px; overflow-wrap:anywhere; }
       .attachment::before { content:"↳ "; color:#949ba4; }
       .media-frame { display:block; width:min(550px,100%); max-width:100%; height:40px; margin:4px 0 2px; border:0; border-radius:8px; background:transparent; }
-      .actions { position:absolute; z-index:2; top:-16px; right:16px; display:flex; align-items:center; gap:1px; max-width:calc(100% - 32px); padding:2px; border:1px solid rgb(255 255 255 / 8%); border-radius:4px; background:#2b2d31; box-shadow:0 2px 5px rgb(0 0 0 / 25%); opacity:0; pointer-events:none; transform:translateY(2px); transition:opacity 100ms ease,transform 100ms ease; }
-      .message:hover .actions,.message:focus-within .actions,.actions:focus-within { opacity:1; pointer-events:auto; transform:none; }
-      .action { min-height:28px; padding:3px 7px; border:0; border-radius:3px; background:transparent; color:#b5bac1; font-size:12px; font-weight:600; line-height:18px; white-space:nowrap; cursor:pointer; }
-      .action:hover { background:#404249; color:#f2f3f5; }
-      .action:focus-visible { outline:2px solid #00a8fc; outline-offset:-2px; }
-      .action.timeout:hover { background:#da373c; color:#fff; }
-      .action-status { position:absolute; top:calc(100% + 5px); right:0; max-width:260px; padding:3px 7px; border-radius:4px; background:#111214; color:#dbdee1; font-size:12px; font-weight:500; line-height:18px; white-space:nowrap; box-shadow:0 2px 5px rgb(0 0 0 / 30%); }
-      .action-status.error { color:#ff6b70; }
-      @media (prefers-reduced-motion:reduce) { .actions { transition:none; } }
+      .author-actions { display:inline-flex; flex:0 0 auto; align-items:center; gap:2px; margin-left:6px; vertical-align:middle; opacity:0; pointer-events:none; transform:translateY(1px); transition:opacity 100ms ease,transform 100ms ease; }
+      .message:hover .author-actions,.message:focus-within .author-actions,.author-actions:focus-within { opacity:1; pointer-events:auto; transform:none; transition-delay:0s; }
+      .author-action { display:inline-grid; place-items:center; min-width:22px; height:20px; margin:0; padding:0 4px; border:0; border-radius:4px; background:#2b2d31; color:#b5bac1; font-size:10px; font-weight:700; line-height:1; white-space:nowrap; cursor:pointer; }
+      .author-action:hover { background:#404249; color:#f2f3f5; }
+      .author-action:focus-visible { outline:2px solid #00a8fc; outline-offset:1px; }
+      .author-action.timeout:hover { background:#da373c; color:#fff; }
+      .author-action:disabled { cursor:wait; opacity:.65; }
+      .author-action.error { color:#ff6b70; }
+      .author-action-status { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
+      @media (prefers-reduced-motion:reduce) { .author-actions { transition:none; } }
       [hidden] { display:none !important; }
     `);
     shadow.adoptedStyleSheets = [sheet];
@@ -1141,7 +1485,9 @@
     authorGroup.append(author, badges);
     const timestamp = document.createElement("time");
     timestamp.className = "timestamp";
-    header.append(authorGroup, timestamp);
+    let actionContext = null;
+    const controls = createAuthorActionControls("Actions for deleted message author", () => actionContext);
+    header.append(authorGroup, timestamp, controls.actions);
     const history = document.createElement("div");
     history.className = "history";
     history.setAttribute("role", "group");
@@ -1164,88 +1510,13 @@
     mediaFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads");
     const disposeCurrentMedia = configureMediaFrame(mediaFrame, key, null);
     body.append(reply, header, history, contentLine, attachments, mediaFrame);
-    const actions = document.createElement("div");
-    actions.className = "actions";
-    actions.setAttribute("role", "toolbar");
-    actions.setAttribute("aria-label", "Actions for deleted message author");
-    const profileAction = document.createElement("button");
-    profileAction.type = "button";
-    profileAction.className = "action";
-    profileAction.textContent = "Open profile";
-    const copyIdAction = document.createElement("button");
-    copyIdAction.type = "button";
-    copyIdAction.className = "action";
-    copyIdAction.textContent = "Copy ID";
-    const copyMentionAction = document.createElement("button");
-    copyMentionAction.type = "button";
-    copyMentionAction.className = "action";
-    copyMentionAction.textContent = "Copy mention";
-    const timeoutAction = document.createElement("button");
-    timeoutAction.type = "button";
-    timeoutAction.className = "action timeout";
-    timeoutAction.textContent = "Timeout 7d";
-    const actionStatus = document.createElement("span");
-    actionStatus.className = "action-status";
-    actionStatus.setAttribute("role", "status");
-    actionStatus.setAttribute("aria-live", "polite");
-    actionStatus.hidden = true;
-    actions.append(profileAction, copyIdAction, copyMentionAction, timeoutAction, actionStatus);
-    article.append(avatar, body, actions);
+    article.append(avatar, body);
     shadow.append(article);
 
     let actionUserId = null;
     let actionGuildId = null;
-    let actionAuthor = "Unknown author";
-    let actionStatusTimer = null;
-
-    function suppressChatAction(event) {
-      event.stopPropagation();
-    }
-
-    for (const control of [avatar, author, actions]) {
-      for (const eventName of ["pointerdown", "mousedown", "click", "dblclick", "keydown"]) {
-        control.addEventListener(eventName, suppressChatAction);
-      }
-    }
-
-    function setActionStatus(message, error) {
-      clearTimeout(actionStatusTimer);
-      replaceText(actionStatus, message);
-      actionStatus.classList.toggle("error", Boolean(error));
-      actionStatus.hidden = !message;
-      if (message) {
-        actionStatusTimer = setTimeout(() => {
-          actionStatus.hidden = true;
-          replaceText(actionStatus, "");
-        }, 2400);
-      }
-    }
-
-    function legacyCopyText(value) {
-      const textArea = document.createElement("textarea");
-      textArea.value = value;
-      textArea.setAttribute("readonly", "");
-      textArea.style.position = "fixed";
-      textArea.style.left = "-9999px";
-      document.body.append(textArea);
-      textArea.select();
-      let copied = false;
-      try { copied = document.execCommand("copy"); } catch (_error) {}
-      textArea.remove();
-      return copied;
-    }
-
-    async function copyUserText(value, successMessage) {
-      if (!value) return;
-      try {
-        if (!navigator.clipboard?.writeText) throw new Error("clipboard-api-unavailable");
-        await navigator.clipboard.writeText(value);
-        setActionStatus(successMessage, false);
-      } catch (_error) {
-        const copied = legacyCopyText(value);
-        setActionStatus(copied ? successMessage : "Copy failed", !copied);
-      }
-    }
+    suppressDiscordMessageGesture(avatar);
+    suppressDiscordMessageGesture(author);
 
     async function openProfile() {
       if (!actionUserId) return;
@@ -1255,28 +1526,10 @@
         userId: actionUserId,
         guildId: actionGuildId
       });
-      if (!response?.ok) setActionStatus("Profile unavailable", true);
-    }
-
-    async function timeoutForSevenDays() {
-      if (!actionUserId || !SNOWFLAKE.test(actionGuildId || "")) return;
-      const confirmed = window.confirm(`Timeout ${actionAuthor} for 7 days?`);
-      if (!confirmed) return;
-      const response = await send({
-        type: "LDMA_USER_ACTION",
-        action: "timeout-7d",
-        userId: actionUserId,
-        guildId: actionGuildId
-      });
-      setActionStatus(response?.ok ? `Timed out ${actionAuthor} for 7 days` : "Timeout unavailable", !response?.ok);
     }
 
     avatar.addEventListener("click", openProfile);
     author.addEventListener("click", openProfile);
-    profileAction.addEventListener("click", openProfile);
-    copyIdAction.addEventListener("click", () => copyUserText(actionUserId, "User ID copied"));
-    copyMentionAction.addEventListener("click", () => copyUserText(actionUserId && `<@${actionUserId}>`, "Mention copied"));
-    timeoutAction.addEventListener("click", timeoutForSevenDays);
 
     avatarImage.addEventListener("error", () => {
       avatarImage.hidden = true;
@@ -1390,19 +1643,25 @@
     const render = (record) => {
       lastRecord = record;
       const name = record.author || "Unknown author";
-      const nextUserId = SNOWFLAKE.test(String(record.authorId || "")) ? String(record.authorId) : null;
+      const nextUserId = resolvedAuthorId(record.channelId, record.messageId, record.authorId);
       const nextGuildId = SNOWFLAKE.test(String(record.guildId || "")) ? String(record.guildId) : null;
-      if (nextUserId !== actionUserId || nextGuildId !== actionGuildId) setActionStatus("", false);
       actionUserId = nextUserId;
       actionGuildId = nextGuildId;
-      actionAuthor = name;
       const profileLabel = nextUserId ? `Open ${name}'s profile` : "Profile unavailable for this archived message";
       avatar.disabled = !nextUserId;
       author.disabled = !nextUserId;
       avatar.setAttribute("aria-label", profileLabel);
       author.setAttribute("aria-label", profileLabel);
-      actions.hidden = !nextUserId;
-      timeoutAction.hidden = !nextGuildId;
+      actionContext = {
+        channelId: record.channelId,
+        messageId: record.messageId,
+        guildId: nextGuildId,
+        userId: nextUserId,
+        author: name,
+        isCurrent: () => host.isConnected && host.dataset.ldmaMessageKey === key &&
+          state.route?.channelId === record.channelId
+      };
+      controls.update(actionContext);
       replaceText(author, name);
       applyAuthorPresentation(record);
       const time = storedTime(record);
@@ -1457,7 +1716,7 @@
     };
     reducedMotion.addEventListener("change", onMotionPreference);
     render.dispose = () => {
-      clearTimeout(actionStatusTimer);
+      controls.update.dispose();
       reducedMotion.removeEventListener("change", onMotionPreference);
       if (authorAnimation) authorAnimation.cancel();
       authorAnimation = null;
@@ -1797,9 +2056,13 @@
   }
 
   function snapshotRenderedMessages(persist) {
-    if (state.paused) return;
+    if (state.paused) {
+      removeLiveAuthorActions();
+      return;
+    }
     const active = updateActiveList();
     if (!active) {
+      reconcileLiveAuthorActions(null);
       reconcileTombstones();
       return;
     }
@@ -1847,6 +2110,7 @@
     });
     reconcileTombstones();
     reconcileEditHistories(active);
+    reconcileLiveAuthorActions(active, records);
     applyRetainedStyles();
   }
 
@@ -2367,10 +2631,14 @@
       state.pendingReleaseKeys.clear();
       state.pendingConfirmedMounts.clear();
       state.stagedSelfEdits.clear();
+      clearTimeout(state.authorResolutionTimer);
+      state.authorResolutionTimer = null;
+      state.pendingAuthorResolutionIds.clear();
       state.activeList = null;
       state.listIdentity = null;
       removeTombstone();
       removeEditHistories();
+      removeLiveAuthorActions();
       if (!route) send({ type: LIVE_HEALTH, status: "inactive", detail: "This Discord document is outside a channel route." }).catch(() => {});
       refreshArchive().catch(() => {});
       if (route) requestPageHook("channel-route-entered").catch(() => {});

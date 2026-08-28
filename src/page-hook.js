@@ -737,6 +737,35 @@
     for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
   }
 
+  function resolveMessageAuthors(channelValue, idValues) {
+    const channelId = cleanId(channelValue);
+    if (!channelId || !Array.isArray(idValues) || idValues.length < 1 || idValues.length > MAX_BULK_IDS) {
+      return { ok: false, reason: "invalid-request", authors: [] };
+    }
+    const ids = [...new Set(idValues.map(cleanId).filter(Boolean))];
+    if (!ids.length || ids.length !== idValues.length) {
+      return { ok: false, reason: "invalid-request", authors: [] };
+    }
+    if (!messageStoreCandidate || typeof messageStoreCandidate?.getMessage !== "function") {
+      recoverHook("author-resolution");
+    } else {
+      reconcileMessageStore("author-resolution");
+    }
+    const getMessage = dataFunction(messageStoreCandidate, "getMessage");
+    if (!getMessage) return { ok: false, reason: "message-store-unavailable", authors: [] };
+    const authors = [];
+    for (const messageId of ids) {
+      let message = null;
+      try { message = getMessage.call(messageStoreCandidate, channelId, messageId); } catch (_error) {}
+      const resolvedMessageId = cleanId(message?.id);
+      const resolvedChannelId = cleanId(message?.channelId || message?.channel_id);
+      if (resolvedMessageId !== messageId || resolvedChannelId !== channelId) continue;
+      const userId = cleanId(message?.author?.id || message?.authorId || message?.author_id);
+      if (userId) authors.push({ messageId, userId });
+    }
+    return { ok: true, reason: "resolved", authors };
+  }
+
   async function invokeUserAction(action, payload) {
     const normalized = validUserActionPayload(action, payload);
     if (!normalized) return { ok: false, reason: "invalid-request" };
@@ -819,6 +848,7 @@
   observeWebpackGlobal();
   controller.recover = recoverHook;
   controller.invokeUserAction = invokeUserAction;
+  controller.resolveMessageAuthors = resolveMessageAuthors;
   if (controller.pendingRecovery) recoverHook("queued-injection");
   let recoveryTicks = 0;
   setInterval(() => {

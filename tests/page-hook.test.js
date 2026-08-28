@@ -20,7 +20,7 @@ function runHook(options) {
     channel_id: "777777777777777777",
     content: content || "retained content",
     editedTimestamp: editedTimestamp || null,
-    author: { id: "current-user" },
+    author: { id: "999999999999999991" },
     deleted: Boolean(deleted),
     set(key, value) {
       const next = makeMessage(this.id, key === "deleted" ? value : this.deleted, this.content, this.editedTimestamp);
@@ -165,6 +165,9 @@ function runHook(options) {
     profileExportUsesGetter: typeof Object.getOwnPropertyDescriptor(userActionExports, "openUserProfileModal").get === "function",
     invokeUserAction(action, payload) {
       return window[Symbol.for("BridgeModTools.pageHook.v1")].invokeUserAction(action, payload);
+    },
+    resolveMessageAuthors(channelId, ids) {
+      return window[Symbol.for("BridgeModTools.pageHook.v1")].resolveMessageAuthors(channelId, ids);
     },
     replaceUserActionModules() {
       actionGeneration += 1;
@@ -318,7 +321,7 @@ test("MessageStore delete handlers retain the current user's native cached messa
     content: "must not cross"
   });
   assert.equal(messages.get("888888888888888881").deleted, true);
-  assert.equal(messages.get("888888888888888881").author.id, "current-user");
+  assert.equal(messages.get("888888888888888881").author.id, "999999999999999991");
   const retained = posted.filter((message) => message.kind === "retained");
   assert.deepEqual(JSON.parse(JSON.stringify(retained)), [{
     bridge: "LDMA_BRIDGE_V1",
@@ -529,6 +532,54 @@ test("user actions reject unrecognized operations, malformed IDs, missing guilds
     { ok: false, reason: "invalid-request" }
   ]);
   assert.deepEqual(result.userActionCalls, { profile: [], until: [] });
+});
+
+test("MessageStore author resolution returns only IDs for exact current or retained messages", () => {
+  const result = runHook();
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId]))), {
+    ok: true,
+    reason: "resolved",
+    authors: [{ messageId, userId: "999999999999999991" }]
+  });
+  result.handlerNode.actionHandler.MESSAGE_DELETE({ channelId, id: messageId });
+  assert.equal(result.messages.get(messageId).deleted, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId]))), {
+    ok: true,
+    reason: "resolved",
+    authors: [{ messageId, userId: "999999999999999991" }]
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, ["888888888888888889"]))), {
+    ok: true,
+    reason: "resolved",
+    authors: []
+  });
+  result.messages.set(messageId, {
+    id: "888888888888888882",
+    channel_id: channelId,
+    author: { id: "999999999999999992" }
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId]))), {
+    ok: true,
+    reason: "resolved",
+    authors: []
+  });
+  result.messages.set(messageId, {
+    id: messageId,
+    channel_id: "777777777777777778",
+    author: { id: "999999999999999992" }
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId]))), {
+    ok: true,
+    reason: "resolved",
+    authors: []
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, ["bad"]))), {
+    ok: false,
+    reason: "invalid-request",
+    authors: []
+  });
 });
 
 test("native profile and fixed seven-day timeout actions receive only normalized identity context", async () => {

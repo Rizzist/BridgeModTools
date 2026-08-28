@@ -55,6 +55,13 @@
     return Boolean(identity && (!identity.channelId || identity.channelId === String(channelId)));
   }
 
+  function messageRowOwnsElement(row, element, expectedMessageId) {
+    if (!row || !element || row.isConnected !== true || element.isConnected !== true ||
+      typeof row.contains !== "function" || !row.contains(element)) return false;
+    const rawValue = row.id || row.dataset?.listItemId || "";
+    return parseMessageRowIdentity(rawValue)?.messageId === String(expectedMessageId || "");
+  }
+
   function compareSnowflakeIds(leftValue, rightValue) {
     const left = String(leftValue || "");
     const right = String(rightValue || "");
@@ -756,6 +763,7 @@
     isDeletedStatus,
     parseMessageRowIdentity,
     rowBelongsToChannel,
+    messageRowOwnsElement,
     compareSnowflakeIds,
     chronologicalNeighborIds, tombstoneInRenderedRange, anchorlessRestoreAllowed,
     messageUsernameLabelId,

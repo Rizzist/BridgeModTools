@@ -26,6 +26,7 @@ function backgroundHarness() {
   let isolatedInstalled = false;
   let styleInstalled = false;
   let queriedTabs = [];
+  let storedArchive = null;
   let context;
   const storageWrites = [];
   const networkCalls = [];
@@ -43,7 +44,7 @@ function backgroundHarness() {
       async executeScript(options) {
         calls.push({ kind: "script", options });
         if (typeof options.func === "function") {
-          if (/invokeUserAction/.test(String(options.func))) {
+          if (/invokeUserAction|resolveMessageAuthors/.test(String(options.func))) {
             return [{ result: await options.func(...(options.args || [])) }];
           }
           if (/contentStyle\.v1"\)\]\s*=\s*true/.test(String(options.func))) {
@@ -69,7 +70,13 @@ function backgroundHarness() {
       async query() { return queriedTabs; },
       async reload(tabId) { calls.push({ kind: "reload", tabId }); }
     },
-    storage: { local: { async get() { return {}; }, async set(value) { storageWrites.push(value); } } },
+    storage: { local: {
+      async get() { return storedArchive ? { ldmaArchive: storedArchive } : {}; },
+      async set(value) {
+        storageWrites.push(value);
+        if (value && Object.prototype.hasOwnProperty.call(value, "ldmaArchive")) storedArchive = value.ldmaArchive;
+      }
+    } },
     offscreen: { async createDocument() {}, async closeDocument() {} },
     permissions: { async contains() { return false; } }
   };
@@ -92,15 +99,16 @@ function backgroundHarness() {
     LocalDiscordArchiveCore: {
       normalizeText: (value) => String(value || "").replace(/\s+/g, " ").trim(),
       recordKey: (record) => `${record.channelId}:${record.messageId}`,
-      isDeletedStatus: () => false,
+      isDeletedStatus: (status) => status === "confirmed_deleted" || status === "inferred_deleted",
+      snowflakeValue: (value) => /^\d{15,25}$/.test(String(value || "")) ? String(value) : null,
       hasEdits: () => false,
       sanitizeMediaItems: () => [],
       sanitizeRecordPresentation: (value) => value
     },
-    BridgeModToolsMediaStore: {}
+    BridgeModToolsMediaStore: { async setGeneration() {} }
   });
   const source = fs.readFileSync(path.resolve(__dirname, "../src/background.js"), "utf8");
-  vm.runInContext(`${source}\n;globalThis.__testApi = { ensureDiscordBootstrap, discordContentSender, discordChannelContentSender, discordChannelContext, extensionSenderPath, reportLiveHealth, bestLiveHealth, pruneLiveHealth, liveHealthByDocument, handleUserAction, userActionRateLimits };`, context);
+  vm.runInContext(`${source}\n;globalThis.__testApi = { ensureDiscordBootstrap, discordContentSender, discordChannelContentSender, discordChannelContext, extensionSenderPath, reportLiveHealth, bestLiveHealth, pruneLiveHealth, liveHealthByDocument, handleUserAction, handleResolveMessageAuthors, userActionRateLimits, timeoutActionsInFlight };`, context);
   return {
     api: context.__testApi,
     calls,
@@ -109,6 +117,7 @@ function backgroundHarness() {
     events,
     setLocation(href) { context.location.href = href; },
     setMainController(controller) { context[Symbol.for("BridgeModTools.pageHook.v1")] = controller; },
+    setStoredArchive(value) { storedArchive = value; },
     setIsolatedInstalled(value) { isolatedInstalled = value; styleInstalled = value; },
     setQueriedTabs(value) { queriedTabs = value; }
   };
@@ -267,17 +276,162 @@ test("user action broker rejects untrusted origins, routes, actions, snowflakes,
 test("timeout action is fixed to the current numeric guild and the allowlisted arguments", async () => {
   const harness = backgroundHarness();
   const invocations = [];
+  const resolutions = [];
+  const messageId = "888888888888888881";
   harness.setLocation("https://discord.com/channels/111111111111111111/777777777777777777");
   harness.setMainController({
+    resolveMessageAuthors(channelId, ids) {
+      resolutions.push({ channelId, ids });
+      return { ok: true, authors: [{ messageId, userId: "222222222222222222" }] };
+    },
     invokeUserAction(action, payload) { invocations.push({ action, payload }); return { ok: true, reason: "timeout-dialog-opened" }; }
   });
   const sender = discordSender({ tab: { id: 3, url: "https://discord.com/channels/111111111111111111/777777777777777777" }, documentId: "document-3" });
   const response = await harness.api.handleUserAction({
-    type: "LDMA_USER_ACTION", action: "timeout-7d", userId: "222222222222222222", guildId: "111111111111111111",
+    type: "LDMA_USER_ACTION", action: "timeout-7d", userId: "222222222222222222", guildId: "111111111111111111", messageId,
     duration: 1, arbitrary: { method: "DELETE", token: "nope" }
   }, sender);
   assert.deepEqual(plain(response), { ok: true, reason: "timeout-dialog-opened" });
   assert.deepEqual(plain(invocations), [{ action: "timeout-7d", payload: { userId: "222222222222222222", guildId: "111111111111111111" } }]);
+  assert.deepEqual(plain(resolutions), [{ channelId: "777777777777777777", ids: [messageId] }]);
+});
+
+test("timeout action rejects stale author identity and deduplicates concurrent requests", async () => {
+  const harness = backgroundHarness();
+  const messageId = "888888888888888881";
+  const sender = discordSender({
+    tab: { id: 3, url: "https://discord.com/channels/111111111111111111/777777777777777777" },
+    documentId: "document-3"
+  });
+  harness.setLocation(sender.tab.url);
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  let invocations = 0;
+  harness.setMainController({
+    resolveMessageAuthors() { return { ok: true, authors: [{ messageId, userId: "333333333333333333" }] }; },
+    invokeUserAction() { invocations += 1; return blocked; }
+  });
+  const stale = await harness.api.handleUserAction({
+    type: "LDMA_USER_ACTION", action: "timeout-7d", userId: "222222222222222222",
+    guildId: "111111111111111111", messageId
+  }, sender);
+  assert.deepEqual(plain(stale), { ok: false, reason: "message-author-mismatch" });
+  assert.equal(invocations, 0);
+
+  harness.setMainController({
+    resolveMessageAuthors() { return { ok: true, authors: [{ messageId, userId: "222222222222222222" }] }; },
+    invokeUserAction() { invocations += 1; return blocked; }
+  });
+  const command = {
+    type: "LDMA_USER_ACTION", action: "timeout-7d", userId: "222222222222222222",
+    guildId: "111111111111111111", messageId
+  };
+  const first = harness.api.handleUserAction(command, sender);
+  await new Promise((resolve) => setImmediate(resolve));
+  const duplicate = await harness.api.handleUserAction(command, sender);
+  assert.deepEqual(plain(duplicate), { ok: false, reason: "timeout-already-in-progress" });
+  assert.equal(invocations, 1);
+  release({ ok: true, reason: "timed-out-7d" });
+  assert.equal((await first).ok, true);
+  assert.equal(harness.api.timeoutActionsInFlight.size, 0);
+});
+
+test("timeout action uses an exact deleted archive identity when MessageStore no longer has the message", async () => {
+  const harness = backgroundHarness();
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const userId = "222222222222222222";
+  const guildId = "111111111111111111";
+  harness.setStoredArchive({
+    generation: 2,
+    records: [{ channelId, messageId, authorId: userId, status: "confirmed_deleted" }]
+  });
+  const pageUrl = "https://discord.com/channels/" + guildId + "/" + channelId;
+  harness.setLocation(pageUrl);
+  const invocations = [];
+  harness.setMainController({
+    resolveMessageAuthors() { return { ok: true, authors: [] }; },
+    invokeUserAction(action, payload) {
+      invocations.push({ action, payload });
+      return { ok: true, reason: "timed-out-7d" };
+    }
+  });
+  const sender = discordSender({
+    tab: { id: 7, url: pageUrl },
+    documentId: "document-7"
+  });
+  const result = await harness.api.handleUserAction({
+    type: "LDMA_USER_ACTION", action: "timeout-7d", userId, guildId, messageId
+  }, sender);
+  assert.deepEqual(plain(result), { ok: true, reason: "timed-out-7d" });
+  assert.deepEqual(plain(invocations), [{
+    action: "timeout-7d",
+    payload: { userId, guildId }
+  }]);
+  const mismatch = await harness.api.handleUserAction({
+    type: "LDMA_USER_ACTION",
+    action: "timeout-7d",
+    userId: "222222222222222223",
+    guildId,
+    messageId
+  }, sender);
+  assert.deepEqual(plain(mismatch), { ok: false, reason: "message-author-mismatch" });
+  assert.equal(invocations.length, 1);
+});
+
+test("message author resolution is document-bound, route-bound, and returns only requested snowflakes", async () => {
+  const harness = backgroundHarness();
+  const requested = [];
+  const channelId = "777777777777777777";
+  const firstMessageId = "888888888888888881";
+  const secondMessageId = "888888888888888882";
+  harness.setLocation(`https://discord.com/channels/111111111111111111/${channelId}`);
+  harness.setMainController({
+    resolveMessageAuthors(receivedChannelId, ids) {
+      requested.push({ receivedChannelId, ids });
+      return {
+        ok: true,
+        authors: [
+          { messageId: firstMessageId, userId: "999999999999999991", content: "must-not-cross" },
+          { messageId: secondMessageId, userId: "not-a-snowflake" },
+          { messageId: "888888888888888899", userId: "999999999999999999" }
+        ],
+        secret: "must-not-cross"
+      };
+    }
+  });
+  const sender = discordSender({
+    tab: { id: 6, url: `https://discord.com/channels/111111111111111111/${channelId}` },
+    documentId: "document-6"
+  });
+  const result = await harness.api.handleResolveMessageAuthors({
+    type: "LDMA_RESOLVE_MESSAGE_AUTHORS",
+    messageIds: [firstMessageId, secondMessageId]
+  }, sender);
+  assert.deepEqual(plain(result), {
+    ok: true,
+    reason: "message-authors-resolved",
+    authors: [{ messageId: firstMessageId, userId: "999999999999999991" }]
+  });
+  assert.deepEqual(plain(requested), [{ receivedChannelId: channelId, ids: [firstMessageId, secondMessageId] }]);
+  const call = harness.calls.at(-1);
+  assert.equal(call.options.world, "MAIN");
+  assert.deepEqual(Array.from(call.options.target.documentIds), ["document-6"]);
+});
+
+test("message author resolution rejects malformed, untrusted, and route-stale requests", async () => {
+  const harness = backgroundHarness();
+  const valid = { type: "LDMA_RESOLVE_MESSAGE_AUTHORS", messageIds: ["888888888888888881"] };
+  assert.equal((await harness.api.handleResolveMessageAuthors(valid, discordSender({ frameId: 1 }))).reason,
+    "untrusted-author-resolution-sender");
+  assert.equal((await harness.api.handleResolveMessageAuthors({ ...valid, messageIds: ["bad"] }, discordSender())).reason,
+    "invalid-message-ids");
+  assert.equal((await harness.api.handleResolveMessageAuthors({ ...valid, messageIds: [valid.messageIds[0], valid.messageIds[0]] }, discordSender())).reason,
+    "invalid-message-ids");
+  harness.setLocation("https://discord.com/channels/@me/888888888888888888");
+  harness.setMainController({ resolveMessageAuthors() { throw new Error("must not run"); } });
+  const changed = await harness.api.handleResolveMessageAuthors(valid, discordSender());
+  assert.deepEqual(plain(changed), { ok: false, reason: "message-author-resolution-failed", authors: [] });
 });
 
 test("user action broker reports missing controllers and binds execution to the still-current route", async () => {

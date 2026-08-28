@@ -17,10 +17,12 @@ const BOOTSTRAP_COMMAND = "LDMA_ENSURE_BOOTSTRAP";
 const REPORT_LIVE_HEALTH = "LDMA_REPORT_LIVE_HEALTH";
 const GET_LIVE_HEALTH = "LDMA_GET_LIVE_HEALTH";
 const USER_ACTION_COMMAND = "LDMA_USER_ACTION";
+const RESOLVE_MESSAGE_AUTHORS_COMMAND = "LDMA_RESOLVE_MESSAGE_AUTHORS";
 const DISCORD_TAB_PATTERN = "https://discord.com/*";
 const bootstrapJobs = new Map();
 const liveHealthByDocument = new Map();
 const userActionRateLimits = new Map();
+const timeoutActionsInFlight = new Set();
 const USER_ACTION_RATE_WINDOW_MS = 10000;
 const USER_ACTION_RATE_MAX = 8;
 const USER_ACTION_RATE_BUCKET_MAX = 500;
@@ -440,17 +442,41 @@ async function handleUserAction(command, sender) {
     if (typeof command?.guildId !== "string" || command.guildId !== context.guildId) {
       return { ok: false, reason: "guild-context-mismatch" };
     }
+    if (typeof command?.messageId !== "string" || !SNOWFLAKE_PATTERN.test(command.messageId)) {
+      return { ok: false, reason: "timeout-requires-message" };
+    }
+  }
+  let archivedTimeoutAuthorId = null;
+  if (action === "timeout-7d") {
+    try {
+      const archive = await readArchive();
+      const key = `${context.channelId}:${command.messageId}`;
+      const record = archive.records.find((candidate) => Core.recordKey(candidate) === key);
+      if (record && Core.isDeletedStatus(record.status)) archivedTimeoutAuthorId = Core.snowflakeValue(record.authorId);
+    } catch (_error) {}
+    if (archivedTimeoutAuthorId && archivedTimeoutAuthorId !== command.userId) {
+      return { ok: false, reason: "message-author-mismatch" };
+    }
+  }
+  const timeoutActionKey = action === "timeout-7d" ? `${context.guildId}:${command.userId}` : null;
+  if (timeoutActionKey && timeoutActionsInFlight.has(timeoutActionKey)) {
+    return { ok: false, reason: "timeout-already-in-progress" };
   }
   if (!consumeUserActionRateLimit(sender)) return { ok: false, reason: "user-action-throttled" };
+  if (timeoutActionKey) timeoutActionsInFlight.add(timeoutActionKey);
 
-  const payload = { userId: command.userId, guildId: context.guildId };
+  const payload = {
+    userId: command.userId,
+    guildId: context.guildId,
+    messageId: action === "timeout-7d" ? command.messageId : null
+  };
   const expectedRoute = { guildId: context.guildId, channelId: context.channelId };
   let execution;
   try {
     execution = await chrome.scripting.executeScript({
       target: { tabId: sender.tab.id, documentIds: [sender.documentId] },
       world: "MAIN",
-      func(actionName, actionPayload, route) {
+      async func(actionName, actionPayload, route, trustedArchivedAuthorId) {
         try {
           const current = new URL(globalThis.location.href);
           const match = /^\/channels\/(@me|\d{15,25})\/(\d{15,25})\/?$/.exec(current.pathname);
@@ -463,7 +489,28 @@ async function handleUserAction(command, sender) {
           if (!controller || typeof controller.invokeUserAction !== "function") {
             return { ok: false, reason: "user-action-controller-unavailable" };
           }
-          return Promise.resolve(controller.invokeUserAction(actionName, actionPayload)).then(
+          let verifiedPayload = { userId: actionPayload.userId, guildId: actionPayload.guildId };
+          if (actionName === "timeout-7d") {
+            let resolvedUserId = null;
+            if (typeof controller.resolveMessageAuthors === "function") {
+              try {
+                const resolution = await Promise.resolve(
+                  controller.resolveMessageAuthors(route.channelId, [actionPayload.messageId]));
+                const author = Array.isArray(resolution?.authors)
+                  ? resolution.authors.find((item) => item?.messageId === actionPayload.messageId) : null;
+                if (author?.userId && author.userId !== actionPayload.userId) {
+                  return { ok: false, reason: "message-author-mismatch" };
+                }
+                if (resolution?.ok === true && author?.userId === actionPayload.userId) resolvedUserId = author.userId;
+              } catch (_error) {}
+            }
+            if (!resolvedUserId && trustedArchivedAuthorId === actionPayload.userId) {
+              resolvedUserId = trustedArchivedAuthorId;
+            }
+            if (!resolvedUserId) return { ok: false, reason: "message-author-resolution-unavailable" };
+            verifiedPayload = { userId: resolvedUserId, guildId: actionPayload.guildId };
+          }
+          return Promise.resolve(controller.invokeUserAction(actionName, verifiedPayload)).then(
             (result) => ({
               ok: result?.ok === true,
               reason: typeof result?.reason === "string" ? result.reason : ""
@@ -474,15 +521,86 @@ async function handleUserAction(command, sender) {
           return { ok: false, reason: "user-action-controller-error" };
         }
       },
-      args: [action, payload, expectedRoute]
+      args: [action, payload, expectedRoute, archivedTimeoutAuthorId]
     });
   } catch (_error) {
+    if (timeoutActionKey) timeoutActionsInFlight.delete(timeoutActionKey);
     return { ok: false, reason: "user-action-injection-failed" };
   }
   const result = Array.isArray(execution)
     ? execution.find((item) => item && Object.prototype.hasOwnProperty.call(item, "result"))?.result
     : null;
+  if (timeoutActionKey) timeoutActionsInFlight.delete(timeoutActionKey);
   return safeUserActionResult(result);
+}
+
+function safeResolvedAuthors(value, requestedIds) {
+  const requested = new Set(requestedIds);
+  const authors = [];
+  const seen = new Set();
+  for (const item of Array.isArray(value?.authors) ? value.authors : []) {
+    const messageId = typeof item?.messageId === "string" && SNOWFLAKE_PATTERN.test(item.messageId)
+      ? item.messageId : null;
+    const userId = typeof item?.userId === "string" && SNOWFLAKE_PATTERN.test(item.userId)
+      ? item.userId : null;
+    if (!messageId || !userId || !requested.has(messageId) || seen.has(messageId)) continue;
+    seen.add(messageId);
+    authors.push({ messageId, userId });
+  }
+  return {
+    ok: value?.ok === true,
+    reason: value?.ok === true ? "message-authors-resolved" : "message-author-resolution-failed",
+    authors
+  };
+}
+
+async function handleResolveMessageAuthors(command, sender) {
+  const context = discordChannelContext(sender);
+  if (!context) return { ok: false, reason: "untrusted-author-resolution-sender", authors: [] };
+  if (!Array.isArray(command?.messageIds) || command.messageIds.length < 1 || command.messageIds.length > 200) {
+    return { ok: false, reason: "invalid-message-ids", authors: [] };
+  }
+  const messageIds = [...new Set(command.messageIds.map((value) =>
+    typeof value === "string" && SNOWFLAKE_PATTERN.test(value) ? value : null).filter(Boolean))];
+  if (!messageIds.length || messageIds.length !== command.messageIds.length) {
+    return { ok: false, reason: "invalid-message-ids", authors: [] };
+  }
+  const expectedRoute = { guildId: context.guildId, channelId: context.channelId };
+  let execution;
+  try {
+    execution = await chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, documentIds: [sender.documentId] },
+      world: "MAIN",
+      func(ids, route) {
+        try {
+          const current = new URL(globalThis.location.href);
+          const match = /^\/channels\/(@me|\d{15,25})\/(\d{15,25})\/?$/.exec(current.pathname);
+          const currentGuildId = match && match[1] !== "@me" ? match[1] : null;
+          if (current.protocol !== "https:" || current.hostname !== "discord.com" || current.port !== "" ||
+            !match || currentGuildId !== route.guildId || match[2] !== route.channelId) {
+            return { ok: false, reason: "author-resolution-route-changed", authors: [] };
+          }
+          const controller = globalThis[Symbol.for("BridgeModTools.pageHook.v1")];
+          if (!controller || typeof controller.resolveMessageAuthors !== "function") {
+            return { ok: false, reason: "author-resolution-controller-unavailable", authors: [] };
+          }
+          return Promise.resolve(controller.resolveMessageAuthors(route.channelId, ids)).then(
+            (result) => result,
+            () => ({ ok: false, reason: "author-resolution-controller-error", authors: [] })
+          );
+        } catch (_error) {
+          return { ok: false, reason: "author-resolution-controller-error", authors: [] };
+        }
+      },
+      args: [messageIds, expectedRoute]
+    });
+  } catch (_error) {
+    return { ok: false, reason: "author-resolution-injection-failed", authors: [] };
+  }
+  const result = Array.isArray(execution)
+    ? execution.find((item) => item && Object.prototype.hasOwnProperty.call(item, "result"))?.result
+    : null;
+  return safeResolvedAuthors(result, messageIds);
 }
 
 function documentHealthKey(sender) {
@@ -664,6 +782,8 @@ chrome.runtime.onMessage.addListener((command, sender, sendResponse) => {
     operation = Promise.resolve({ ok: true, reason: "live-health-read", health: bestLiveHealth() });
   } else if (command?.type === USER_ACTION_COMMAND) {
     operation = handleUserAction(command, sender);
+  } else if (command?.type === RESOLVE_MESSAGE_AUTHORS_COMMAND) {
+    operation = handleResolveMessageAuthors(command, sender);
   } else if (command?.type === BOOTSTRAP_COMMAND && discordContentSender(sender)) {
     operation = ensureDiscordBootstrap(sender.tab.id, sender.documentId || null, true);
   } else if (playbackTypes.has(command && command.type)) operation = handlePlaybackCommand(command, sender);

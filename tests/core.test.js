@@ -41,6 +41,25 @@ test("parses server and direct-message channel routes", () => {
   assert.equal(Core.parseDiscordRoute("/settings/account"), null);
 });
 
+test("live action ownership accepts Discord's nested article inside its outer message row", () => {
+  const messageId = "888888888888888881";
+  const channelId = "777777777777777777";
+  const host = { isConnected: true };
+  const innerArticle = { isConnected: true, dataset: { listItemId: `chat-messages___${channelId}-${messageId}` } };
+  const outerRow = {
+    id: `chat-messages-${channelId}-${messageId}`,
+    isConnected: true,
+    contains(element) { return element === innerArticle || element === host; }
+  };
+  host.closest = () => innerArticle;
+
+  assert.notEqual(host.closest(), outerRow);
+  assert.equal(Core.messageRowOwnsElement(outerRow, host, messageId), true);
+  assert.equal(Core.messageRowOwnsElement(outerRow, { isConnected: true }, messageId), false);
+  assert.equal(Core.messageRowOwnsElement({ ...outerRow, isConnected: false }, host, messageId), false);
+  assert.equal(Core.messageRowOwnsElement(outerRow, host, "888888888888888889"), false);
+});
+
 test("accepts only a stationary single-message removal with surviving anchors", () => {
   assert.deepEqual(Core.classifyRemoval(acceptedSignal()), {
     highConfidence: true,

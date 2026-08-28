@@ -20,6 +20,33 @@
   display: none !important;
 }
 
+[data-ldma-author-actions-host="true"] {
+  display: inline-flex;
+  flex: 0 0 auto;
+  margin-inline-start: 6px;
+  vertical-align: middle;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(1px);
+  transition: opacity 100ms ease, transform 100ms ease;
+}
+
+li[id^="chat-messages-"]:hover [data-ldma-author-actions-host="true"],
+li[id^="chat-messages-"]:focus-within [data-ldma-author-actions-host="true"],
+[data-list-item-id^="chat-messages___"]:hover [data-ldma-author-actions-host="true"],
+[data-list-item-id^="chat-messages___"]:focus-within [data-ldma-author-actions-host="true"] {
+  opacity: 1;
+  pointer-events: auto;
+  transform: none;
+  transition-delay: 0s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-ldma-author-actions-host="true"] {
+    transition: none;
+  }
+}
+
 .ldma-retained-deleted {
   background: color-mix(in srgb, #f23f42 7%, transparent);
 }
