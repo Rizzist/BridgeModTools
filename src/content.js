@@ -40,7 +40,7 @@
     snapshotsByKey: new Map(), pageHookStatus: "searching", pageHookDetail: "Waiting for Discord's deletion event dispatcher.",
     pendingRecords: new Map(), pendingRetractions: new Set(), recentRemovals: new Map(), pendingRetainedKeys: new Set(), pendingReleaseKeys: new Set(), flushTimer: null, flushPromise: null,
     healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), editRenderers: new Map(), spacingFrame: 0,
-    pendingConfirmedMounts: new Map(), pendingEdits: new Map(),
+    pendingConfirmedMounts: new Map(), pendingEdits: new Map(), stagedSelfEdits: new Map(),
     lastMediaRecoveryAt: -Infinity,
     pageHookLastSeenAt: -Infinity, bootstrapRequestedAt: -Infinity, bootstrapPromise: null
   };
@@ -729,6 +729,7 @@
       state.pendingRetainedKeys.clear();
       state.pendingConfirmedMounts.clear();
       state.pendingEdits.clear();
+      state.stagedSelfEdits.clear();
       state.pendingRecords.clear();
       state.signatures.clear();
       removeEditHistories();
@@ -2210,55 +2211,110 @@
     }
   }
 
-  function confirmEditLifecycle(message) {
+  function editLifecycleIdentity(message) {
     const channelId = String(message?.channelId || "");
     const messageId = String(message?.ids?.[0] || "");
     const editSessionId = Core.normalizeText(message?.editSessionId).slice(0, 100);
     const editSequence = Math.max(0, Math.floor(Number(message?.editSequence) || 0));
-    const editedAt = Number(message?.editedAt);
-    if (state.paused || state.route?.channelId !== channelId || !SNOWFLAKE.test(channelId) || !SNOWFLAKE.test(messageId) ||
-      !editSessionId || !editSequence || !Number.isFinite(editedAt) || editedAt <= 0) return;
-    const key = `${channelId}:${messageId}`;
-    const row = retainedRow(channelId, messageId, state.activeList) || findMessage(messageId, state.activeList ? uniqueMessageNodes(state.activeList, state.route) : []);
-    const baseline = (row && recordFromNode(row, Date.now())) || state.snapshotsByKey.get(key)?.record ||
-      state.archive.records.find((record) => Core.recordKey(record) === key);
-    if (!baseline) return;
-    const pendingId = `${key}|${editSessionId}:${editSequence}`;
-    if (state.pendingEdits.has(pendingId)) return;
-    const pending = {
-      baseline,
-      baselineSignature: Core.editPayloadSignature(baseline),
-      recordKey: key,
+    if (state.paused || state.route?.channelId !== channelId || !SNOWFLAKE.test(channelId) ||
+      !SNOWFLAKE.test(messageId) || !editSessionId || !editSequence) return null;
+    return {
       channelId,
       messageId,
-      editedAt,
       editSessionId,
       editSequence,
+      key: `${channelId}:${messageId}`,
+      pendingId: `${channelId}:${messageId}|${editSessionId}:${editSequence}`
+    };
+  }
+
+  function stageSelfEditLifecycle(message) {
+    const identity = editLifecycleIdentity(message);
+    if (!identity) return;
+    const active = updateActiveList();
+    const row = retainedRow(identity.channelId, identity.messageId, active?.node) ||
+      findMessage(identity.messageId, active?.rows || []);
+    const baseline = (row && recordFromNode(row, Date.now())) || state.snapshotsByKey.get(identity.key)?.record ||
+      state.archive.records.find((record) => Core.recordKey(record) === identity.key);
+    if (!baseline) return;
+    // Settle an immediately preceding local attempt before staging another.
+    // A changed payload commits the prior revision; an unchanged payload means
+    // the prior successful response was a semantic no-op and is discarded.
+    for (const [pendingId, pending] of state.pendingEdits) {
+      if (pending.recordKey !== identity.key || pending.sending) continue;
+      if (Core.editPayloadSignature(baseline) !== pending.baselineSignature) {
+        verifyPendingEdit(pendingId, pending, baseline);
+      } else {
+        discardPendingEdit(pendingId, pending);
+      }
+    }
+    state.stagedSelfEdits.set(identity.pendingId, {
+      baseline,
+      baselineSignature: Core.editPayloadSignature(baseline),
+      generation: state.generation,
+      expiresAt: performance.now() + 5 * 60 * 1000
+    });
+    while (state.stagedSelfEdits.size > 100) {
+      state.stagedSelfEdits.delete(state.stagedSelfEdits.keys().next().value);
+    }
+  }
+
+  function cancelSelfEditLifecycle(message) {
+    const identity = editLifecycleIdentity(message);
+    if (identity) state.stagedSelfEdits.delete(identity.pendingId);
+  }
+
+  function confirmEditLifecycle(message) {
+    const identity = editLifecycleIdentity(message);
+    const editedAt = Number(message?.editedAt);
+    if (!identity || !Number.isFinite(editedAt) || editedAt <= 0) return;
+    const staged = state.stagedSelfEdits.get(identity.pendingId);
+    state.stagedSelfEdits.delete(identity.pendingId);
+    const validStaged = staged && staged.generation === state.generation && performance.now() < staged.expiresAt;
+    const row = retainedRow(identity.channelId, identity.messageId, state.activeList) ||
+      findMessage(identity.messageId, state.activeList ? uniqueMessageNodes(state.activeList, state.route) : []);
+    const baseline = (validStaged && staged.baseline) || (row && recordFromNode(row, Date.now())) ||
+      state.snapshotsByKey.get(identity.key)?.record || state.archive.records.find((record) => Core.recordKey(record) === identity.key);
+    if (!baseline) return;
+    if (state.pendingEdits.has(identity.pendingId)) return;
+    const lifetimeMs = validStaged ? 30000 : 30 * 60 * 1000;
+    const pending = {
+      baseline,
+      baselineSignature: validStaged ? staged.baselineSignature : Core.editPayloadSignature(baseline),
+      recordKey: identity.key,
+      channelId: identity.channelId,
+      messageId: identity.messageId,
+      editedAt,
+      editSessionId: identity.editSessionId,
+      editSequence: identity.editSequence,
       generation: state.generation,
       // Virtualized/off-route rows can remain absent for a long time. Keep the
       // already-captured baseline bounded in memory until that exact message is
       // rendered again, rather than letting an ordinary later upsert erase it.
-      expiresAt: performance.now() + 30 * 60 * 1000,
+      expiresAt: performance.now() + lifetimeMs,
       attempts: 0,
       sending: false
     };
-    state.pendingEdits.set(pendingId, pending);
+    state.pendingEdits.set(identity.pendingId, pending);
     while (state.pendingEdits.size > 500) state.pendingEdits.delete(state.pendingEdits.keys().next().value);
     for (const delayMs of [0, 16, 50, 150, 350, 750]) {
       setTimeout(() => {
         snapshotRenderedMessages(true);
-        verifyPendingEdit(pendingId, pending);
+        verifyPendingEdit(identity.pendingId, pending);
       }, delayMs);
     }
-    setTimeout(() => discardPendingEdit(pendingId, pending), 30 * 60 * 1000 + 1000);
+    setTimeout(() => discardPendingEdit(identity.pendingId, pending), lifetimeMs + 1000);
   }
 
   function installPageBridge() {
     window.addEventListener(EDIT_EVENT, (event) => {
       let message = null;
       try { message = JSON.parse(String(event.detail || "")); } catch (_error) { return; }
-      if (!message || message.bridge !== BRIDGE || message.kind !== "edit-before") return;
-      confirmEditLifecycle(message);
+      if (!message || message.bridge !== BRIDGE || !["edit-stage", "edit-before", "edit-cancel"].includes(message.kind)) return;
+      checkRoute();
+      if (message.kind === "edit-stage") stageSelfEditLifecycle(message);
+      else if (message.kind === "edit-before") confirmEditLifecycle(message);
+      else cancelSelfEditLifecycle(message);
     });
     window.addEventListener("message", (event) => {
       const message = event.data;
@@ -2274,9 +2330,11 @@
         reportCombinedHealth(state.activeList && { node: state.activeList });
         return;
       }
-      if (message.kind === "edit-before") {
+      if (["edit-stage", "edit-before", "edit-cancel"].includes(message.kind)) {
         checkRoute();
-        confirmEditLifecycle(message);
+        if (message.kind === "edit-stage") stageSelfEditLifecycle(message);
+        else if (message.kind === "edit-before") confirmEditLifecycle(message);
+        else cancelSelfEditLifecycle(message);
         return;
       }
       if (!SNOWFLAKE.test(String(message.channelId || "")) || !Array.isArray(message.ids)) return;
@@ -2308,6 +2366,7 @@
       state.pendingRetainedKeys.clear();
       state.pendingReleaseKeys.clear();
       state.pendingConfirmedMounts.clear();
+      state.stagedSelfEdits.clear();
       state.activeList = null;
       state.listIdentity = null;
       removeTombstone();

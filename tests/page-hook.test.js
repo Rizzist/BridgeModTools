@@ -386,6 +386,73 @@ test("MessageStore update handlers emit an ID-only synchronous edit lifecycle be
   assert.equal(dispatched.filter((event) => event.type === "LDMA_EDIT_BEFORE_V1").length, 1);
 });
 
+test("self edits stage the rendered baseline at edit start and confirm it once after success", () => {
+  const result = runHook();
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const start = result.subscriptions.get("MESSAGE_START_EDIT");
+  const end = result.subscriptions.get("MESSAGE_END_EDIT");
+  assert.equal(typeof start, "function");
+  assert.equal(typeof end, "function");
+
+  start({ type: "MESSAGE_START_EDIT", channelId, messageId, content: "must not cross" });
+  let lifecycle = result.dispatched.filter((event) => event.type === "LDMA_EDIT_BEFORE_V1")
+    .map((event) => JSON.parse(event.detail));
+  assert.equal(lifecycle.length, 1);
+  assert.equal(lifecycle[0].kind, "edit-stage");
+  assert.equal(lifecycle[0].channelId, channelId);
+  assert.deepEqual(lifecycle[0].ids, [messageId]);
+  assert.equal(JSON.stringify(lifecycle[0]).includes("must not cross"), false);
+
+  result.handlerNode.actionHandler.MESSAGE_UPDATE({
+    message: {
+      channel_id: channelId,
+      id: messageId,
+      content: "new self-edited content",
+      edited_timestamp: "2026-08-28T01:02:03.000Z"
+    }
+  });
+  lifecycle = result.dispatched.filter((event) => event.type === "LDMA_EDIT_BEFORE_V1")
+    .map((event) => JSON.parse(event.detail));
+  assert.equal(lifecycle.length, 1);
+
+  end({
+    type: "MESSAGE_END_EDIT",
+    channelId,
+    response: { body: { edited_timestamp: "2026-08-28T01:02:03.000Z", content: "must not cross" } }
+  });
+  lifecycle = result.dispatched.filter((event) => event.type === "LDMA_EDIT_BEFORE_V1")
+    .map((event) => JSON.parse(event.detail));
+  assert.equal(lifecycle.length, 2);
+  assert.equal(lifecycle[1].kind, "edit-before");
+  assert.equal(lifecycle[1].editSequence, lifecycle[0].editSequence);
+  assert.equal(lifecycle[1].editedAt, Date.parse("2026-08-28T01:02:03.000Z"));
+  assert.equal(JSON.stringify(lifecycle[1]).includes("must not cross"), false);
+
+  result.handlerNode.actionHandler.MESSAGE_UPDATE({
+    message: {
+      channel_id: channelId,
+      id: messageId,
+      content: "new self-edited content",
+      edited_timestamp: "2026-08-28T01:02:03.000Z"
+    }
+  });
+  assert.equal(result.dispatched.filter((event) => event.type === "LDMA_EDIT_BEFORE_V1").length, 2);
+});
+
+test("cancelled or failed self edits discard their staged baseline without creating history", () => {
+  const result = runHook();
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  result.subscriptions.get("MESSAGE_START_EDIT")({ type: "MESSAGE_START_EDIT", channelId, messageId });
+  result.subscriptions.get("MESSAGE_END_EDIT")({ type: "MESSAGE_END_EDIT", channelId });
+  const lifecycle = result.dispatched.filter((event) => event.type === "LDMA_EDIT_BEFORE_V1")
+    .map((event) => JSON.parse(event.detail));
+  assert.deepEqual(lifecycle.map((event) => event.kind), ["edit-stage", "edit-cancel"]);
+  assert.equal(lifecycle[1].editSequence, lifecycle[0].editSequence);
+  assert.equal(lifecycle.some((event) => event.kind === "edit-before"), false);
+});
+
 test("MessageStore hydration without a cached predecessor does not fabricate an edit", () => {
   const { dispatched, handlerNode, messages } = runHook();
   const channelId = "777777777777777777";

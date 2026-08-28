@@ -33,6 +33,8 @@
   const patchedRetentionDispatchers = new WeakMap();
   const releaseKeys = new Set();
   const retainedKeys = new Set();
+  const activeSelfEdits = new Map();
+  const recentSelfEdits = new Map();
   let isolatedReady = false;
   let coreDispatcher = null;
   let fallbackDispatcher = null;
@@ -108,6 +110,19 @@
     const id = cleanId(incoming && incoming.id || action && action.id);
     const editedAt = editTimestamp(incoming);
     if (!channelId || !id || !editedAt || typeof store?.getMessage !== "function") return null;
+    const key = `${channelId}:${id}`;
+    const now = Date.now();
+    for (const [activeChannelId, active] of activeSelfEdits) {
+      if (active.expiresAt <= now) activeSelfEdits.delete(activeChannelId);
+    }
+    for (const [recentKey, recent] of recentSelfEdits) {
+      if (recent.expiresAt <= now) recentSelfEdits.delete(recentKey);
+    }
+    // A local edit starts before Discord swaps the rendered content. Its
+    // separately staged baseline owns the corresponding server update.
+    if (activeSelfEdits.get(channelId)?.id === id) return null;
+    const recent = recentSelfEdits.get(key);
+    if (recent && editedAt <= recent.editedAt + 15000) return null;
     let previous = null;
     try { previous = store.getMessage(channelId, id); } catch (_error) {}
     // MESSAGE_UPDATE is also used to hydrate messages that were not previously
@@ -120,17 +135,17 @@
     return { channelId, id, editedAt };
   }
 
-  function emitEditBefore(item) {
+  function emitEditSignal(kind, item) {
     if (!item) return;
     const detail = {
       bridge: BRIDGE,
-      kind: "edit-before",
+      kind,
       channelId: item.channelId,
       ids: [item.id],
-      editedAt: item.editedAt,
       editSessionId,
-      editSequence: editSequence += 1
+      editSequence: item.editSequence || (editSequence += 1)
     };
+    if (kind === "edit-before") detail.editedAt = item.editedAt;
     if (!isolatedReady) {
       bufferedEvents.push(detail);
       if (bufferedEvents.length > 100) bufferedEvents.shift();
@@ -139,8 +154,50 @@
     try {
       window.dispatchEvent(new CustomEvent(EDIT_EVENT, { detail: JSON.stringify(detail) }));
     } catch (_error) {
-      bridgeMessage("edit-before", detail);
+      bridgeMessage(kind, detail);
     }
+  }
+
+  function emitEditBefore(item) {
+    emitEditSignal("edit-before", item);
+  }
+
+  function onEditStart(action) {
+    const channelId = cleanId(action && (action.channelId || action.channel_id));
+    const id = cleanId(action && (action.messageId || action.message_id));
+    if (!channelId || !id) return;
+    const previous = activeSelfEdits.get(channelId);
+    if (previous) emitEditSignal("edit-cancel", previous);
+    const active = {
+      channelId,
+      id,
+      editSequence: editSequence += 1,
+      expiresAt: Date.now() + 5 * 60 * 1000
+    };
+    activeSelfEdits.set(channelId, active);
+    while (activeSelfEdits.size > 100) activeSelfEdits.delete(activeSelfEdits.keys().next().value);
+    recentSelfEdits.delete(`${channelId}:${id}`);
+    emitEditSignal("edit-stage", active);
+  }
+
+  function onEditEnd(action) {
+    const channelId = cleanId(action && (action.channelId || action.channel_id));
+    const active = channelId && activeSelfEdits.get(channelId);
+    if (!active) return;
+    activeSelfEdits.delete(channelId);
+    const response = action && action.response;
+    if (!response) {
+      emitEditSignal("edit-cancel", active);
+      return;
+    }
+    const responseBody = response && (response.body?.message || response.body || response.message || response);
+    const editedAt = editTimestamp(responseBody) || Date.now();
+    recentSelfEdits.set(`${active.channelId}:${active.id}`, {
+      editedAt,
+      expiresAt: Date.now() + 15000
+    });
+    while (recentSelfEdits.size > 500) recentSelfEdits.delete(recentSelfEdits.keys().next().value);
+    emitEditBefore(Object.assign({}, active, { editedAt }));
   }
 
   function onDelete(action) {
@@ -196,6 +253,8 @@
     disableDispatcherRetention(dispatcher);
     try { dispatcher.unsubscribe("MESSAGE_DELETE", onDelete); } catch (_error) {}
     try { dispatcher.unsubscribe("MESSAGE_DELETE_BULK", onBulkDelete); } catch (_error) {}
+    try { dispatcher.unsubscribe("MESSAGE_START_EDIT", onEditStart); } catch (_error) {}
+    try { dispatcher.unsubscribe("MESSAGE_END_EDIT", onEditEnd); } catch (_error) {}
     dispatchers.delete(dispatcher);
     if (coreDispatcher === dispatcher) coreDispatcher = null;
     if (fallbackDispatcher === dispatcher) fallbackDispatcher = null;
@@ -213,9 +272,13 @@
       try {
         dispatcher.subscribe("MESSAGE_DELETE", onDelete);
         dispatcher.subscribe("MESSAGE_DELETE_BULK", onBulkDelete);
+        dispatcher.subscribe("MESSAGE_START_EDIT", onEditStart);
+        dispatcher.subscribe("MESSAGE_END_EDIT", onEditEnd);
       } catch (_error) {
         try { dispatcher.unsubscribe("MESSAGE_DELETE", onDelete); } catch (_ignored) {}
         try { dispatcher.unsubscribe("MESSAGE_DELETE_BULK", onBulkDelete); } catch (_ignored) {}
+        try { dispatcher.unsubscribe("MESSAGE_START_EDIT", onEditStart); } catch (_ignored) {}
+        try { dispatcher.unsubscribe("MESSAGE_END_EDIT", onEditEnd); } catch (_ignored) {}
         return false;
       }
       dispatchers.add(dispatcher);

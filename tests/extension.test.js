@@ -35,7 +35,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.4.0");
+  assert.equal(manifest.version, "2.5.0");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -435,7 +435,11 @@ test("Discord edit lifecycle is event-gated, versioned, and rendered independent
   assert.match(hook, /MESSAGE_UPDATE/);
   assert.match(hook, /editedTimestamp \|\| value\.edited_timestamp/);
   assert.match(hook, /new CustomEvent\(EDIT_EVENT/);
-  assert.match(hook, /kind: "edit-before"/);
+  assert.match(hook, /emitEditSignal\("edit-before"/);
+  assert.match(hook, /MESSAGE_START_EDIT/);
+  assert.match(hook, /MESSAGE_END_EDIT/);
+  assert.match(hook, /emitEditSignal\("edit-stage"/);
+  assert.match(hook, /emitEditSignal\("edit-cancel"/);
   assert.match(protocol, /CONFIRM_EDIT/);
   assert.match(protocol, /editHistory/);
   assert.match(core, /maxEditRevisions/);
@@ -444,6 +448,9 @@ test("Discord edit lifecycle is event-gated, versioned, and rendered independent
   assert.match(content, /function verifyPendingEdit/);
   assert.match(content, /function commitPendingEdit/);
   assert.match(content, /baselineSignature/);
+  assert.match(content, /stagedSelfEdits/);
+  assert.match(content, /function stageSelfEditLifecycle/);
+  assert.match(content, /validStaged \? staged\.baselineSignature/);
   assert.match(content, /function reconcileEditHistories/);
   assert.match(content, /data-ldma-edit-history/);
   assert.match(content, /• EDITED/);

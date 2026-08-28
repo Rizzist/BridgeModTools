@@ -18,6 +18,8 @@ An extension update automatically reloads any already-open Discord tabs once so 
 
 Version 2.4 keeps saved deleted-row author identity actionable. Click the restored avatar or author name to open Discord's native profile modal, or use the row toolbar to open the profile, copy the raw user ID, copy a Discord `<@USER_ID>` mention, or apply a fixed seven-day server timeout. Timeout is shown only in server channels and always requires a confirmation naming the archived author; Discord still enforces the moderator's current permission and role hierarchy.
 
+Version 2.5 fixes edit history for messages you edit yourself in DMs, group DMs, and servers. BridgeModTools now stages the rendered original when Discord enters local edit mode, commits it only after Discord reports a successful edit, and suppresses the duplicate gateway update. Other users' edits continue through the existing server-update path, while canceled, failed, and semantically unchanged local edits create no history.
+
 Restored visual media now uses Discord-like inline sizing and spacing instead of a fixed-height generic card. Images and videos retain intrinsic dimensions up to a 550×350-pixel display box, small GIFs stay small, multiple visuals use a compact grid, and audio remains a compact native player. Cached files and plain links keep a small labeled tile.
 
 Version 2 also captures links and rendered upload/embed media. Discord-hosted images, videos, audio, voice messages, and files are downloaded immediately into an extension-owned local cache; direct third-party media can be enabled per site from the popup. Restored deleted rows and full history use the cached bytes, so supported media remains viewable or playable after the original message disappears.
