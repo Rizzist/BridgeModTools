@@ -42,7 +42,8 @@
     pendingRecords: new Map(), pendingRetractions: new Set(), recentRemovals: new Map(), pendingRetainedKeys: new Set(), pendingReleaseKeys: new Set(), flushTimer: null, flushPromise: null,
     healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), editRenderers: new Map(), liveActionRenderers: new Map(), spacingFrame: 0,
     pendingConfirmedMounts: new Map(), pendingEdits: new Map(), stagedSelfEdits: new Map(),
-    resolvedAuthorIds: new Map(), authorResolutionAttempts: new Map(), pendingAuthorResolutionIds: new Set(),
+    resolvedAuthorIds: new Map(), resolvedAuthorUsernames: new Map(),
+    authorResolutionAttempts: new Map(), pendingAuthorResolutionIds: new Set(),
     authorResolutionTimer: null, pendingTimeoutActions: new Set(),
     lastMediaRecoveryAt: -Infinity,
     pageHookLastSeenAt: -Infinity, bootstrapRequestedAt: -Infinity, bootstrapPromise: null
@@ -287,13 +288,22 @@
     return Core.snowflakeValue(fallback);
   }
 
+  function resolvedAuthorUsername(channelId, messageId, fallback) {
+    if (SNOWFLAKE.test(String(channelId || "")) && SNOWFLAKE.test(String(messageId || ""))) {
+      const resolved = state.resolvedAuthorUsernames.get(`${channelId}:${messageId}`);
+      if (resolved) return resolved;
+    }
+    return Core.discordUsernameValue(fallback);
+  }
+
   function queueAuthorResolution(channelId, messageIds) {
     if (state.route?.channelId !== channelId || !SNOWFLAKE.test(String(channelId || ""))) return;
     const now = performance.now();
     for (const messageId of messageIds || []) {
       if (!SNOWFLAKE.test(String(messageId || ""))) continue;
       const key = `${channelId}:${messageId}`;
-      if (state.resolvedAuthorIds.has(key) || now - (state.authorResolutionAttempts.get(key) || -Infinity) < 30000) continue;
+      if (state.resolvedAuthorIds.has(key) && state.resolvedAuthorUsernames.has(key) ||
+        now - (state.authorResolutionAttempts.get(key) || -Infinity) < 30000) continue;
       state.pendingAuthorResolutionIds.add(key);
     }
     if (!state.pendingAuthorResolutionIds.size || state.authorResolutionTimer) return;
@@ -318,12 +328,25 @@
         for (const item of Array.isArray(response.authors) ? response.authors : []) {
           const messageId = Core.snowflakeValue(item?.messageId);
           const userId = Core.snowflakeValue(item?.userId);
+          const username = Core.discordUsernameValue(item?.username);
           if (!messageId || !userId || !messageIdsForRequest.includes(messageId)) continue;
           const key = `${route.channelId}:${messageId}`;
-          if (state.resolvedAuthorIds.get(key) !== userId) changed = true;
+          if (state.resolvedAuthorIds.get(key) !== userId ||
+            username && state.resolvedAuthorUsernames.get(key) !== username) changed = true;
           state.resolvedAuthorIds.set(key, userId);
+          if (username) state.resolvedAuthorUsernames.set(key, username);
+          const archived = state.archive.records.find((record) => Core.recordKey(record) === key);
+          if (archived && (archived.authorId !== userId || username && archived.authorUsername !== username)) {
+            queueRecord(Core.sanitizeRecordPresentation(Object.assign({}, archived, {
+              authorId: userId,
+              authorUsername: username || archived.authorUsername
+            })));
+          }
         }
         while (state.resolvedAuthorIds.size > 5000) state.resolvedAuthorIds.delete(state.resolvedAuthorIds.keys().next().value);
+        while (state.resolvedAuthorUsernames.size > 5000) {
+          state.resolvedAuthorUsernames.delete(state.resolvedAuthorUsernames.keys().next().value);
+        }
         while (state.authorResolutionAttempts.size > 5000) state.authorResolutionAttempts.delete(state.authorResolutionAttempts.keys().next().value);
         if (changed) requestAnimationFrame(() => snapshotRenderedMessages(true));
       }).finally(() => {
@@ -666,6 +689,7 @@
       avatarUrl,
       authorId: resolvedAuthorId(route?.channelId, identity?.messageId,
         authorIdFromNode(presentationRow, authorElement, avatarUrl)),
+      authorUsername: resolvedAuthorUsername(route?.channelId, identity?.messageId, null),
       authorColor: authorStyle?.color || null,
       authorStyle,
       authorBadges: captureAuthorBadges(authorElement),
@@ -700,7 +724,7 @@
   function recordSignature(record) {
     return JSON.stringify([
       record.author, record.content, record.messageTimestamp, record.channelName, record.attachments,
-      record.avatarUrl, record.authorId, record.authorColor, record.authorStyle, record.authorBadges,
+      record.avatarUrl, record.authorId, record.authorUsername, record.authorColor, record.authorStyle, record.authorBadges,
       record.groupRootMessageId, record.sourceContinuation,
       record.displayTimestamp, record.replyPreview, record.media
     ]);
@@ -923,34 +947,56 @@
     return copied;
   }
 
-  async function copyUserId(value) {
-    if (!SNOWFLAKE.test(String(value || ""))) return false;
+  async function copyDiscordUsername(value) {
+    const username = Core.discordUsernameValue(value);
+    if (!username) return false;
     try {
       if (!navigator.clipboard?.writeText) throw new Error("clipboard-api-unavailable");
-      await navigator.clipboard.writeText(value);
+      await navigator.clipboard.writeText(username);
       return true;
     } catch (_error) {
-      return legacyCopyText(value);
+      return legacyCopyText(username);
     }
   }
 
-  async function resolveActionAuthorId(context, allowStoredFallback) {
+  async function resolveActionAuthorIdentity(context, allowStoredFallback) {
     if (!context || state.route?.channelId !== context.channelId || !SNOWFLAKE.test(String(context.messageId || ""))) return null;
+    const fallback = {
+      userId: resolvedAuthorId(context.channelId, context.messageId, context.userId),
+      username: resolvedAuthorUsername(context.channelId, context.messageId, context.username)
+    };
     const routeKey = state.route.routeKey;
     const response = await send({ type: RESOLVE_MESSAGE_AUTHORS, messageIds: [context.messageId] });
     if (!response?.ok || state.route?.routeKey !== routeKey) {
-      return allowStoredFallback ? resolvedAuthorId(context.channelId, context.messageId, context.userId) : null;
+      return allowStoredFallback ? fallback : null;
     }
     const match = (Array.isArray(response.authors) ? response.authors : []).find((item) =>
       item?.messageId === context.messageId && SNOWFLAKE.test(String(item?.userId || "")));
     if (!match) {
       state.resolvedAuthorIds.delete(`${context.channelId}:${context.messageId}`);
-      return allowStoredFallback ? Core.snowflakeValue(context.userId) : null;
+      state.resolvedAuthorUsernames.delete(`${context.channelId}:${context.messageId}`);
+      return allowStoredFallback ? fallback : null;
     }
     const key = `${context.channelId}:${context.messageId}`;
-    state.resolvedAuthorIds.set(key, String(match.userId));
+    const identity = {
+      userId: String(match.userId),
+      username: Core.discordUsernameValue(match.username)
+    };
+    state.resolvedAuthorIds.set(key, identity.userId);
+    if (identity.username) state.resolvedAuthorUsernames.set(key, identity.username);
+    const archived = state.archive.records.find((record) => Core.recordKey(record) === key);
+    if (archived && (archived.authorId !== identity.userId ||
+      identity.username && archived.authorUsername !== identity.username)) {
+      queueRecord(Core.sanitizeRecordPresentation(Object.assign({}, archived, {
+        authorId: identity.userId,
+        authorUsername: identity.username || archived.authorUsername
+      })));
+    }
     while (state.resolvedAuthorIds.size > 5000) state.resolvedAuthorIds.delete(state.resolvedAuthorIds.keys().next().value);
-    return String(match.userId);
+    while (state.resolvedAuthorUsernames.size > 5000) {
+      state.resolvedAuthorUsernames.delete(state.resolvedAuthorUsernames.keys().next().value);
+    }
+    return identity;
   }
 
   function createAuthorActionControls(label, getContext) {
@@ -961,10 +1007,10 @@
     actions.setAttribute("aria-label", label);
     const copyAction = document.createElement("button");
     copyAction.type = "button";
-    copyAction.className = "author-action copy-id";
-    copyAction.textContent = "ID";
-    copyAction.title = "Copy Discord ID";
-    copyAction.setAttribute("aria-label", "Copy Discord ID");
+    copyAction.className = "author-action copy-username";
+    copyAction.textContent = "@";
+    copyAction.title = "Copy Discord username";
+    copyAction.setAttribute("aria-label", "Copy Discord username");
     const timeoutAction = document.createElement("button");
     timeoutAction.type = "button";
     timeoutAction.className = "author-action timeout";
@@ -988,8 +1034,8 @@
       button.classList.toggle("error", Boolean(error));
       status.textContent = title;
       feedbackTimers.set(button, setTimeout(() => {
-        button.textContent = button === copyAction ? "ID" : "7d";
-        button.title = button === copyAction ? "Copy Discord ID" : "Timeout for 7 days";
+        button.textContent = button === copyAction ? "@" : "7d";
+        button.title = button === copyAction ? "Copy Discord username" : "Timeout for 7 days";
         button.classList.remove("error");
         if (![...feedbackTimers.keys()].some((candidate) => candidate !== button)) status.textContent = "";
         feedbackTimers.delete(button);
@@ -1007,9 +1053,9 @@
       copyBusy = true;
       copyAction.disabled = true;
       const context = currentContext();
-      const userId = context && await resolveActionAuthorId(context, true);
-      const copied = Boolean(userId && currentContext() && await copyUserId(userId));
-      feedback(copyAction, copied ? "✓" : "!", copied ? "Discord ID copied" : "Discord ID unavailable", !copied);
+      const identity = context && await resolveActionAuthorIdentity(context, true);
+      const copied = Boolean(identity?.username && currentContext() && await copyDiscordUsername(identity.username));
+      feedback(copyAction, copied ? "✓" : "!", copied ? "Discord username copied" : "Discord username unavailable", !copied);
       copyAction.disabled = false;
       copyBusy = false;
     });
@@ -1022,7 +1068,8 @@
       // A tombstone can outlive Discord's MessageStore after reload. Use its
       // stored ID as the candidate; the background independently proves that
       // candidate against MessageStore or the exact deleted archive record.
-      const userId = context && await resolveActionAuthorId(context, true);
+      const identity = context && await resolveActionAuthorIdentity(context, true);
+      const userId = identity?.userId;
       if (!userId || !context?.guildId || !currentContext()) {
         feedback(timeoutAction, "!", "Timeout unavailable", true);
         timeoutAction.disabled = false;
@@ -1061,7 +1108,8 @@
     const update = (context) => {
       actions.hidden = !context || !SNOWFLAKE.test(String(context.messageId || ""));
       timeoutAction.hidden = !SNOWFLAKE.test(String(context?.guildId || ""));
-      if (context && !state.resolvedAuthorIds.has(`${context.channelId}:${context.messageId}`)) {
+      if (context && (!state.resolvedAuthorIds.has(`${context.channelId}:${context.messageId}`) ||
+        !state.resolvedAuthorUsernames.has(`${context.channelId}:${context.messageId}`))) {
         queueAuthorResolution(context.channelId, [context.messageId]);
       }
     };
@@ -1135,6 +1183,7 @@
           messageId: identity.messageId,
           guildId: route.guildId,
           userId: resolvedAuthorId(route.channelId, identity.messageId, record?.authorId),
+          username: resolvedAuthorUsername(route.channelId, identity.messageId, record?.authorUsername),
           author: record?.author || visibleElementText(authorNameElement(row)) || "Unknown author",
           isCurrent: () => Core.messageRowOwnsElement(row, host, identity.messageId) &&
             state.route?.routeKey === route.routeKey
@@ -1212,6 +1261,7 @@
       // identity from that presentation row is intentional: every member of
       // the native group belongs to the same Discord author.
       authorId: authorIdFromNode(presentationRow, authorElement, avatarUrl),
+      authorUsername: resolvedAuthorUsername(identity.channelId || state.route?.channelId, identity.messageId, null),
       messageTimestamp: timeElement?.getAttribute("datetime") || null,
       groupRootMessageId,
       sourceContinuation: Boolean(groupRootMessageId && groupRootMessageId !== identity.messageId),
@@ -1657,6 +1707,7 @@
         messageId: record.messageId,
         guildId: nextGuildId,
         userId: nextUserId,
+        username: resolvedAuthorUsername(record.channelId, record.messageId, record.authorUsername),
         author: name,
         isCurrent: () => host.isConnected && host.dataset.ldmaMessageKey === key &&
           state.route?.channelId === record.channelId

@@ -14,13 +14,14 @@ function runHook(options) {
   const subscriptions = new Map();
   const intervals = [];
   const messages = new Map();
+  const users = new Map();
   const userActionCalls = { profile: [], until: [] };
   const makeMessage = (id, deleted, content, editedTimestamp) => ({
     id,
     channel_id: "777777777777777777",
     content: content || "retained content",
     editedTimestamp: editedTimestamp || null,
-    author: { id: "999999999999999991" },
+    author: { id: "999999999999999991", username: "curiousbro" },
     deleted: Boolean(deleted),
     set(key, value) {
       const next = makeMessage(this.id, key === "deleted" ? value : this.deleted, this.content, this.editedTimestamp);
@@ -29,6 +30,7 @@ function runHook(options) {
     }
   });
   messages.set("888888888888888881", makeMessage("888888888888888881", false));
+  users.set("999999999999999991", { id: "999999999999999991", username: "curiousbro" });
   const handlerNode = {
     name: "MessageStore",
     actionHandler: {
@@ -69,6 +71,13 @@ function runHook(options) {
     getDispatchToken() { return "message_store_token"; },
     getMessage(_channelId, id) { return messages.get(id); },
     getMessages() { return { receiveMessage(message) { messages.set(message.id, message); return this; } }; }
+  };
+  const userStore = {
+    _dispatcher: dispatcher,
+    getName() { return "UserStore"; },
+    getDispatchToken() { return "user_store_token"; },
+    getUser(id) { return users.get(id); },
+    getCurrentUser() { return users.get("999999999999999991"); }
   };
   const rejectingDispatcher = {
     dispatch() {},
@@ -115,7 +124,8 @@ function runHook(options) {
     "0": { exports: { rejectingStore } },
     "1": { exports: { fallbackDispatcher } },
     "21": { exports: userActionExports },
-    "42": { exports: moduleExports }
+    "42": { exports: moduleExports },
+    "43": { exports: { Z: userStore } }
   };
   const chunks = [];
   chunks.push = function push(chunk) {
@@ -166,8 +176,8 @@ function runHook(options) {
     invokeUserAction(action, payload) {
       return window[Symbol.for("BridgeModTools.pageHook.v1")].invokeUserAction(action, payload);
     },
-    resolveMessageAuthors(channelId, ids) {
-      return window[Symbol.for("BridgeModTools.pageHook.v1")].resolveMessageAuthors(channelId, ids);
+    resolveMessageAuthors(channelId, ids, fallbacks) {
+      return window[Symbol.for("BridgeModTools.pageHook.v1")].resolveMessageAuthors(channelId, ids, fallbacks);
     },
     replaceUserActionModules() {
       actionGeneration += 1;
@@ -534,21 +544,21 @@ test("user actions reject unrecognized operations, malformed IDs, missing guilds
   assert.deepEqual(result.userActionCalls, { profile: [], until: [] });
 });
 
-test("MessageStore author resolution returns only IDs for exact current or retained messages", () => {
+test("author resolution returns exact IDs and usernames for current, retained, or trusted deleted messages", () => {
   const result = runHook();
   const channelId = "777777777777777777";
   const messageId = "888888888888888881";
   assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId]))), {
     ok: true,
     reason: "resolved",
-    authors: [{ messageId, userId: "999999999999999991" }]
+    authors: [{ messageId, userId: "999999999999999991", username: "curiousbro" }]
   });
   result.handlerNode.actionHandler.MESSAGE_DELETE({ channelId, id: messageId });
   assert.equal(result.messages.get(messageId).deleted, true);
   assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId]))), {
     ok: true,
     reason: "resolved",
-    authors: [{ messageId, userId: "999999999999999991" }]
+    authors: [{ messageId, userId: "999999999999999991", username: "curiousbro" }]
   });
   assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, ["888888888888888889"]))), {
     ok: true,
@@ -564,6 +574,14 @@ test("MessageStore author resolution returns only IDs for exact current or retai
     ok: true,
     reason: "resolved",
     authors: []
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(result.resolveMessageAuthors(channelId, [messageId], [{
+    messageId,
+    userId: "999999999999999991"
+  }]))), {
+    ok: true,
+    reason: "resolved",
+    authors: [{ messageId, userId: "999999999999999991", username: "curiousbro" }]
   });
   result.messages.set(messageId, {
     id: messageId,

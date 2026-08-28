@@ -101,6 +101,8 @@ function backgroundHarness() {
       recordKey: (record) => `${record.channelId}:${record.messageId}`,
       isDeletedStatus: (status) => status === "confirmed_deleted" || status === "inferred_deleted",
       snowflakeValue: (value) => /^\d{15,25}$/.test(String(value || "")) ? String(value) : null,
+      discordUsernameValue: (value) => typeof value === "string" && /^[a-z0-9._]{1,32}$/i.test(value.trim())
+        ? value.trim() : null,
       hasEdits: () => false,
       sanitizeMediaItems: () => [],
       sanitizeRecordPresentation: (value) => value
@@ -379,7 +381,7 @@ test("timeout action uses an exact deleted archive identity when MessageStore no
   assert.equal(invocations.length, 1);
 });
 
-test("message author resolution is document-bound, route-bound, and returns only requested snowflakes", async () => {
+test("message author resolution is document-bound, route-bound, and returns only sanitized requested identities", async () => {
   const harness = backgroundHarness();
   const requested = [];
   const channelId = "777777777777777777";
@@ -387,12 +389,12 @@ test("message author resolution is document-bound, route-bound, and returns only
   const secondMessageId = "888888888888888882";
   harness.setLocation(`https://discord.com/channels/111111111111111111/${channelId}`);
   harness.setMainController({
-    resolveMessageAuthors(receivedChannelId, ids) {
-      requested.push({ receivedChannelId, ids });
+    resolveMessageAuthors(receivedChannelId, ids, fallbackUsers) {
+      requested.push({ receivedChannelId, ids, fallbackUsers });
       return {
         ok: true,
         authors: [
-          { messageId: firstMessageId, userId: "999999999999999991", content: "must-not-cross" },
+          { messageId: firstMessageId, userId: "999999999999999991", username: "curiousbro", content: "must-not-cross" },
           { messageId: secondMessageId, userId: "not-a-snowflake" },
           { messageId: "888888888888888899", userId: "999999999999999999" }
         ],
@@ -411,12 +413,55 @@ test("message author resolution is document-bound, route-bound, and returns only
   assert.deepEqual(plain(result), {
     ok: true,
     reason: "message-authors-resolved",
-    authors: [{ messageId: firstMessageId, userId: "999999999999999991" }]
+    authors: [{ messageId: firstMessageId, userId: "999999999999999991", username: "curiousbro" }]
   });
-  assert.deepEqual(plain(requested), [{ receivedChannelId: channelId, ids: [firstMessageId, secondMessageId] }]);
+  assert.deepEqual(plain(requested), [{
+    receivedChannelId: channelId,
+    ids: [firstMessageId, secondMessageId],
+    fallbackUsers: []
+  }]);
   const call = harness.calls.at(-1);
   assert.equal(call.options.world, "MAIN");
   assert.deepEqual(Array.from(call.options.target.documentIds), ["document-6"]);
+});
+
+test("deleted message username resolution receives only the exact trusted archive author fallback", async () => {
+  const harness = backgroundHarness();
+  const guildId = "111111111111111111";
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const seenMessageId = "888888888888888882";
+  const userId = "999999999999999991";
+  harness.setStoredArchive({
+    generation: 3,
+    records: [
+      { channelId, messageId, authorId: userId, status: "confirmed_deleted" },
+      { channelId, messageId: seenMessageId, authorId: "999999999999999992", status: "seen" }
+    ]
+  });
+  const pageUrl = "https://discord.com/channels/" + guildId + "/" + channelId;
+  harness.setLocation(pageUrl);
+  const received = [];
+  harness.setMainController({
+    resolveMessageAuthors(receivedChannelId, ids, fallbackUsers) {
+      received.push({ receivedChannelId, ids, fallbackUsers });
+      return { ok: true, authors: [{ messageId, userId, username: "curiousbro" }] };
+    }
+  });
+  const result = await harness.api.handleResolveMessageAuthors({
+    type: "LDMA_RESOLVE_MESSAGE_AUTHORS",
+    messageIds: [messageId, seenMessageId]
+  }, discordSender({ tab: { id: 8, url: pageUrl }, documentId: "document-8" }));
+  assert.deepEqual(plain(result), {
+    ok: true,
+    reason: "message-authors-resolved",
+    authors: [{ messageId, userId, username: "curiousbro" }]
+  });
+  assert.deepEqual(plain(received), [{
+    receivedChannelId: channelId,
+    ids: [messageId, seenMessageId],
+    fallbackUsers: [{ messageId, userId }]
+  }]);
 });
 
 test("message author resolution rejects malformed, untrusted, and route-stale requests", async () => {

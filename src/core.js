@@ -112,6 +112,12 @@
     return /^\d{15,25}$/.test(text) ? text : null;
   }
 
+  function discordUsernameValue(value) {
+    if (typeof value !== "string") return null;
+    const username = value.trim();
+    return /^[a-z0-9._]{1,32}$/i.test(username) ? username : null;
+  }
+
   function avatarAuthorId(value) {
     const safe = safeDiscordAssetUrl(value);
     if (!safe) return null;
@@ -568,6 +574,9 @@
     const authorId = snowflakeValue(record.authorId);
     if (authorId) next.authorId = authorId;
     else delete next.authorId;
+    const authorUsername = discordUsernameValue(record.authorUsername);
+    if (authorUsername) next.authorUsername = authorUsername;
+    else delete next.authorUsername;
     next.sourceContinuation = Boolean(record.sourceContinuation);
     const groupRootMessageId = snowflakeValue(record.groupRootMessageId);
     if (groupRootMessageId) next.groupRootMessageId = groupRootMessageId;
@@ -702,6 +711,7 @@
         if (!needle) return true;
         const haystack = [
           record.author,
+          record.authorUsername,
           record.content,
           record.channelName,
           record.channelId,
@@ -768,6 +778,7 @@
     chronologicalNeighborIds, tombstoneInRenderedRange, anchorlessRestoreAllowed,
     messageUsernameLabelId,
     snowflakeValue,
+    discordUsernameValue,
     avatarAuthorId,
     snowflakeTimestamp,
     sameContinuationAuthor,

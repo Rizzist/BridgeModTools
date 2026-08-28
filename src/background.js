@@ -545,7 +545,8 @@ function safeResolvedAuthors(value, requestedIds) {
       ? item.userId : null;
     if (!messageId || !userId || !requested.has(messageId) || seen.has(messageId)) continue;
     seen.add(messageId);
-    authors.push({ messageId, userId });
+    const username = Core.discordUsernameValue(item?.username);
+    authors.push(Object.assign({ messageId, userId }, username ? { username } : {}));
   }
   return {
     ok: value?.ok === true,
@@ -566,12 +567,23 @@ async function handleResolveMessageAuthors(command, sender) {
     return { ok: false, reason: "invalid-message-ids", authors: [] };
   }
   const expectedRoute = { guildId: context.guildId, channelId: context.channelId };
+  let trustedFallbacks = [];
+  try {
+    const archive = await readArchive();
+    const requested = new Set(messageIds);
+    trustedFallbacks = archive.records.map((record) => {
+      if (!Core.isDeletedStatus(record.status) || record.channelId !== context.channelId ||
+        !requested.has(record.messageId)) return null;
+      const userId = Core.snowflakeValue(record.authorId);
+      return userId ? { messageId: record.messageId, userId } : null;
+    }).filter(Boolean);
+  } catch (_error) {}
   let execution;
   try {
     execution = await chrome.scripting.executeScript({
       target: { tabId: sender.tab.id, documentIds: [sender.documentId] },
       world: "MAIN",
-      func(ids, route) {
+      func(ids, route, fallbackUsers) {
         try {
           const current = new URL(globalThis.location.href);
           const match = /^\/channels\/(@me|\d{15,25})\/(\d{15,25})\/?$/.exec(current.pathname);
@@ -584,7 +596,7 @@ async function handleResolveMessageAuthors(command, sender) {
           if (!controller || typeof controller.resolveMessageAuthors !== "function") {
             return { ok: false, reason: "author-resolution-controller-unavailable", authors: [] };
           }
-          return Promise.resolve(controller.resolveMessageAuthors(route.channelId, ids)).then(
+          return Promise.resolve(controller.resolveMessageAuthors(route.channelId, ids, fallbackUsers)).then(
             (result) => result,
             () => ({ ok: false, reason: "author-resolution-controller-error", authors: [] })
           );
@@ -592,7 +604,7 @@ async function handleResolveMessageAuthors(command, sender) {
           return { ok: false, reason: "author-resolution-controller-error", authors: [] };
         }
       },
-      args: [messageIds, expectedRoute]
+      args: [messageIds, expectedRoute, trustedFallbacks]
     });
   } catch (_error) {
     return { ok: false, reason: "author-resolution-injection-failed", authors: [] };

@@ -27,7 +27,7 @@
   const scannedModules = new WeakMap();
   const dispatchers = new Set();
   const fallbackDispatchers = new Set();
-  const CORE_STORES = new Set(["MessageStore", "ChannelStore", "GuildStore", "ReadStateStore"]);
+  const CORE_STORES = new Set(["MessageStore", "ChannelStore", "GuildStore", "ReadStateStore", "UserStore"]);
   const bufferedEvents = [];
   const patchedHandlerNodes = new WeakMap();
   const patchedRetentionDispatchers = new WeakMap();
@@ -39,6 +39,7 @@
   let coreDispatcher = null;
   let fallbackDispatcher = null;
   let messageStoreCandidate = null;
+  let userStoreCandidate = null;
   let userProfileActionsCandidate = null;
   let timeoutUntilActionsCandidate = null;
   let messageStorePatched = false;
@@ -64,6 +65,12 @@
   function cleanId(value) {
     const id = String(value || "");
     return SNOWFLAKE.test(id) ? id : null;
+  }
+
+  function cleanUsername(value) {
+    if (typeof value !== "string") return null;
+    const username = value.trim();
+    return /^[a-z0-9._]{1,32}$/i.test(username) ? username : null;
   }
 
   function emitDelete(channelValue, idValues, bulk) {
@@ -590,13 +597,16 @@
       if (storeInfo) {
         const usableMessageStore = storeInfo.name === "MessageStore" &&
           dataFunction(value, "getMessage") && dataFunction(value, "getMessages");
+        const usableUserStore = storeInfo.name === "UserStore" &&
+          dataFunction(value, "getUser") && dataFunction(value, "getCurrentUser");
+        if (usableUserStore) userStoreCandidate = value;
         // Do not let a decoy/partial named store claim global hook health. Its
         // dispatcher must first pass subscription and become the accepted core
         // dispatcher, and the store must expose the cache reads retention needs.
         if (usableMessageStore) {
           messageStoreCandidate = value;
           reconcileMessageStore("module-discovery");
-        } else subscribeDispatcher(storeInfo.dispatcher, true, false);
+        } else if (!usableUserStore) subscribeDispatcher(storeInfo.dispatcher, true, false);
       }
       else if (fallbackDispatchers.size < 4 && isDispatcher(value)) fallbackDispatchers.add(value);
       if (depth >= 2) continue;
@@ -737,7 +747,7 @@
     for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
   }
 
-  function resolveMessageAuthors(channelValue, idValues) {
+  function resolveMessageAuthors(channelValue, idValues, fallbackValues) {
     const channelId = cleanId(channelValue);
     if (!channelId || !Array.isArray(idValues) || idValues.length < 1 || idValues.length > MAX_BULK_IDS) {
       return { ok: false, reason: "invalid-request", authors: [] };
@@ -746,6 +756,14 @@
     if (!ids.length || ids.length !== idValues.length) {
       return { ok: false, reason: "invalid-request", authors: [] };
     }
+    const fallbackUsers = new Map();
+    for (const item of Array.isArray(fallbackValues) ? fallbackValues : []) {
+      const messageId = cleanId(item?.messageId);
+      const userId = cleanId(item?.userId);
+      if (messageId && userId && ids.includes(messageId) && !fallbackUsers.has(messageId)) {
+        fallbackUsers.set(messageId, userId);
+      }
+    }
     if (!messageStoreCandidate || typeof messageStoreCandidate?.getMessage !== "function") {
       recoverHook("author-resolution");
     } else {
@@ -753,15 +771,39 @@
     }
     const getMessage = dataFunction(messageStoreCandidate, "getMessage");
     if (!getMessage) return { ok: false, reason: "message-store-unavailable", authors: [] };
+    let rescannedUserStore = false;
+    if (!userStoreCandidate || !dataFunction(userStoreCandidate, "getUser")) {
+      rescannedUserStore = true;
+      for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
+    }
+    let getUser = dataFunction(userStoreCandidate, "getUser");
     const authors = [];
     for (const messageId of ids) {
       let message = null;
       try { message = getMessage.call(messageStoreCandidate, channelId, messageId); } catch (_error) {}
       const resolvedMessageId = cleanId(message?.id);
       const resolvedChannelId = cleanId(message?.channelId || message?.channel_id);
-      if (resolvedMessageId !== messageId || resolvedChannelId !== channelId) continue;
-      const userId = cleanId(message?.author?.id || message?.authorId || message?.author_id);
-      if (userId) authors.push({ messageId, userId });
+      const exactMessage = resolvedMessageId === messageId && resolvedChannelId === channelId ? message : null;
+      const userId = cleanId(exactMessage?.author?.id || exactMessage?.authorId || exactMessage?.author_id) ||
+        fallbackUsers.get(messageId) || null;
+      if (!userId) continue;
+      let username = cleanUsername(exactMessage?.author?.username);
+      if (!username && getUser) {
+        let user = null;
+        try { user = getUser.call(userStoreCandidate, userId); } catch (_error) {}
+        if (cleanId(user?.id) === userId) username = cleanUsername(user?.username);
+      }
+      if (!username && !rescannedUserStore) {
+        rescannedUserStore = true;
+        for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
+        getUser = dataFunction(userStoreCandidate, "getUser");
+        let user = null;
+        try { user = getUser?.call(userStoreCandidate, userId); } catch (_error) {}
+        if (cleanId(user?.id) === userId) username = cleanUsername(user?.username);
+      }
+      const item = { messageId, userId };
+      if (username) item.username = username;
+      authors.push(item);
     }
     return { ok: true, reason: "resolved", authors };
   }

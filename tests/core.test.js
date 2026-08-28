@@ -278,9 +278,12 @@ test("author presentation sanitizer keeps Discord visuals and rejects executable
 
   const grouped = Core.sanitizeRecordPresentation({
     messageId: "222222222222222", channelId: "111111111111111",
-    authorId: "999999999999999", groupRootMessageId: "111111111111112", sourceContinuation: 1
+    authorId: "999999999999999", authorUsername: "curiousbro",
+    groupRootMessageId: "111111111111112", sourceContinuation: 1
   });
   assert.equal(grouped.authorId, "999999999999999");
+  assert.equal(grouped.authorUsername, "curiousbro");
+  assert.equal(Core.searchRecords([grouped], "curiousbro", "all").length, 1);
   assert.equal(grouped.groupRootMessageId, "111111111111112");
   assert.equal(grouped.sourceContinuation, true);
 
@@ -288,6 +291,7 @@ test("author presentation sanitizer keeps Discord visuals and rejects executable
     messageId: "3",
     channelId: "2",
     authorId: "not-a-user",
+    authorUsername: "@not a username",
     groupRootMessageId: "future<script>",
     avatarUrl: "https://example.com/avatars/1/a.png",
     authorStyle: {
@@ -303,6 +307,7 @@ test("author presentation sanitizer keeps Discord visuals and rejects executable
   assert.equal(hostile.authorStyle, undefined);
   assert.deepEqual(hostile.authorBadges, []);
   assert.equal(hostile.authorId, undefined);
+  assert.equal(hostile.authorUsername, undefined);
   assert.equal(hostile.groupRootMessageId, undefined);
 });
 

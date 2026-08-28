@@ -35,7 +35,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.6.0");
+  assert.equal(manifest.version, "2.6.1");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -275,7 +275,7 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.match(content, /author\.setAttribute\("aria-label", profileLabel\)/);
   assert.match(content, /function createAuthorActionControls/);
   assert.match(content, /role", "toolbar"/);
-  for (const label of ["Copy Discord ID", "Timeout user for 7 days"]) {
+  for (const label of ["Copy Discord username", "Timeout user for 7 days"]) {
     assert.match(content, new RegExp(label));
   }
   assert.match(content, /actions\.append\(copyAction, timeoutAction, status\)/);
@@ -288,7 +288,10 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.match(content, /data-ldma-author-actions-host/);
   assert.match(content, /host\.attachShadow\(\{ mode: "closed" \}\)/);
   assert.match(content, /child\.matches\("\[class\*='hiddenVisually_'\], \[aria-hidden='true'\], \[data-ldma-author-actions\]"\)/);
-  assert.match(content, /navigator\.clipboard\.writeText\(value\)/);
+  assert.match(content, /navigator\.clipboard\.writeText\(username\)/);
+  assert.match(content, /copyAction\.textContent = "@"/);
+  assert.match(content, /function copyDiscordUsername/);
+  assert.equal(/function copyUserId/.test(content), false);
   assert.match(content, /document\.execCommand\("copy"\)/);
   assert.match(content, /window\.confirm\(`Timeout \$\{author\} \(\$\{userId\}\) for 7 days\?`\)/);
   assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "open-profile",\s*userId: actionUserId,\s*guildId: actionGuildId/);
@@ -299,7 +302,8 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.match(content, /aria-live", "polite"/);
   assert.match(content, /timeoutAction\.hidden = !SNOWFLAKE\.test\(String\(context\?\.guildId/);
   assert.match(content, /type: RESOLVE_MESSAGE_AUTHORS, messageIds: \[context\.messageId\]/);
-  assert.match(content, /const userId = context && await resolveActionAuthorId\(context, true\)/);
+  assert.match(content, /const identity = context && await resolveActionAuthorIdentity\(context, true\)/);
+  assert.match(content, /copyDiscordUsername\(identity\.username\)/);
   assert.match(content, /background independently proves/);
   assert.match(content, /function removeLiveAuthorActions/);
   assert.match(content, /removeLiveAuthorActions\(\)/);
