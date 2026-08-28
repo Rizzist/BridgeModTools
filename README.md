@@ -26,6 +26,8 @@ Version 2.6.1 changes the copy action to **@** and copies the account's real Dis
 
 Version 2.6.2 fixes the **@** action showing `!` after an extension update. It versions the page-world resolver so a surviving older Discord hook is replaced by one automatic page refresh, supports Discord UserStore builds without `getCurrentUser`, preserves an exact verified cached username when an older resolver returns only the author ID, and carries trusted cached usernames for restored deleted rows. Clipboard failures and genuinely unavailable usernames now report distinct status text.
 
+Version 2.6.3 grants the **@** action Chrome's write-only clipboard capability so resolved usernames are actually copied; the extension never reads the clipboard. The popup also displays combined local data usage—message metadata plus cached-media payload bytes—while retaining the separate media-cache total.
+
 Restored visual media now uses Discord-like inline sizing and spacing instead of a fixed-height generic card. Images and videos retain intrinsic dimensions up to a 550×350-pixel display box, small GIFs stay small, multiple visuals use a compact grid, and audio remains a compact native player. Cached files and plain links keep a small labeled tile.
 
 Version 2 also captures links and rendered upload/embed media. Discord-hosted images, videos, audio, voice messages, and files are downloaded immediately into an extension-owned local cache; direct third-party media can be enabled per site from the popup. Restored deleted rows and full history use the cached bytes, so supported media remains viewable or playable after the original message disappears.
@@ -76,7 +78,7 @@ The toolbar popup shows archived, edited, saved-deleted, and cached-media counts
 
 ## Privacy and security properties
 
-- Manifest permissions: `storage`, `offscreen`, `unlimitedStorage`, `scripting`, and `webNavigation`. Required hosts are limited to the exact Discord application origin plus Discord's CDN/media proxy domains. Arbitrary HTTPS is optional; Chrome prompts only when you click the popup button for the exact origins currently waiting.
+- Manifest permissions: `storage`, `offscreen`, `unlimitedStorage`, `scripting`, `webNavigation`, and write-only `clipboardWrite` for the explicit username-copy button. BridgeModTools never reads the clipboard. Required hosts are limited to the exact Discord application origin plus Discord's CDN/media proxy domains. Arbitrary HTTPS is optional; Chrome prompts only when you click the popup button for the exact origins currently waiting.
 - Bootstrap page match: `https://discord.com/*`. Message capture remains route-gated internally to real `/channels/<guild-or-@me>/<channelId>` views.
 - One local service worker serializes every archive read/write; content and UI pages cannot access storage directly.
 - A `document_start`, main-world adapter discovers Discord's `MessageStore`, signals genuine edits, and retains cached records during single or bulk deletion. It sends only validated channel/message IDs plus an edit timestamp/ordering token to the isolated content script. Message content, tokens, cookies, and store objects never cross that bridge.

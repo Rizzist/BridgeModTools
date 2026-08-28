@@ -27,6 +27,8 @@ function backgroundHarness() {
   let styleInstalled = false;
   let queriedTabs = [];
   let storedArchive = null;
+  let storageBytesInUse = 0;
+  let mediaStats = { cached: 0, pending: 0, failed: 0, permissionRequired: 0, bytes: 0, origins: [] };
   let context;
   const storageWrites = [];
   const networkCalls = [];
@@ -72,6 +74,7 @@ function backgroundHarness() {
     },
     storage: { local: {
       async get() { return storedArchive ? { ldmaArchive: storedArchive } : {}; },
+      async getBytesInUse() { return storageBytesInUse; },
       async set(value) {
         storageWrites.push(value);
         if (value && Object.prototype.hasOwnProperty.call(value, "ldmaArchive")) storedArchive = value.ldmaArchive;
@@ -107,10 +110,13 @@ function backgroundHarness() {
       sanitizeMediaItems: () => [],
       sanitizeRecordPresentation: (value) => value
     },
-    BridgeModToolsMediaStore: { async setGeneration() {} }
+    BridgeModToolsMediaStore: {
+      async setGeneration() {},
+      async getStats() { return mediaStats; }
+    }
   });
   const source = fs.readFileSync(path.resolve(__dirname, "../src/background.js"), "utf8");
-  vm.runInContext(`${source}\n;globalThis.__testApi = { ensureDiscordBootstrap, discordContentSender, discordChannelContentSender, discordChannelContext, extensionSenderPath, reportLiveHealth, bestLiveHealth, pruneLiveHealth, liveHealthByDocument, handleUserAction, handleResolveMessageAuthors, userActionRateLimits, timeoutActionsInFlight };`, context);
+  vm.runInContext(`${source}\n;globalThis.__testApi = { ensureDiscordBootstrap, discordContentSender, discordChannelContentSender, discordChannelContext, extensionSenderPath, reportLiveHealth, bestLiveHealth, pruneLiveHealth, liveHealthByDocument, handleUserAction, handleResolveMessageAuthors, handleMediaCommand, userActionRateLimits, timeoutActionsInFlight };`, context);
   return {
     api: context.__testApi,
     calls,
@@ -120,6 +126,8 @@ function backgroundHarness() {
     setLocation(href) { context.location.href = href; },
     setMainController(controller) { context[Symbol.for("BridgeModTools.pageHook.v1")] = controller; },
     setStoredArchive(value) { storedArchive = value; },
+    setStorageBytesInUse(value) { storageBytesInUse = value; },
+    setMediaStats(value) { mediaStats = value; },
     setIsolatedInstalled(value) { isolatedInstalled = value; styleInstalled = value; },
     setQueriedTabs(value) { queriedTabs = value; }
   };
@@ -183,6 +191,38 @@ test("Discord and extension sender authorization rejects route, origin, frame, a
 
   assert.equal(api.extensionSenderPath({ id: "extension-id", url: "chrome-extension://extension-id/popup/popup.html" }), "/popup/popup.html");
   assert.equal(api.extensionSenderPath({ id: "extension-id", url: "https://discord.com/popup/popup.html" }), null);
+});
+
+test("popup media stats include message metadata and combined local data bytes", async () => {
+  const harness = backgroundHarness();
+  const mediaBytes = 65 * 1024 * 1024;
+  const archiveBytes = 768 * 1024;
+  harness.setMediaStats({
+    cached: 183,
+    pending: 2,
+    failed: 1,
+    permissionRequired: 7,
+    bytes: mediaBytes,
+    origins: ["https://media1.tenor.com"]
+  });
+  harness.setStorageBytesInUse(archiveBytes);
+  const result = await harness.api.handleMediaCommand({ type: "MEDIA_STATS" }, {
+    id: "extension-id",
+    url: "chrome-extension://extension-id/popup/popup.html"
+  });
+  assert.deepEqual(plain(result), {
+    ok: true,
+    stats: {
+      cached: 183,
+      pending: 2,
+      failed: 1,
+      permissionRequired: 7,
+      bytes: mediaBytes,
+      origins: ["https://media1.tenor.com"],
+      archiveBytes,
+      totalBytes: mediaBytes + archiveBytes
+    }
+  });
 });
 
 test("live health is document-scoped, active wins, and inactive removes the document", () => {

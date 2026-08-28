@@ -85,6 +85,7 @@ input[role="switch"]:checked::after { transform: translateX(16px); }
 
 .stats strong { font-size: 18px; }
 .stats span { color: #949ba4; font-size: 10px; text-transform: uppercase; }
+.stats .storage-total { grid-column: 1 / -1; }
 
 .health { margin: -5px 0 14px; padding: 8px 9px; border-radius: 4px; background: #29382f; color: #9bd7af; }
 .health[data-state="degraded"], .health[data-state="unsupported"] { background: #443a28; color: #f0c56b; }

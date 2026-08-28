@@ -8,6 +8,7 @@
   const editedCount = document.getElementById("edited-count");
   const deletedCount = document.getElementById("deleted-count");
   const mediaCount = document.getElementById("media-count");
+  const storageBytes = document.getElementById("storage-bytes");
   const mediaBytes = document.getElementById("media-bytes");
   const mediaCacheDetail = document.getElementById("media-cache-detail");
   const mediaAccess = document.getElementById("media-access");
@@ -105,6 +106,8 @@
     const stats = response.stats || { cached: 0, bytes: 0, origins: [] };
     mediaCount.textContent = String(stats.cached || 0);
     mediaBytes.textContent = formatBytes(stats.bytes);
+    storageBytes.textContent = formatBytes(stats.totalBytes);
+    storageBytes.title = `${formatBytes(stats.archiveBytes)} message metadata + ${formatBytes(stats.bytes)} cached media`;
     missingMediaOrigins = [];
     for (const origin of stats.origins || []) {
       const granted = await chrome.permissions.contains({ origins: [`${origin}/*`] });

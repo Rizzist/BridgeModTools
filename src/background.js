@@ -760,7 +760,20 @@ function handleMediaCommand(command, sender) {
     const archive = await readArchive();
     if (command.type === Protocol.TYPES.GET_MEDIA_STATS) {
       if (!popupSender(sender)) return { ok: false, reason: "untrusted-media-sender" };
-      return { ok: true, stats: await MediaStore.getStats() };
+      const stats = await MediaStore.getStats();
+      let archiveBytes = 0;
+      try {
+        archiveBytes = Math.max(0, Number(await chrome.storage.local.getBytesInUse(STORAGE_KEY)) || 0);
+      } catch (_error) {}
+      const mediaBytes = Math.max(0, Number(stats?.bytes) || 0);
+      return {
+        ok: true,
+        stats: Object.assign({}, stats, {
+          bytes: mediaBytes,
+          archiveBytes,
+          totalBytes: mediaBytes + archiveBytes
+        })
+      };
     }
     if (command.type === Protocol.TYPES.CACHE_MEDIA) {
       if (!discordChannelContentSender(sender)) return { ok: false, reason: "untrusted-media-sender" };

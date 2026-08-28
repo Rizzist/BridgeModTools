@@ -19,7 +19,8 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.minimum_chrome_version, "133");
-  assert.deepEqual(manifest.permissions, ["storage", "offscreen", "unlimitedStorage", "scripting", "webNavigation"]);
+  assert.deepEqual(manifest.permissions, ["storage", "offscreen", "unlimitedStorage", "scripting", "webNavigation", "clipboardWrite"]);
+  assert.equal(manifest.permissions.includes("clipboardRead"), false);
   assert.deepEqual(manifest.host_permissions, [
     "https://discord.com/*",
     "https://cdn.discordapp.com/*",
@@ -35,7 +36,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.6.2");
+  assert.equal(manifest.version, "2.6.3");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -108,6 +109,7 @@ test("only the serialized background broker accesses chrome storage", () => {
     if (path.basename(file) === "background.js") {
       assert.match(source, /chrome\.storage\.local\.get/);
       assert.match(source, /chrome\.storage\.local\.set/);
+      assert.match(source, /chrome\.storage\.local\.getBytesInUse/);
       assert.match(source, /brokerQueue/);
       assert.match(source, /archiveCache/);
     } else {
@@ -290,6 +292,7 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.match(content, /host\.attachShadow\(\{ mode: "closed" \}\)/);
   assert.match(content, /child\.matches\("\[class\*='hiddenVisually_'\], \[aria-hidden='true'\], \[data-ldma-author-actions\]"\)/);
   assert.match(content, /navigator\.clipboard\.writeText\(username\)/);
+  assert.equal(/navigator\.clipboard\.read/.test(content), false);
   assert.match(content, /copyAction\.textContent = "@"/);
   assert.match(content, /function copyDiscordUsername/);
   assert.equal(/function copyUserId/.test(content), false);
@@ -346,12 +349,16 @@ test("popup exposes saved-deletion counts and local search without unsafe HTML r
   assert.match(html, /id="deleted-count"/);
   assert.match(html, /id="search" type="search"/);
   assert.match(html, /id="search-results"/);
+  assert.match(html, /id="storage-bytes"/);
+  assert.match(html, /local data used/);
   assert.match(source, /Core\.searchRecords/);
   assert.match(source, /Core\.isDeletedStatus/);
   assert.match(source, /replaceChildren/);
   assert.match(source, /LDMA_GET_LIVE_HEALTH/);
   assert.match(source, /healthAge >= 0 && healthAge <= 45000/);
   assert.match(source, /LDMA_LIVE_HEALTH_CHANGED/);
+  assert.match(source, /storageBytes\.textContent = formatBytes\(stats\.totalBytes\)/);
+  assert.match(source, /stats\.archiveBytes/);
   assert.equal(/innerHTML/.test(source), false);
   assert.equal(/reload Discord once/i.test(`${html}\n${source}\n${protocol}`), false);
 });
