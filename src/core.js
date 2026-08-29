@@ -172,7 +172,7 @@
   }
 
   function messageContinues(previous, current, options) {
-    if (!previous || !current || current.replyPreview) return false;
+    if (!previous || !current || current.reply || current.replyPreview) return false;
     const previousMessageId = snowflakeValue(previous?.messageId);
     const currentMessageId = snowflakeValue(current?.messageId);
     const previousGroupRoot = snowflakeValue(previous?.groupRootMessageId);
@@ -486,6 +486,83 @@
     return items;
   }
 
+  const REPLY_STATES = new Set(["available", "deleted", "unavailable", "unknown", "legacy"]);
+
+  function replyText(value, maxLength) {
+    if (typeof value !== "string") return null;
+    const text = value.replace(/\r\n?/g, "\n").slice(0, maxLength);
+    return text.trim() ? text : null;
+  }
+
+  function sanitizeReply(value, legacyPreview) {
+    const raw = value && typeof value === "object" && !Array.isArray(value) ? value : null;
+    const legacyFallback = typeof legacyPreview === "string"
+      ? normalizeText(legacyPreview).slice(0, 500) || null : null;
+    if (!raw && !legacyFallback) return null;
+    const reply = {};
+    for (const field of ["messageId", "channelId", "guildId", "authorId"]) {
+      const id = typeof raw?.[field] === "string" ? snowflakeValue(raw[field]) : null;
+      if (id) reply[field] = id;
+    }
+    const author = typeof raw?.author === "string" ? normalizeText(raw.author).slice(0, 128) : "";
+    const authorUsername = discordUsernameValue(raw?.authorUsername);
+    const avatarUrl = safeDiscordAssetUrl(raw?.avatarUrl);
+    const authorColor = safePresentationColor(raw?.authorColor);
+    const content = replyText(raw?.content, 2000);
+    const fallbackText = typeof raw?.fallbackText === "string"
+      ? normalizeText(raw.fallbackText).slice(0, 500) || legacyFallback : legacyFallback;
+    const attachmentNames = (Array.isArray(raw?.attachmentNames) ? raw.attachmentNames : [])
+      .slice(0, 8).filter((item) => typeof item === "string").map(safeMediaName).filter(Boolean).slice(0, 4);
+    const media = sanitizeMediaItems(raw?.media).slice(0, 4);
+    if (author) reply.author = author;
+    if (authorUsername) reply.authorUsername = authorUsername;
+    if (avatarUrl) reply.avatarUrl = avatarUrl;
+    if (authorColor) reply.authorColor = authorColor;
+    if (content) reply.content = content;
+    if (fallbackText) reply.fallbackText = fallbackText;
+    if (attachmentNames.length) reply.attachmentNames = attachmentNames;
+    if (media.length) reply.media = media;
+    const hasSnapshot = Object.keys(reply).length > 0;
+    const rawState = raw?.state === "resolved" ? "available" : REPLY_STATES.has(raw?.state) ? raw.state : null;
+    reply.state = rawState || (raw && hasSnapshot ? "available" : "legacy");
+    return hasSnapshot || reply.state === "deleted" || reply.state === "unavailable" ? reply : null;
+  }
+
+  function mergeReplySnapshots(existingValue, incomingValue) {
+    const existing = sanitizeReply(existingValue);
+    const incoming = sanitizeReply(incomingValue);
+    if (!incoming) return existing;
+    if (!existing) return incoming;
+    for (const field of ["messageId", "channelId", "guildId", "authorId"]) {
+      if (existing[field] && incoming[field] && existing[field] !== incoming[field]) return existing;
+    }
+    if (existing.state === "deleted" && incoming.state !== "deleted") return existing;
+    const merged = Object.assign({}, existing);
+    for (const field of [
+      "messageId", "channelId", "guildId", "author", "authorId", "authorUsername",
+      "avatarUrl", "authorColor", "content", "fallbackText"
+    ]) {
+      if (incoming[field]) merged[field] = incoming[field];
+    }
+    if (incoming.attachmentNames?.length) merged.attachmentNames = incoming.attachmentNames;
+    if (incoming.media?.length) merged.media = incoming.media;
+    const rank = { legacy: 0, unknown: 1, unavailable: 2, available: 3, deleted: 4 };
+    merged.state = rank[incoming.state] > rank[existing.state] ? incoming.state : existing.state;
+    return sanitizeReply(merged);
+  }
+
+  function versionMediaItems(version) {
+    if (!version || typeof version !== "object") return [];
+    const reply = sanitizeReply(version.reply, version.replyPreview);
+    // Keep body and reply references separate here. The cache layer deduplicates
+    // the asset URL, while separate items ensure that distinct poster URLs or
+    // other bounded metadata on the two references are both traversed.
+    return [
+      ...sanitizeMediaItems(version.media),
+      ...(Array.isArray(reply?.media) ? reply.media : [])
+    ];
+  }
+
   function editPayloadSignature(record) {
     // Message edits are content-exact. Preserve meaningful whitespace so an
     // edit that only adds a line break or repeated spaces is still retained.
@@ -687,6 +764,10 @@
     if (groupRootMessageId) next.groupRootMessageId = groupRootMessageId;
     else delete next.groupRootMessageId;
     next.media = sanitizeMediaItems(record.media);
+    const reply = sanitizeReply(record.reply, record.replyPreview);
+    if (reply) next.reply = reply;
+    else delete next.reply;
+    delete next.replyPreview;
     next.editHistory = sanitizeEditHistory(record.editHistory);
     if (!next.editHistory.length) delete next.editHistory;
     const editSessionId = normalizeText(record.editSessionId).slice(0, 100);
@@ -785,6 +866,9 @@
         firstCapturedAt: old.firstCapturedAt || record.firstCapturedAt || record.capturedAt || now,
         updatedAt: now
       });
+      const mergedReply = mergeReplySnapshots(old.reply, safeRecord.reply);
+      if (mergedReply) merged.reply = mergedReply;
+      else delete merged.reply;
       const oldAuthorId = snowflakeValue(old.authorId);
       const incomingAuthorId = snowflakeValue(safeRecord.authorId);
       const incomingAuthorUsername = discordUsernameValue(safeRecord.authorUsername);
@@ -803,6 +887,7 @@
           merged.content = old.content;
           merged.attachments = old.attachments;
           merged.media = old.media;
+          merged.reply = old.reply;
           merged.capturedAt = old.capturedAt;
           merged.captureSessionId = old.captureSessionId;
           merged.captureSequence = old.captureSequence;
@@ -811,6 +896,17 @@
         merged.status = old.status;
         merged.confirmedDeletedAt = old.confirmedDeletedAt;
         merged.deletionSource = old.deletionSource;
+        // A conservative DOM inference can arrive after Discord's exact
+        // lifecycle confirmation. Keep the authoritative captured payload as
+        // well as its status; otherwise the lower-confidence inference could
+        // silently replace both the deleted body and its reply snapshot.
+        merged.content = old.content;
+        merged.attachments = old.attachments;
+        merged.media = old.media;
+        merged.reply = old.reply;
+        merged.capturedAt = old.capturedAt;
+        merged.captureSessionId = old.captureSessionId;
+        merged.captureSequence = old.captureSequence;
       }
       byKey.set(key, merged);
     }
@@ -830,6 +926,12 @@
           record.channelName,
           record.channelId,
           record.guildId,
+          record.reply?.author,
+          record.reply?.authorUsername,
+          record.reply?.content,
+          record.reply?.fallbackText,
+          ...(Array.isArray(record.reply?.attachmentNames) ? record.reply.attachmentNames : []),
+          ...(Array.isArray(record.reply?.media) ? record.reply.media.flatMap((item) => [item.name, item.url, item.alt]) : []),
           ...(Array.isArray(record.attachments) ? record.attachments : []),
           ...(Array.isArray(record.media) ? record.media.flatMap((item) => [item.name, item.url, item.alt]) : []),
           ...(Array.isArray(record.editHistory) ? record.editHistory.flatMap((revision) => [
@@ -916,6 +1018,9 @@
     mediaKindFromMime,
     safeMediaName,
     sanitizeMediaItems,
+    sanitizeReply,
+    mergeReplySnapshots,
+    versionMediaItems,
     editPayloadSignature,
     editRevisionFromRecord,
     sanitizeEditHistory,

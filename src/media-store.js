@@ -536,7 +536,7 @@
       const ownerKey = Core.recordKey(record);
       const protectedValue = Core.isDeletedStatus(record.status) || Core.hasEdits(record);
       for (const version of [record, ...(record.editHistory || [])]) {
-        for (const media of Core.sanitizeMediaItems(version.media)) {
+        for (const media of Core.versionMediaItems(version)) {
           if (fetchableMedia(media)) add(media.url, ownerKey, protectedValue);
           if (media.posterUrl) add(media.posterUrl, ownerKey, protectedValue);
         }

@@ -38,5 +38,16 @@
   "grouped": {
     "firstUsernameId": "message-username-555555555555555555",
     "secondRowAriaLabelledBy": "message-username-555555555555555555 message-content-666666666666666666"
+  },
+  "reply": {
+    "sourceMessageId": "666666666666666666",
+    "targetMessageId": "555555555555555555",
+    "guildHref": "/channels/333333333333333333/444444444444444444/555555555555555555",
+    "dmHref": "/channels/@me/111111111111111111/555555555555555555",
+    "ariaLabelledBy": "message-reply-context-666666666666666666 message-content-555555555555555555",
+    "avatarClass": "replyAvatar_a1b2c3",
+    "author": "Target author",
+    "content": "Referenced content",
+    "deletedFallback": "Original message was deleted"
   }
 }

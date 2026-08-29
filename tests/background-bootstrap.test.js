@@ -56,7 +56,7 @@ function backgroundHarness(options) {
   const chrome = {
     runtime: {
       id: "extension-id",
-      getManifest() { return { version: options?.version || "2.6.7" }; },
+      getManifest() { return { version: options?.version || "2.7.0" }; },
       getURL(relative) { return `chrome-extension://extension-id/${relative}`; },
       onMessage: events.message,
       onConnect: events.connect,
@@ -142,15 +142,21 @@ function backgroundHarness(options) {
         ? value.trim() : null,
       hasEdits: () => false,
       sanitizeMediaItems: () => [],
+      sanitizeReply: (value) => value && typeof value === "object" ? value : null,
+      versionMediaItems: (value) => [
+        ...(Array.isArray(value?.media) ? value.media : []),
+        ...(Array.isArray(value?.reply?.media) ? value.reply.media : [])
+      ],
       sanitizeRecordPresentation: (value) => value
     },
     BridgeModToolsMediaStore: {
+      fetchableMedia: (value) => Boolean(value?.url && value.kind !== "link"),
       async setGeneration() {},
       async getStats() { return mediaStats; }
     }
   });
   const source = fs.readFileSync(path.resolve(__dirname, "../src/background.js"), "utf8");
-  vm.runInContext(`${source}\n;globalThis.__testApi = { ensureDiscordBootstrap, discordContentSender, discordChannelContentSender, discordChannelContext, extensionSenderPath, reportLiveHealth, bestLiveHealth, pruneLiveHealth, liveHealthByDocument, handleUserAction, handleResolveMessageAuthors, handleMediaCommand, userActionRateLimits, timeoutActionsInFlight };`, context);
+  vm.runInContext(`${source}\n;globalThis.__testApi = { ensureDiscordBootstrap, discordContentSender, discordChannelContentSender, discordChannelContext, extensionSenderPath, reportLiveHealth, bestLiveHealth, pruneLiveHealth, liveHealthByDocument, handleUserAction, handleResolveMessageAuthors, handleMediaCommand, handlePlaybackCommand, mediaRefs, playbackCapabilities, userActionRateLimits, timeoutActionsInFlight };`, context);
   return {
     api: context.__testApi,
     calls,
@@ -856,4 +862,61 @@ test("user action broker rate limits each document and keeps limiter state bound
     await harness.api.handleUserAction(command, other);
   }
   assert.ok(harness.api.userActionRateLimits.size <= 500);
+});
+
+test("background media traversal includes reply media and its poster", () => {
+  const harness = backgroundHarness();
+  const refs = harness.api.mediaRefs([{
+    channelId: "111111111111111111", messageId: "222222222222222222", status: "confirmed_deleted",
+    media: [{ url: "https://cdn.discordapp.com/body.png", kind: "image" }],
+    reply: { media: [{
+      url: "https://cdn.discordapp.com/reply.mp4", posterUrl: "https://cdn.discordapp.com/reply-poster.png",
+      kind: "video", name: "reply"
+    }] }
+  }], 7);
+  assert.deepEqual(plain(refs.map((ref) => ref.media.url)), [
+    "https://cdn.discordapp.com/body.png",
+    "https://cdn.discordapp.com/reply.mp4",
+    "https://cdn.discordapp.com/reply-poster.png"
+  ]);
+  assert.equal(refs.every((ref) => ref.deleted && ref.generation === 7), true);
+});
+
+test("reply playback capabilities are scoped and reject edit revisions", async () => {
+  const harness = backgroundHarness();
+  const key = "111111111111111111:222222222222222222";
+  harness.setStoredArchive({
+    generation: 0, paused: true,
+    records: [{
+      channelId: "111111111111111111", messageId: "222222222222222222", content: "body",
+      media: [{ url: "https://cdn.discordapp.com/body.png", kind: "image" }],
+      reply: {
+        messageId: "333333333333333333", content: "quoted body", attachmentNames: ["quoted.png"],
+        media: [{ url: "https://cdn.discordapp.com/reply.png", kind: "image" }], state: "available"
+      },
+      editHistory: [{ revisionId: "session:1", content: "old body", media: [] }]
+    }]
+  });
+  const issuer = discordSender();
+  const invalid = await harness.api.handlePlaybackCommand({
+    type: "CREATE_CAP", key, mediaPart: "reply", revisionId: "session:1"
+  }, issuer);
+  assert.deepEqual(plain(invalid), { ok: false, reason: "invalid-media-part-revision" });
+
+  const created = await harness.api.handlePlaybackCommand({ type: "CREATE_CAP", key, mediaPart: "reply" }, issuer);
+  assert.equal(created.ok, true);
+  assert.equal(harness.api.playbackCapabilities.get(created.capability).mediaPart, "reply");
+  const viewer = {
+    id: "extension-id", url: "chrome-extension://extension-id/media/view.html",
+    frameId: 2, documentId: "viewer-document", tab: { id: 1 }
+  };
+  const redeemed = await harness.api.handlePlaybackCommand({ type: "REDEEM_CAP", capability: created.capability }, viewer);
+  assert.equal(redeemed.ok, true);
+  assert.equal(redeemed.record.content, "quoted body");
+  assert.deepEqual(plain(redeemed.record.attachments), ["quoted.png"]);
+  assert.deepEqual(plain(redeemed.record.media.map((item) => item.url)), ["https://cdn.discordapp.com/reply.png"]);
+  assert.equal(redeemed.record.reply, null);
+
+  const body = await harness.api.handlePlaybackCommand({ type: "CREATE_CAP", key }, issuer);
+  assert.equal(harness.api.playbackCapabilities.get(body.capability).mediaPart, "body");
 });

@@ -199,3 +199,24 @@ test("edited revision media remains owned and protected with the current message
     assert.equal(owners.get(MediaStore.mediaStorageKey(url)).protected, true);
   }
 });
+
+test("reply media and posters remain owned, protected, and separately traversable", () => {
+  const body = "https://cdn.discordapp.com/attachments/111111111111111111/222222222222222222/body.png";
+  const replyVideo = "https://cdn.discordapp.com/attachments/111111111111111111/333333333333333333/reply.mp4";
+  const replyPoster = "https://media.discordapp.net/attachments/111111111111111111/444444444444444444/reply-poster.png";
+  const record = {
+    channelId: "111111111111111111", messageId: "555555555555555555", status: "confirmed_deleted",
+    media: [{ url: body, kind: "image", source: "attachment" }],
+    reply: {
+      messageId: "666666666666666666", state: "available",
+      media: [{ url: replyVideo, posterUrl: replyPoster, kind: "video", source: "attachment" }]
+    }
+  };
+  assert.deepEqual(Core.versionMediaItems(record).map((item) => item.url), [body, replyVideo]);
+  const owners = MediaStore.expectedOwnerMap([record]);
+  for (const url of [body, replyVideo, replyPoster]) {
+    const owner = owners.get(MediaStore.mediaStorageKey(url));
+    assert.deepEqual(owner.ownerKeys, ["111111111111111111:555555555555555555"]);
+    assert.equal(owner.protected, true);
+  }
+});

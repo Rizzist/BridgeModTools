@@ -34,6 +34,8 @@ Version 2.6.6 fixes an injection-serialization bug behind “Discord author reso
 
 Version 2.6.7 removes heavy Discord scrolling lag in image-rich channels. Scroll capture is limited to changed rows, four records or five milliseconds of work per frame, and one non-resetting persistence batch per 1.25 seconds. Real lifecycle removals receive priority over Discord virtualization, hover actions no longer trigger global scans while moving, healthy MessageStore retention avoids repeated Webpack cache walks, and restored media unloads outside the viewport without losing its measured layout. Activation epochs prevent stale media capabilities from crossing iframe reloads.
 
+Version 2.7.0 and archive schema v6 preserve Discord replies as structured, immutable message context instead of one flattened line. The referenced message/channel identity, visible author presentation, bounded text fallback, attachment names, and preview-media metadata are stored once at the replying message's top level. Restored Discord rows and full History render that reply header once above every earlier edited version and the current or deleted body. Reference state is explicit: `available`, `deleted`, `unavailable`, `unknown`, or `legacy`. A target that later becomes deleted keeps its locally captured preview while showing the deletion truth; an unavailable or pruned target never causes fabricated content.
+
 Restored visual media now uses Discord-like inline sizing and spacing instead of a fixed-height generic card. Images and videos retain intrinsic dimensions up to a 550×350-pixel display box, small GIFs stay small, multiple visuals use a compact grid, and audio remains a compact native player. Cached files and plain links keep a small labeled tile.
 
 Version 2 also captures links and rendered upload/embed media. Discord-hosted images, videos, audio, voice messages, and files are downloaded immediately into an extension-owned local cache; direct third-party media can be enabled per site from the popup. Restored deleted rows and full history use the cached bytes, so supported media remains viewable or playable after the original message disappears.
@@ -80,7 +82,7 @@ Then use **Load unpacked** in `chrome://extensions` and select the cloned `Bridg
 3. Confirm that the row remains in place with a red deleted marker.
 4. Reload Discord and confirm that the saved row is restored once, without duplication.
 
-The toolbar popup shows archived, edited, saved-deleted, and cached-media counts and includes immediate local search. It can grant exact third-party origins when direct external media needs permission, pause capture, open full history, or clear everything. Full history adds status filtering, cached playback for current and earlier edited versions, JSON metadata export, per-record deletion, and delete-all.
+The toolbar popup shows archived, edited, saved-deleted, and cached-media counts and includes immediate local search. It can grant exact third-party origins when direct external media needs permission, pause capture, open full history, or clear everything. Full history adds status filtering, one compact structured-reply header per message, cached playback for current and earlier edited versions, JSON metadata export, per-record deletion, and delete-all.
 
 ## Privacy and security properties
 
@@ -93,7 +95,7 @@ The toolbar popup shows archived, edited, saved-deleted, and cached-media counts
 - The only programmatic network requests are bounded media downloads. They omit credentials and referrers, follow no cross-origin redirect, enforce MIME/size limits, and run in a packaged offscreen document. There are no remote scripts, analytics, cookies, tokens, authorization headers, Discord API calls, or ordinary browser-cache access.
 - Message metadata stays in `chrome.storage.local`; cached bodies and their local index stay in extension-origin Cache Storage/IndexedDB for the same Chrome profile.
 - Saved records survive Discord refreshes, tab/browser restarts, and MV3 service-worker suspension. Removing the extension or clearing its local history still removes them.
-- Stored metadata includes message/channel IDs, the account username, visible channel/author/content, HTTPS links and media descriptors, attachment names, timestamps, local capture/deletion times, and bounded presentation metadata. Media bytes never enter the JSON archive.
+- Stored metadata includes message/channel IDs, the account username, visible channel/author/content, structured reply identity and bounded fallback presentation, HTTPS links and media descriptors, attachment names, timestamps, local capture/deletion times, and bounded presentation metadata. Media bytes never enter the JSON archive.
 - Presentation metadata is normalized on capture, merge, load, and render. Raw Discord HTML, class names, arbitrary CSS variables, remote CSS URLs, and scripts are never stored or replayed.
 - Storage is pruned to at most 1,500 records and approximately 4 MiB of serialized record data. Deleted and edited records retain priority while a small rolling reserve keeps newly rendered messages eligible for a later lifecycle event. Per-message edit history is independently bounded to the original plus the newest revisions, at most 20 revisions and approximately 512 KiB.
 - Media is capped at 32 MiB per asset, 512 MiB total, 1,000 cached assets, and one download at a time. Downloads stream through a byte-counting limiter directly into Cache Storage, and space is reserved before each download. Old media referenced only by seen messages is evicted before deleted-message media. Record deletion and archive pruning remove unshared bodies; clear-all invalidates in-flight jobs and deletes the complete media cache.
@@ -112,7 +114,7 @@ Discord's deletion actions contain IDs but not the deleted message content. The 
 - The isolated content script archives visible text from Discord's rendered message list.
 - The main-world adapter discovers Discord's local Flux dispatcher, named `MessageStore`, and that store's registered action-handler node.
 - For a cached single or bulk deletion, the adapter marks the immutable message record `deleted: true`, writes it back through the channel's message cache, and returns before the original MessageStore removal code. Other Discord stores still receive the deletion action normally.
-- The retained native row remains only as an internal safety copy. Once deletion is persisted, the isolated script hides that row and mounts a packaged Discord-style replacement in the same list slot with captured presentation, text, links, cached media, red tint, and a deleted marker. Reduced-motion preferences are honored.
+- The retained native row remains only as an internal safety copy. Once deletion is persisted, the isolated script hides that row and mounts a packaged Discord-style replacement in the same list slot with captured presentation, structured reply context, text, links, cached media, red tint, and a deleted marker. Reduced-motion preferences are honored.
 - Native Discord group-root metadata is stored with each rendered row. After every chronological insertion, removal, or virtual-list change, a presentation-only pass recomputes restored deleted-row continuations from visible adjacency. Native live rows remain untouched, so a message Discord promotes to the top of a group keeps its real avatar, author, badges, and timestamp. Regrouping changes only restored row classes in place, preserving active media iframe and audio/video state.
 - Self-authored messages are not filtered. On a retained deletion, the isolated script immediately snapshots the still-native row before flushing storage, covering the race where you send and delete your own message before the normal capture debounce completes.
 - On later Discord loads, confirmed records are read back from `chrome.storage.local`. The extension first uses the archived neighboring message IDs, then falls back to the nearest older/newer Discord snowflake IDs currently rendered. It restores the same compact Discord-style replacement in chronological position and deduplicates by `{channelId,messageId}`, so repeated reconciliation cannot create copies. Its exterior position is balanced from the real neighboring-row geometry, including Discord's grouped/full-message spacing, without changing list height. Older saved records without presentation metadata use a generated initial avatar and formatted timestamp. The record remains searchable in the popup even when the chat view is not open.
@@ -129,6 +131,16 @@ The MAIN-to-isolated bridge shares the Discord page boundary and is therefore no
 - Live history is injected inside the matching native message payload in a closed shadow root. Discord's actual current content, avatar, name, timestamp, grouping, and edited indicator remain untouched.
 - On deletion, the one restored message row renders prior versions in yellow and the latest deleted payload in red. Revision media stays owned by the parent record and remains playable from both Discord and the full History page.
 - An intermediate version that Discord never rendered cannot be reconstructed without importing private MessageStore content, so BridgeModTools deliberately preserves the existing rendered-only trust boundary.
+
+## How structured reply preservation works
+
+- A reply reference belongs to the message, not to one editable body version. Schema v6 stores one top-level `reply` object with `messageId`, `channelId`, `guildId`, `author`, `authorId`, `authorUsername`, `avatarUrl`, `authorColor`, `content`, `fallbackText`, `attachmentNames`, `media`, and `state`. Edit revisions remain body/media snapshots and never duplicate the reply header.
+- Reply text and media are excluded from the replying message's own text/media payload. A compact referenced-media snapshot may be retained in `reply.media`, but the History page presents only its safe name/count preview rather than creating another player.
+- When the referenced record is still known locally, its current presentation and deletion status can refresh the restored header. Confirmed or suspected deletion truth takes precedence over a stale retained native snapshot. If the target later reappears, inferred deletion can retract normally.
+- Exact references resolve against a known local target record when available. Missing, pruned, cross-route, and legacy references retain their bounded visible fallback without inventing target content or author identity.
+- Schema v5 records containing only `replyPreview` migrate to `reply.fallbackText` with `state: "legacy"`. They remain visible and searchable, but cannot recover identity or live target state that was never captured.
+- Capture remains row-local inside the same changed-row scroll sampler—at most four rows or five milliseconds per frame—with no eager broker lookup per row. Reply dependency resolution uses bounded archive maps during reconciliation, and reply-only updates do not rebuild edit history or reload cached media players.
+- JSON export sanitizes reply avatar/media URLs exactly like current and historical payload media, including removal of Discord CDN signature query parameters.
 
 If private Discord internals change, the popup reports a degraded or searching state. The extension then falls back to lifecycle/removal correlation and, finally, conservative DOM inference. Modern chat interfaces also remove DOM nodes while scrolling, changing channels, or replacing a list, so the DOM-only path is labeled **suspected removed**. Its fallback requires all of these:
 
@@ -163,6 +175,7 @@ If the same live message ID reappears later, its status is retracted to **seen**
 - Discord structural rows such as date dividers share part of the message-row ID prefix. They are explicitly excluded from message-list validation so they cannot suspend persistent capture.
 - A **suspected removed** DOM fallback is not authoritative proof that a user deleted a message.
 - An edit that occurs while the message is not locally rendered/cached, or an intermediate edit that Discord replaces before it ever renders, cannot be recovered.
+- A legacy reply preview without an exact referenced message ID cannot be upgraded retroactively; its captured text remains available with an explicit legacy state.
 - Clearing Chrome extension data or removing the extension deletes its local archive unless it was exported first.
 
 ## Test and inspect
@@ -173,7 +186,7 @@ No package installation is needed. With Node.js 18 or newer:
 npm test
 ```
 
-The test suite checks deletion classification, fake Discord `MessageStore` edit/deletion lifecycle handling, live/deleted username-copy and timeout controls, trusted username recovery for saved deletions, document-bound moderation routing, fixed timeout arguments, ID-only lifecycle bridge normalization, multi-edit and edit-then-delete durability, stale-capture rejection, historical-media ownership, responsive inline media structure, dispatcher fallback, media URL/name sanitization, MIME/size/redirect enforcement, omitted credentials/referrers, storage merge/prune/search, exact manifest permissions and host scope, packaged offscreen/player files, and absence of cookie/token/remote-script primitives.
+The test suite checks deletion classification, fake Discord `MessageStore` edit/deletion lifecycle handling, structured reply capture/migration/state/rendering/export, live/deleted username-copy and timeout controls, trusted username recovery for saved deletions, document-bound moderation routing, fixed timeout arguments, ID-only lifecycle bridge normalization, multi-edit and edit-then-delete durability, stale-capture rejection, historical-media ownership, responsive inline media structure, dispatcher fallback, media URL/name sanitization, MIME/size/redirect enforcement, omitted credentials/referrers, storage merge/prune/search, exact manifest permissions and host scope, packaged offscreen/player files, and absence of cookie/token/remote-script primitives.
 
 Open `demo/index.html` in a browser for a deterministic fixture. Its controls feed fixed signals into the same pure classifier used by the extension; it does not contact Discord or write extension storage.
 
@@ -186,6 +199,6 @@ Open `demo/index.html` in a browser for a deterministic fixture. Its controls fe
 - `media/view.*` — sandboxed cached image/video/audio/file/link renderer shared by Discord rows and history.
 - `src/content.js` / `src/content.css` — rendered-message capture, native-row replacement, chronological/deduplicated restoration, and mutation checks.
 - `popup/` — capture pause/resume, counts, history shortcut, and clear.
-- `history/` — local search, filter, JSON export, and deletion controls.
+- `history/` — local search, structured reply and edit-history display, safe JSON export, and deletion controls.
 - `demo/` — deterministic visual classifier fixture.
 - `tests/` — dependency-free Node test suite and static privacy audit.

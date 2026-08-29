@@ -37,7 +37,7 @@
   let captureSequence = 0;
 
   const state = {
-    archive: Protocol.emptyArchive(), generation: 0, paused: false,
+    archive: Protocol.emptyArchive(), archiveByKey: new Map(), generation: 0, paused: false,
     route: Core.parseDiscordRoute(location.pathname), lastRouteAt: performance.now(), lastScrollAt: -Infinity,
     anchorlessEpoch: 0,
     activeList: null, listIdentity: null, snapshots: new WeakMap(), signatures: new Map(),
@@ -259,6 +259,234 @@
       }
     }
     return "";
+  }
+
+  const REPLY_SELECTOR = "[class*='repliedMessage_'], [class*='reply_']";
+
+  function discordMessageRoute(value) {
+    try {
+      const url = new URL(String(value || ""), location.href);
+      if (url.protocol !== "https:" || url.hostname !== "discord.com") return null;
+      const match = url.pathname.match(/^\/channels\/(?:(@me)|(\d{15,25}))\/(\d{15,25})\/(\d{15,25})(?:\/|$)/);
+      if (!match) return null;
+      return { guildId: match[1] ? null : match[2], channelId: match[3], messageId: match[4] };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function replyTargetMessageId(values, sourceMessageId) {
+    for (const value of values || []) {
+      const matches = String(value || "").matchAll(/message-content-(\d{15,25})/g);
+      for (const match of matches) {
+        if (match[1] !== String(sourceMessageId || "")) return match[1];
+      }
+      const identity = Core.parseMessageRowIdentity(String(value || ""));
+      if (identity?.messageId && identity.messageId !== String(sourceMessageId || "")) return identity.messageId;
+    }
+    return null;
+  }
+
+  function replyTargetRoute(replyNode, contentElement, targetMessageId) {
+    const anchors = [
+      ...(replyNode?.matches?.("a[href]") ? [replyNode] : []),
+      ...replyNode.querySelectorAll("a[href]")
+    ];
+    const candidates = anchors.map((anchor) => ({ anchor, route: discordMessageRoute(anchor.href) }))
+      .filter((candidate) => candidate.route);
+    if (targetMessageId) {
+      return candidates.find((candidate) => candidate.route.messageId === targetMessageId)?.route || null;
+    }
+    const explicit = candidates.find(({ anchor }) => {
+      if (contentElement?.contains(anchor)) return false;
+      if (anchor === replyNode) return true;
+      const signal = `${String(anchor.className || "")} ${anchor.getAttribute?.("aria-label") || ""} ${anchor.title || ""}`;
+      return /repliedMessage_|replyLink_|jump\s+to\s+message/i.test(signal);
+    });
+    return explicit?.route || null;
+  }
+
+  function replyNodeFromRow(node) {
+    const sourceIdentity = rowIdentity(node);
+    return [...node.querySelectorAll(REPLY_SELECTOR)].find((candidate) => {
+      const ownerIdentity = rowIdentity(candidate.closest(MESSAGE_SELECTOR));
+      const structuralEvidence = String(candidate.className || "").includes("repliedMessage_") ||
+        Boolean(candidate.querySelector([
+          "[id^='message-content-']", "[aria-labelledby*='message-content-']",
+          "[class*='repliedText']", "img[class*='replyAvatar_']"
+        ].join(",")));
+      return structuralEvidence && sourceIdentity?.messageId && ownerIdentity?.messageId === sourceIdentity.messageId &&
+        !candidate.parentElement?.closest(REPLY_SELECTOR);
+    }) || null;
+  }
+
+  function captureReplyMedia(replyNode) {
+    const media = [];
+    const seen = new Set();
+    const add = (raw) => {
+      const item = Core.sanitizeMediaItems([raw])[0];
+      const identity = item && Core.mediaIdentity(item.url);
+      if (!item || !identity || seen.has(identity) || media.length >= 4) return;
+      seen.add(identity);
+      media.push(item);
+    };
+    replyNode.querySelectorAll("a[href]").forEach((anchor) => {
+      const url = Core.safeMediaUrl(anchor.href);
+      if (!url) return;
+      let pathname = "";
+      try { pathname = new URL(url).pathname; } catch (_error) { return; }
+      if (!/\/(?:ephemeral-)?attachments\//.test(pathname)) return;
+      add({
+        url,
+        kind: Core.mediaKindFromUrl(url) === "link" ? "file" : Core.mediaKindFromUrl(url),
+        source: "attachment",
+        name: Core.safeMediaName(anchor.textContent || pathname.split("/").pop() || "Attachment"),
+        alt: anchor.getAttribute("aria-label") || anchor.title,
+        cacheable: true,
+        spoiler: Boolean(anchor.closest("[class*='spoiler']"))
+      });
+    });
+    replyNode.querySelectorAll("img, video, audio, source[src]").forEach((element) => {
+      if (element.closest("[class*='replyAvatar_'], [class*='avatar_'], [class*='emoji'], [class*='reaction']")) return;
+      const parentMedia = element.tagName === "SOURCE" ? element.closest("video, audio") : element;
+      const url = Core.safeMediaUrl(element.currentSrc || element.getAttribute("src") ||
+        parentMedia?.currentSrc || parentMedia?.getAttribute("src"));
+      if (!url) return;
+      const kind = parentMedia?.tagName === "VIDEO" ? "video" : parentMedia?.tagName === "AUDIO" ? "audio" : "image";
+      add({
+        url,
+        kind,
+        source: "attachment",
+        name: Core.safeMediaName(element.getAttribute("alt") || parentMedia?.getAttribute("aria-label") || "Attachment"),
+        alt: element.getAttribute("alt") || parentMedia?.getAttribute("aria-label"),
+        posterUrl: kind === "video" ? Core.safeMediaUrl(parentMedia?.poster || parentMedia?.getAttribute("poster")) : null,
+        cacheable: true,
+        spoiler: Boolean(element.closest("[class*='spoiler']"))
+      });
+    });
+    return media;
+  }
+
+  function capturedReplyState(replyNode, fallbackText) {
+    const deletedStructure = replyNode.querySelector("[class*='deleted_']");
+    const placeholder = replyNode.querySelector("[class*='repliedTextPlaceholder_']");
+    if (deletedStructure || placeholder && /original message was deleted|deleted message/i.test(fallbackText)) {
+      return "deleted";
+    }
+    // Placeholder wording is localized and may also represent a target that
+    // Discord cannot load. Ordinary quoted text alone never determines state.
+    return placeholder ? "unavailable" : "available";
+  }
+
+  function captureReply(node, sourceIdentity, route, options) {
+    const replyNode = replyNodeFromRow(node);
+    if (!replyNode) return null;
+    if (options?.minimal) {
+      return Core.sanitizeReply({
+        channelId: route?.channelId || sourceIdentity?.channelId,
+        guildId: route?.guildId,
+        fallbackText: "Reply",
+        state: "unknown"
+      });
+    }
+    const authorElement = replyNode.querySelector("[class*='username_'], [data-author-id] [data-text]");
+    const contentElement = replyNode.querySelector([
+      "[class*='repliedTextContent_']", "[class*='repliedTextPreview_']",
+      "[class*='textPreview_']", "[class*='messageContent_']"
+    ].join(","));
+    const structuralTargetMessageId = replyTargetMessageId([
+      replyNode.id,
+      replyNode.getAttribute("aria-labelledby"),
+      replyNode.getAttribute("data-list-item-id"),
+      ...[...replyNode.querySelectorAll("[id], [aria-labelledby], [data-list-item-id]")].flatMap((element) => [
+        element.id,
+        element.getAttribute("aria-labelledby"),
+        element.getAttribute("data-list-item-id")
+      ])
+    ], sourceIdentity?.messageId);
+    // A Discord-message link inside the quoted text is ordinary content, not
+    // necessarily the message being replied to. Prefer structural IDs and use
+    // only an explicit reply/jump anchor as an identity fallback.
+    const targetRoute = replyTargetRoute(replyNode, contentElement, structuralTargetMessageId);
+    const targetMessageId = structuralTargetMessageId || targetRoute?.messageId || null;
+    const replyAvatar = replyNode.querySelector("img[class*='replyAvatar_'], img[class*='avatar_'], [class*='replyAvatar_'] img");
+    const avatarUrl = normalizedAvatarUrl(replyAvatar?.currentSrc || replyAvatar?.getAttribute("src") || "");
+    const fallbackText = visibleElementText(replyNode).slice(0, 500);
+    const replyState = capturedReplyState(replyNode, fallbackText);
+    const media = captureReplyMedia(replyNode);
+    const attachmentNames = [...new Set([
+      ...[...replyNode.querySelectorAll("[class*='fileName_'], [class*='attachmentName_']")]
+        .map((element) => Core.safeMediaName(element.textContent)),
+      ...media.filter((item) => item.source === "attachment").map((item) => Core.safeMediaName(item.name))
+    ].filter(Boolean))].slice(0, 12);
+    const content = String(contentElement?.innerText || contentElement?.textContent || "")
+      .replace(/\r\n?/g, "\n").slice(0, 2000);
+    let authorColor = null;
+    try { authorColor = Core.safePresentationColor(authorElement && getComputedStyle(authorElement).color); } catch (_error) {}
+    return Core.sanitizeReply({
+      messageId: targetMessageId,
+      channelId: targetRoute?.channelId || route?.channelId || sourceIdentity?.channelId,
+      guildId: targetRoute ? targetRoute.guildId : route?.guildId,
+      author: visibleElementText(authorElement),
+      authorId: authorIdFromNode(replyNode, authorElement, avatarUrl),
+      authorUsername: authorElement?.getAttribute("data-username"),
+      avatarUrl,
+      authorColor,
+      content,
+      fallbackText,
+      attachmentNames,
+      media,
+      state: replyState
+    });
+  }
+
+  function archivedReplyTarget(record, replyValue) {
+    const reply = replyValue || Core.sanitizeReply(record?.reply, record?.replyPreview);
+    if (!reply?.messageId || !reply.channelId || reply.channelId !== record?.channelId) return null;
+    return state.archiveByKey.get(`${reply.channelId}:${reply.messageId}`) || null;
+  }
+
+  function resolveReplyAgainstTarget(reply, target) {
+    if (!reply || !target) return reply;
+    return Core.sanitizeReply({
+      messageId: reply.messageId,
+      channelId: reply.channelId,
+      guildId: Core.snowflakeValue(target.guildId) || reply.guildId,
+      author: target.author || reply.author,
+      authorId: target.authorId || reply.authorId,
+      authorUsername: target.authorUsername || reply.authorUsername,
+      avatarUrl: target.avatarUrl || reply.avatarUrl,
+      authorColor: target.authorColor || reply.authorColor,
+      content: Object.prototype.hasOwnProperty.call(target, "content") ? target.content : reply.content,
+      fallbackText: reply.fallbackText,
+      attachmentNames: target.attachments?.length ? target.attachments : reply.attachmentNames,
+      media: target.media?.length ? target.media : reply.media,
+      state: reply.state === "deleted" || Core.isDeletedStatus(target.status) ? "deleted" : "available"
+    });
+  }
+
+  function resolvedReply(record) {
+    const reply = Core.sanitizeReply(record?.reply, record?.replyPreview);
+    const target = archivedReplyTarget(record, reply);
+    return resolveReplyAgainstTarget(reply, target);
+  }
+
+  function capturedReply(record, replyValue) {
+    const reply = Core.sanitizeReply(replyValue);
+    if (!reply?.messageId || !reply.channelId || reply.channelId !== record?.channelId) return reply;
+    const key = `${reply.channelId}:${reply.messageId}`;
+    const archived = state.archiveByKey.get(key) || null;
+    // A retained Discord row can remain stale after deletion; authoritative
+    // archived deletion truth must beat that visible snapshot. Otherwise the
+    // freshest rendered target gives this source reply a durable full preview.
+    const visible = state.snapshotsByKey.get(key)?.record || null;
+    const target = Core.isDeletedStatus(archived?.status) ? archived : visible || archived;
+    return resolveReplyAgainstTarget(reply, target);
+  }
+
+  function recordHasCacheableMedia(record) {
+    return [record, ...(record?.editHistory || [])].some((version) =>
+      Core.versionMediaItems(version).some((item) => item.cacheable));
   }
 
   function groupRootFromNode(node, messageId) {
@@ -626,13 +854,12 @@
     }
   }
 
-  function presentationFromNode(node, timeElement) {
+  function presentationFromNode(node, timeElement, replyValue) {
     const route = Core.parseDiscordRoute(location.pathname);
     const identity = rowIdentity(node);
     const authorElement = authorNameElement(node);
     const authorStyle = captureAuthorStyle(authorElement);
     const presentationRow = authorElement?.closest(MESSAGE_SELECTOR) || node;
-    const reply = node.querySelector("[class*='repliedMessage_'], [class*='reply_']");
     const avatarUrl = safeAvatarUrl(presentationRow);
     return {
       avatarUrl,
@@ -643,7 +870,7 @@
       authorStyle,
       authorBadges: captureAuthorBadges(authorElement),
       displayTimestamp: visibleElementText(timeElement) || null,
-      replyPreview: Core.normalizeText(reply?.textContent).slice(0, 500) || null
+      reply: Core.sanitizeReply(replyValue)
     };
   }
 
@@ -654,7 +881,8 @@
     const media = captureMedia(node, identity.messageId);
     const attachments = media.filter((item) => item.source === "attachment").map((item) => item.name).slice(0, 12);
     const content = allContent(node, identity.messageId);
-    if (!content && !attachments.length && !media.length) return null;
+    const reply = capturedReply({ channelId: route.channelId }, captureReply(node, identity, route));
+    if (!content && !attachments.length && !media.length && !reply) return null;
     const timeElement = node.querySelector("time[datetime]");
     const groupRootMessageId = groupRootFromNode(node, identity.messageId);
     return Core.sanitizeRecordPresentation(Object.assign({
@@ -667,7 +895,7 @@
       sourceContinuation: Boolean(groupRootMessageId && groupRootMessageId !== identity.messageId),
       capturedAt: now, updatedAt: now, status: "seen",
       captureSessionId, captureSequence: captureSequence += 1
-    }, presentationFromNode(node, timeElement)));
+    }, presentationFromNode(node, timeElement, reply)));
   }
 
   function recordSignature(record) {
@@ -675,7 +903,7 @@
       record.author, record.content, record.messageTimestamp, record.channelName, record.attachments,
       record.avatarUrl, record.authorId, record.authorUsername, record.authorColor, record.authorStyle, record.authorBadges,
       record.groupRootMessageId, record.sourceContinuation,
-      record.displayTimestamp, record.replyPreview, record.media
+      record.displayTimestamp, Core.sanitizeReply(record.reply, record.replyPreview), record.media
     ]);
   }
 
@@ -710,7 +938,7 @@
           for (const item of items) {
             if (persistedKeys.has(Core.recordKey(item.record))) state.signatures.set(Core.recordKey(item.record), item.signature);
           }
-          const mediaKeys = records.filter((record) => record.media?.some((item) => item.cacheable))
+          const mediaKeys = records.filter(recordHasCacheableMedia)
             .map(Core.recordKey).filter((key) => persistedKeys.has(key));
           if (mediaKeys.length) send({ type: T.CACHE_MEDIA, generation, keys: mediaKeys }).catch(() => {});
         }
@@ -778,6 +1006,7 @@
       removeEditHistories();
     }
     state.archive = archive;
+    state.archiveByKey = new Map(archive.records.map((record) => [Core.recordKey(record), record]));
     state.archiveInitialized = true;
     state.generation = incomingGeneration;
     state.paused = Boolean(archive.paused);
@@ -792,8 +1021,7 @@
 
   function requestMediaRecovery(archive) {
     if (!archive || archive.paused || performance.now() - state.lastMediaRecoveryAt < 5 * 60 * 1000) return;
-    const keys = archive.records.filter((record) => [record, ...(record.editHistory || [])]
-      .some((version) => version.media?.some((item) => item.cacheable)))
+    const keys = archive.records.filter(recordHasCacheableMedia)
       .map(Core.recordKey);
     state.lastMediaRecoveryAt = performance.now();
     for (let offset = 0; offset < keys.length; offset += 200) {
@@ -1272,7 +1500,7 @@
     const avatarUrl = safeAvatarUrl(presentationRow);
     const timeElement = node.querySelector("time[datetime]");
     const groupRootMessageId = groupRootFromNode(node, identity.messageId);
-    const reply = node.querySelector("[class*='repliedMessage_'], [class*='reply_']");
+    const reply = captureReply(node, identity, state.route, { minimal: true });
     return Core.sanitizeRecordPresentation({
       messageId: identity.messageId,
       channelId: identity.channelId || state.route?.channelId,
@@ -1287,7 +1515,7 @@
       messageTimestamp: timeElement?.getAttribute("datetime") || null,
       groupRootMessageId,
       sourceContinuation: Boolean(groupRootMessageId && groupRootMessageId !== identity.messageId),
-      replyPreview: Core.normalizeText(reply?.textContent).slice(0, 500) || null
+      reply
     });
   }
 
@@ -1306,9 +1534,10 @@
             previous = null;
             continue;
           }
-          let continues = Core.messageContinues(previous, record);
+          const hasReply = Boolean(Core.sanitizeReply(record.reply, record.replyPreview));
+          let continues = !hasReply && Core.messageContinues(previous, record);
           const capturedRoot = Core.snowflakeValue(record.groupRootMessageId);
-          if (!continues && capturedRoot && capturedRoot !== record.messageId) {
+          if (!continues && !hasReply && capturedRoot && capturedRoot !== record.messageId) {
             // A surviving native row may have been promoted to a new full root
             // after this deleted continuation was captured under the old root.
             // Reconcile that stale non-self root only through the strict stable
@@ -1543,11 +1772,18 @@
       .profile-trigger:disabled { cursor:default; }
       .profile-trigger:focus-visible { outline:2px solid #00a8fc; outline-offset:2px; }
       .avatar { display:grid; place-items:center; width:40px; height:40px; margin:0; padding:0; overflow:hidden; border-radius:50%; background:#5865f2; color:#fff; font-size:17px; font-weight:700; user-select:none; }
+      .message.has-reply .avatar { margin-top:20px; }
       .avatar:not(:disabled):hover { box-shadow:0 0 0 2px rgb(255 255 255 / 20%); }
       .avatar img { width:100%; height:100%; object-fit:cover; }
       .body { min-width:0; }
-      .reply { position:relative; margin:-1px 0 2px; padding-left:18px; overflow:hidden; color:#b5bac1; font-size:13px; line-height:18px; text-overflow:ellipsis; white-space:nowrap; }
-      .reply::before { content:""; position:absolute; left:2px; top:8px; width:11px; border-top:2px solid #4e5058; }
+      .reply { position:relative; display:flex; align-items:center; min-width:0; height:20px; margin:-2px 0 2px; color:#b5bac1; font-size:13px; line-height:18px; white-space:nowrap; }
+      .reply::before { content:""; position:absolute; left:-36px; top:9px; width:27px; height:12px; border-left:2px solid #4e5058; border-top:2px solid #4e5058; border-radius:6px 0 0; }
+      .reply-avatar { flex:0 0 auto; width:16px; height:16px; margin-right:4px; border-radius:50%; object-fit:cover; }
+      .reply-author { flex:0 0 auto; max-width:35%; margin-right:4px; overflow:hidden; color:#f2f3f5; font-weight:500; text-overflow:ellipsis; }
+      .reply-preview { min-width:0; overflow:hidden; color:#b5bac1; text-overflow:ellipsis; }
+      .reply-state { flex:0 0 auto; margin-left:4px; color:#949ba4; font-size:10px; font-weight:700; }
+      .reply-state.deleted { color:#ff6b70; }
+      .reply-state.edited { color:#f5c451; }
       .header { display:flex; align-items:baseline; min-width:0; line-height:22px; }
       .author-group { display:inline-flex; align-items:center; min-width:0; gap:4px; }
       .author { display:inline-block; min-width:0; margin:0; padding:0; overflow:hidden; background:transparent; color:#f2f3f5; font-size:16px; font-weight:400; line-height:inherit; text-align:left; text-overflow:ellipsis; white-space:nowrap; }
@@ -1603,6 +1839,18 @@
     const reply = document.createElement("div");
     reply.className = "reply";
     reply.hidden = true;
+    const replyAvatar = document.createElement("img");
+    replyAvatar.className = "reply-avatar";
+    replyAvatar.alt = "";
+    replyAvatar.hidden = true;
+    replyAvatar.addEventListener("error", () => { replyAvatar.hidden = true; });
+    const replyAuthor = document.createElement("span");
+    replyAuthor.className = "reply-author";
+    const replyPreview = document.createElement("span");
+    replyPreview.className = "reply-preview";
+    const replyState = document.createElement("span");
+    replyState.className = "reply-state";
+    reply.append(replyAvatar, replyAuthor, replyPreview, replyState);
     const header = document.createElement("header");
     header.className = "header";
     const authorGroup = document.createElement("span");
@@ -1674,6 +1922,7 @@
     let continuation = false;
     let historySignature = "";
     let renderSignature = "";
+    let replySignature = "";
     let historyDisposers = [];
     const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
@@ -1775,11 +2024,15 @@
     const render = (record) => {
       lastRecord = record;
       const name = record.author || "Unknown author";
+      const nextReply = resolvedReply(record);
+      const replyTarget = archivedReplyTarget(record, nextReply);
+      const replyTargetEdited = Boolean(replyTarget && Core.hasEdits(replyTarget));
       const nextAuthorIdentity = resolvedAuthorIdentity(
         record.channelId, record.messageId, record.authorId, record.authorUsername);
       const nextRenderSignature = JSON.stringify([
         recordSignature(record), record.status, Core.sanitizeEditHistory(record.editHistory),
-        nextAuthorIdentity.userId, nextAuthorIdentity.username
+        nextAuthorIdentity.userId, nextAuthorIdentity.username, nextReply,
+        replyTarget?.status, replyTarget?.editHistory?.length || 0
       ]);
       if (nextRenderSignature === renderSignature) return;
       renderSignature = nextRenderSignature;
@@ -1809,8 +2062,35 @@
       replaceText(timestamp, time.display);
       timestamp.dateTime = time.dateTime;
       timestamp.title = time.title;
-      reply.hidden = !record.replyPreview;
-      replaceText(reply, record.replyPreview || "");
+      const nextReplySignature = JSON.stringify([nextReply, replyTarget?.status, replyTargetEdited]);
+      if (nextReplySignature !== replySignature) {
+        replySignature = nextReplySignature;
+        reply.hidden = !nextReply;
+        article.classList.toggle("has-reply", Boolean(nextReply));
+        const replyName = nextReply?.author || "";
+        const preview = nextReply?.content || nextReply?.attachmentNames?.[0] ||
+          nextReply?.media?.[0]?.alt || nextReply?.media?.[0]?.name || nextReply?.fallbackText || "Referenced message";
+        replaceText(replyAuthor, replyName);
+        replyAuthor.hidden = !replyName;
+        if (nextReply?.authorColor) replyAuthor.style.color = nextReply.authorColor;
+        else replyAuthor.style.removeProperty("color");
+        replaceText(replyPreview, preview);
+        const stateLabel = nextReply?.state === "deleted" ? "• DELETED"
+          : nextReply?.state === "unavailable" ? "• UNAVAILABLE"
+            : replyTargetEdited ? "• EDITED" : "";
+        replaceText(replyState, stateLabel);
+        replyState.classList.toggle("deleted", nextReply?.state === "deleted");
+        replyState.classList.toggle("edited", nextReply?.state !== "deleted" && replyTargetEdited);
+        replyState.hidden = !stateLabel;
+        const replyAvatarUrl = normalizedAvatarUrl(nextReply?.avatarUrl);
+        replyAvatar.hidden = !replyAvatarUrl;
+        if (replyAvatarUrl) replyAvatar.src = replyAvatarUrl;
+        else replyAvatar.removeAttribute("src");
+        if (nextReply) {
+          reply.setAttribute("aria-label", `${replyName ? `Reply to ${replyName}: ` : "Reply: "}${preview}${stateLabel ? ` ${stateLabel}` : ""}`);
+        } else reply.removeAttribute("aria-label");
+        scheduleTombstoneSpacing();
+      }
       replaceText(content, record.content || "");
       const revisions = Core.sanitizeEditHistory(record.editHistory);
       host.dataset.ldmaEditCount = String(revisions.length);
@@ -1841,7 +2121,7 @@
       article.setAttribute("aria-label", `${name}, ${revisions.length ? `${revisions.length} earlier edited version${revisions.length === 1 ? "" : "s"}, ` : ""}deleted message preserved locally`);
     };
     render.setContinuation = (value) => {
-      const next = Boolean(value);
+      const next = Boolean(value) && !Core.sanitizeReply(lastRecord?.reply, lastRecord?.replyPreview);
       if (next === continuation) return;
       continuation = next;
       article.classList.toggle("continuation", continuation);
@@ -1859,6 +2139,7 @@
       if (authorAnimation) authorAnimation.cancel();
       authorAnimation = null;
       avatarImage.removeAttribute("src");
+      replyAvatar.removeAttribute("src");
       badges.replaceChildren();
       historyDisposers.forEach((dispose) => dispose());
       historyDisposers = [];

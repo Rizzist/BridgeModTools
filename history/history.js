@@ -10,7 +10,7 @@
   const summary = document.getElementById("summary");
   const exportButton = document.getElementById("export");
   const clearButton = document.getElementById("clear");
-  let archive = { version: 5, generation: 0, paused: false, records: [] };
+  let archive = { version: 6, generation: 0, paused: false, records: [] };
   const recordViews = new Map();
   let lastMediaRecoveryAt = -Infinity;
 
@@ -74,7 +74,51 @@
     return Number.isNaN(date.valueOf()) ? "Time unavailable" : date.toLocaleString();
   }
 
-  function createRecordView(initialRecord) {
+  function replyStateLabel(value) {
+    const state = String(value || "").toLocaleLowerCase();
+    if (state === "deleted") return "DELETED";
+    if (state === "unavailable") return "UNAVAILABLE";
+    if (state === "unknown") return "UNKNOWN";
+    if (state === "legacy") return "CACHED PREVIEW";
+    return "";
+  }
+
+  function replyPreviewText(reply) {
+    if (!reply || typeof reply !== "object") return "";
+    const content = String(reply.content || "").trim();
+    if (content) return content;
+    const names = (Array.isArray(reply.attachmentNames) ? reply.attachmentNames : [])
+      .map((name) => Core.safeMediaName(name)).filter(Boolean);
+    if (names.length) return `Attachment: ${names.join(", ")}`;
+    const media = Core.sanitizeMediaItems(reply.media);
+    if (media.length) return media.length === 1
+      ? media[0].name || `${media[0].kind || "Media"} attachment`
+      : `${media.length} media attachments`;
+    const fallback = String(reply.fallbackText || "").trim();
+    if (fallback) return fallback;
+    return "Referenced message";
+  }
+
+  function resolvedReply(record, recordsByKey) {
+    const reply = Core.sanitizeReply(record?.reply, record?.replyPreview);
+    if (!reply?.messageId || !reply.channelId) return reply;
+    const target = recordsByKey?.get(`${reply.channelId}:${reply.messageId}`);
+    if (!target) return reply;
+    return Core.sanitizeReply(Object.assign({}, reply, {
+      guildId: target.guildId || reply.guildId,
+      author: target.author || reply.author,
+      authorId: target.authorId || reply.authorId,
+      authorUsername: target.authorUsername || reply.authorUsername,
+      avatarUrl: target.avatarUrl || reply.avatarUrl,
+      authorColor: target.authorColor || reply.authorColor,
+      content: Object.prototype.hasOwnProperty.call(target, "content") ? target.content : reply.content,
+      attachmentNames: target.attachments?.length ? target.attachments : reply.attachmentNames,
+      media: target.media?.length ? target.media : reply.media,
+      state: reply.state === "deleted" || Core.isDeletedStatus(target.status) ? "deleted" : "available"
+    }));
+  }
+
+  function createRecordView(initialRecord, initialReply) {
     let record = initialRecord;
     const key = Core.recordKey(initialRecord);
     const article = document.createElement("article");
@@ -95,7 +139,28 @@
     deleteButton.textContent = "Delete record";
     deleteButton.addEventListener("click", () => deleteOne(record));
     top.append(heading, deleteButton);
-    article.append(top);
+    const replyView = document.createElement("section");
+    replyView.className = "record__reply";
+    replyView.setAttribute("aria-label", "Referenced message");
+    replyView.hidden = true;
+    const replyAvatar = document.createElement("img");
+    replyAvatar.className = "record__reply-avatar";
+    replyAvatar.alt = "";
+    replyAvatar.referrerPolicy = "no-referrer";
+    replyAvatar.hidden = true;
+    const replyBody = document.createElement("div");
+    replyBody.className = "record__reply-body";
+    const replyHeading = document.createElement("div");
+    replyHeading.className = "record__reply-heading";
+    const replyAuthor = document.createElement("strong");
+    replyAuthor.className = "record__reply-author";
+    const replyState = document.createElement("span");
+    replyState.className = "record__reply-state";
+    replyHeading.append(replyAuthor, replyState);
+    const replyContent = document.createElement("div");
+    replyContent.className = "record__reply-content";
+    replyBody.append(replyHeading, replyContent);
+    replyView.append(replyAvatar, replyBody);
     const content = document.createElement("p");
     content.className = "record__content";
     const attachments = document.createElement("p");
@@ -103,12 +168,49 @@
     const revisions = document.createElement("div");
     revisions.className = "record__revisions";
     revisions.setAttribute("aria-label", "Earlier edited versions");
-    article.append(revisions, content, attachments);
+    // A Discord reply reference is immutable message-level context. Render it
+    // once above every earlier edit revision and the current payload.
+    article.append(top, replyView, revisions, content, attachments);
     let frame = null;
     let disposeFrame = null;
     let currentMediaSignature = "";
     let revisionDisposers = [];
     let revisionSignature = "";
+    let replySignature = "";
+
+    function updateReply(value) {
+      const reply = Core.sanitizeReply(value);
+      const nextSignature = JSON.stringify(reply);
+      if (nextSignature === replySignature) return;
+      replySignature = nextSignature;
+      replyView.hidden = !reply;
+      if (!reply) {
+        replyAvatar.hidden = true;
+        replyAvatar.removeAttribute("src");
+        replyAuthor.textContent = "";
+        replyAuthor.style.removeProperty("color");
+        replyState.textContent = "";
+        replyState.hidden = true;
+        replyContent.textContent = "";
+        replyView.removeAttribute("data-state");
+        return;
+      }
+      const state = String(reply.state || "unknown").toLocaleLowerCase();
+      const stateLabel = replyStateLabel(state);
+      const avatarUrl = Core.safeDiscordAssetUrl(reply.avatarUrl);
+      replyView.dataset.state = state;
+      replyAvatar.hidden = !avatarUrl;
+      if (avatarUrl) replyAvatar.src = avatarUrl;
+      else replyAvatar.removeAttribute("src");
+      replyAuthor.textContent = reply.author || "Referenced message";
+      const authorColor = Core.safePresentationColor(reply.authorColor);
+      if (authorColor) replyAuthor.style.color = authorColor;
+      else replyAuthor.style.removeProperty("color");
+      replyState.textContent = stateLabel;
+      replyState.hidden = !stateLabel;
+      replyContent.textContent = replyPreviewText(reply);
+      replyView.setAttribute("aria-label", `${reply.author || "Referenced message"}: ${replyPreviewText(reply)}${stateLabel ? `, ${stateLabel.toLocaleLowerCase()}` : ""}`);
+    }
 
     function ensureMediaFrame() {
       if (frame) return frame;
@@ -119,7 +221,7 @@
       return frame;
     }
 
-    function update(nextRecord) {
+    function update(nextRecord, nextReply) {
       record = nextRecord;
       const deleted = Core.isDeletedStatus(record.status);
       const confirmed = record.status === "confirmed_deleted";
@@ -132,6 +234,7 @@
       const editCount = record.editHistory?.length || 0;
       badge.textContent = `${lifecycle}${editCount ? ` · Edited ${editCount}×` : ""}`;
       metaText.data = `${record.channelName || record.channelId || "Unknown channel"} · ${formatDate(record.messageTimestamp || record.capturedAt)}`;
+      updateReply(nextReply);
       content.hidden = !record.content;
       content.textContent = record.content || "";
       attachments.hidden = !record.attachments?.length;
@@ -184,7 +287,7 @@
       }
     }
 
-    update(initialRecord);
+    update(initialRecord, initialReply);
     return {
       element: article,
       update,
@@ -198,6 +301,7 @@
 
   function render() {
     const filtered = Core.searchRecords(archive.records, search.value, statusFilter.value);
+    const recordsByKey = new Map(archive.records.map((record) => [Core.recordKey(record), record]));
     const liveKeys = new Set(archive.records.map(Core.recordKey));
     for (const [key, view] of recordViews) {
       if (liveKeys.has(key)) continue;
@@ -209,11 +313,12 @@
     filtered.forEach((record, index) => {
       const key = Core.recordKey(record);
       let view = recordViews.get(key);
+      const reply = resolvedReply(record, recordsByKey);
       if (!view) {
-        view = createRecordView(record);
+        view = createRecordView(record, reply);
         recordViews.set(key, view);
         recordsElement.append(view.element);
-      } else view.update(record);
+      } else view.update(record, reply);
       view.element.hidden = false;
       view.element.style.order = String(index);
     });
@@ -235,13 +340,24 @@
         url: Core.exportMediaUrl(item.url),
         posterUrl: item.posterUrl ? Core.exportMediaUrl(item.posterUrl) : undefined
       }));
+    const exportReply = (reply) => {
+      const safeReply = Core.sanitizeReply(reply);
+      if (!safeReply) return undefined;
+      const exported = Object.assign({}, safeReply, { media: exportMedia(safeReply.media) });
+      const avatarUrl = Core.safeDiscordAssetUrl(safeReply.avatarUrl);
+      if (avatarUrl) exported.avatarUrl = Core.exportMediaUrl(avatarUrl);
+      else delete exported.avatarUrl;
+      return exported;
+    };
     const records = archive.records.map((record) => Object.assign({}, record, {
+      reply: exportReply(record.reply),
       media: exportMedia(record.media),
       editHistory: (record.editHistory || []).map((revision) => Object.assign({}, revision, {
         media: exportMedia(revision.media)
       }))
     }));
     const payload = {
+      archiveVersion: archive.version,
       exportedAt: new Date().toISOString(),
       source: "BridgeModTools",
       note: "Retained deletions were preserved in Discord's local MessageStore; lifecycle deletions correlate a local signal with row removal; suspected removals use conservative DOM observation.",

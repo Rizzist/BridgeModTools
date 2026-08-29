@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const Core = require("../src/core.js");
 
 const source = fs.readFileSync(path.join(__dirname, "../src/content.js"), "utf8");
 
@@ -14,6 +15,198 @@ function productionFunctions(startName, endName) {
   assert.ok(start >= 0 && end > start, `production function boundaries: ${startName} / ${endName}`);
   return source.slice(start, end);
 }
+
+function productionReplyHelpers() {
+  const start = source.indexOf("  const REPLY_SELECTOR");
+  const end = source.indexOf("  function groupRootFromNode(", start);
+  assert.ok(start >= 0 && end > start, "production structured-reply helper boundaries");
+  return source.slice(start, end);
+}
+
+test("structured replies validate routes, sanitize exact fields, and resolve a same-channel archive target", () => {
+  const context = vm.createContext({
+    URL,
+    MESSAGE_SELECTOR: "message-row",
+    location: { href: "https://discord.com/channels/333333333333333333/444444444444444444/666666666666666666" },
+    Core,
+    rowIdentity: (node) => node?.identity || null,
+    state: {
+      archive: {
+        records: [{
+          messageId: "555555555555555555",
+          channelId: "444444444444444444",
+          guildId: "333333333333333333",
+          author: "Target author",
+          authorId: "777777777777777777",
+          authorUsername: "target.user",
+          content: "latest cached target",
+          attachments: ["proof.png"],
+          media: [],
+          status: "confirmed_deleted"
+        }]
+      },
+      archiveByKey: new Map([["444444444444444444:555555555555555555", {
+        messageId: "555555555555555555",
+        channelId: "444444444444444444",
+        guildId: "333333333333333333",
+        author: "Target author",
+        authorId: "777777777777777777",
+        authorUsername: "target.user",
+        content: "latest cached target",
+        attachments: ["proof.png"],
+        media: [],
+        status: "confirmed_deleted"
+      }]]),
+      snapshotsByKey: new Map()
+    }
+  });
+  vm.runInContext(`${productionReplyHelpers()}
+    globalThis.discordMessageRoute = discordMessageRoute;
+    globalThis.replyTargetMessageId = replyTargetMessageId;
+    globalThis.replyTargetRoute = replyTargetRoute;
+    globalThis.replyNodeFromRow = replyNodeFromRow;
+    globalThis.capturedReplyState = capturedReplyState;
+    globalThis.resolvedReply = resolvedReply;
+    globalThis.capturedReply = capturedReply;
+    globalThis.recordHasCacheableMedia = recordHasCacheableMedia;`, context);
+
+  assert.deepEqual(JSON.parse(JSON.stringify(context.discordMessageRoute(
+    "/channels/333333333333333333/444444444444444444/555555555555555555"
+  ))), {
+    guildId: "333333333333333333",
+    channelId: "444444444444444444",
+    messageId: "555555555555555555"
+  });
+  assert.equal(context.discordMessageRoute("https://example.com/channels/333/444/555"), null);
+  assert.equal(context.replyTargetMessageId([
+    "message-reply-context-666666666666666666 message-content-555555555555555555"
+  ], "666666666666666666"), "555555555555555555");
+  const quotedContent = { contains: (candidate) => candidate === quotedLink };
+  const quotedLink = {
+    href: "https://discord.com/channels/333333333333333333/444444444444444444/888888888888888888",
+    className: "anchor_abc", title: "",
+    getAttribute: () => null
+  };
+  const replyRoot = {
+    matches: () => false,
+    querySelectorAll: () => [quotedLink]
+  };
+  assert.equal(context.replyTargetRoute(replyRoot, quotedContent, "555555555555555555"), null,
+    "a Discord-message link inside quoted content cannot replace the structural reply target");
+  const jumpLink = {
+    href: "https://discord.com/channels/333333333333333333/444444444444444444/555555555555555555",
+    className: "replyLink_abc", title: "",
+    getAttribute: () => "Jump to message"
+  };
+  replyRoot.querySelectorAll = () => [jumpLink];
+  assert.equal(context.replyTargetRoute(replyRoot, { contains: () => false }, null).messageId,
+    "555555555555555555");
+  const liveReply = { querySelector: () => null };
+  assert.equal(context.capturedReplyState(liveReply, "I deleted message history yesterday"), "available");
+  assert.equal(context.capturedReplyState(liveReply, "this file is not available yet"), "available");
+  const deletedPlaceholder = {
+    querySelector: (selector) => selector.includes("repliedTextPlaceholder_") ? {} : null
+  };
+  assert.equal(context.capturedReplyState(deletedPlaceholder, "Original message was deleted"), "deleted");
+  assert.equal(context.capturedReplyState(deletedPlaceholder, "Localized unavailable placeholder"), "unavailable");
+  const innerOwner = { identity: { messageId: "666666666666666666" } };
+  const replyCandidate = {
+    className: "repliedMessage_a1b2c3",
+    closest: () => innerOwner,
+    querySelector: () => null,
+    parentElement: { closest: () => null }
+  };
+  const outerRow = {
+    identity: { messageId: "666666666666666666" },
+    querySelectorAll: () => [replyCandidate]
+  };
+  assert.equal(context.replyNodeFromRow(outerRow), replyCandidate,
+    "an inner Discord article may own a reply rendered inside its outer list row");
+  const ordinaryReplyControl = Object.assign({}, replyCandidate, {
+    className: "reply_button",
+    querySelector: () => null
+  });
+  assert.equal(context.replyNodeFromRow(Object.assign({}, outerRow, {
+    querySelectorAll: () => [ordinaryReplyControl]
+  })), null, "a generic reply action is not captured as replied-message context");
+
+  const sourceRecord = {
+    messageId: "666666666666666666",
+    channelId: "444444444444444444",
+    guildId: "333333333333333333",
+    reply: {
+      messageId: "555555555555555555",
+      channelId: "444444444444444444",
+      guildId: "333333333333333333",
+      author: "Earlier author",
+      authorId: "777777777777777777",
+      authorUsername: "target.user",
+      avatarUrl: "https://cdn.discordapp.com/avatars/777777777777777777/hash.webp",
+      authorColor: "rgb(10, 20, 30)",
+      content: "earlier preview",
+      fallbackText: "Earlier author earlier preview",
+      attachmentNames: ["proof.png", "proof.png"],
+      media: [],
+      state: "available"
+    }
+  };
+  const resolved = JSON.parse(JSON.stringify(context.resolvedReply(sourceRecord)));
+  assert.equal(resolved.content, "latest cached target");
+  assert.equal(resolved.author, "Target author");
+  assert.equal(resolved.state, "deleted");
+  assert.deepEqual(resolved.attachmentNames, ["proof.png"]);
+  assert.deepEqual(Object.keys(resolved).sort(), [
+    "attachmentNames", "author", "authorColor", "authorId", "authorUsername", "avatarUrl",
+    "channelId", "content", "fallbackText", "guildId", "messageId", "state"
+  ].sort());
+  const targetKey = "444444444444444444:555555555555555555";
+  context.state.archiveByKey.set(targetKey, {
+    ...context.state.archiveByKey.get(targetKey), status: "seen", content: "older archive"
+  });
+  context.state.snapshotsByKey.set(targetKey, { record: {
+    ...context.state.archiveByKey.get(targetKey), content: "fresh rendered target", status: "seen"
+  } });
+  assert.equal(context.capturedReply(sourceRecord, sourceRecord.reply).content, "fresh rendered target",
+    "capture embeds the freshest rendered target snapshot into the durable source reply");
+  context.state.archiveByKey.set(targetKey, {
+    ...context.state.archiveByKey.get(targetKey), status: "confirmed_deleted", content: "deleted truth"
+  });
+  assert.equal(context.capturedReply(sourceRecord, sourceRecord.reply).content, "deleted truth",
+    "archived deletion truth beats a stale retained target row");
+  assert.equal(context.recordHasCacheableMedia({
+    reply: {
+      fallbackText: "Image attachment",
+      state: "available",
+      media: [{
+        url: "https://cdn.discordapp.com/attachments/111111111111111111/222222222222222222/reply.png",
+        kind: "image",
+        source: "attachment",
+        cacheable: true
+      }]
+    }
+  }), true);
+});
+
+test("reply media participates in persistence without adding an eager page-world resolver", () => {
+  const helpers = productionReplyHelpers();
+  assert.doesNotMatch(helpers, /send\(|RESOLVE_MESSAGE_AUTHORS|requestPageHook/);
+  assert.match(helpers, /replyNodeFromRow/);
+  assert.match(helpers, /captureReplyMedia/);
+  assert.match(helpers, /state\.archiveByKey\.get/);
+  assert.doesNotMatch(helpers, /state\.archive\.records\.find/);
+  assert.match(helpers, /img\[class\*='replyAvatar_'\]/);
+  assert.match(helpers, /replyTargetMessageId/);
+  const richCapture = helpers.slice(helpers.indexOf("  function captureReply("), helpers.indexOf("  function resolvedReply("));
+  assert.ok(richCapture.indexOf("if (options?.minimal)") < richCapture.indexOf("captureReplyMedia(replyNode)"));
+  assert.match(source, /captureReply\(node, identity, state\.route, \{ minimal: true \}\)/);
+  const capture = productionFunctions("recordFromNode", "recordSignature");
+  assert.match(capture, /!content && !attachments\.length && !media\.length && !reply/);
+  const signature = productionFunctions("recordSignature", "queueRecord");
+  assert.match(signature, /Core\.sanitizeReply\(record\.reply, record\.replyPreview\)/);
+  assert.match(source, /records\.filter\(recordHasCacheableMedia\)/);
+  assert.match(source, /Core\.versionMediaItems\(version\)/);
+  assert.match(source, /state\.archiveByKey = new Map/);
+});
 
 function element(options = {}) {
   const value = {

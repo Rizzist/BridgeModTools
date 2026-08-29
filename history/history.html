@@ -23,7 +23,7 @@
     <section class="controls" aria-label="History filters">
       <label>
         <span>Search</span>
-        <input id="search" type="search" placeholder="Content, author, channel, attachment…" autofocus>
+        <input id="search" type="search" placeholder="Content, author, reply, channel, attachment…" autofocus>
       </label>
       <label>
         <span>Status</span>
@@ -37,7 +37,7 @@
       <div class="summary" id="summary">0 records</div>
     </section>
 
-    <p class="notice"><strong>Important:</strong> “Retained deleted” means the extension kept the record in Discord's local MessageStore and marked its native row red. Other confirmed records use lifecycle/removal correlation. “Suspected removed” uses DOM observation only.</p>
+    <p class="notice"><strong>Important:</strong> “Retained deleted” means the extension kept the record in Discord's local MessageStore and marked its native row red. Other confirmed records use lifecycle/removal correlation. “Suspected removed” uses DOM observation only. A compact reply header is preserved once above the message and all of its edited versions.</p>
     <div id="records" class="records" aria-live="polite"></div>
     <div id="empty" class="empty" hidden>No matching local records.</div>
   </main>

@@ -340,7 +340,7 @@ function mediaRefs(records, generation) {
     const ownerKey = Core.recordKey(record);
     const deleted = Core.isDeletedStatus(record.status) || Core.hasEdits(record);
     for (const version of [record, ...(record.editHistory || [])]) {
-      for (const media of Core.sanitizeMediaItems(version.media)) {
+      for (const media of Core.versionMediaItems(version)) {
         if (MediaStore.fetchableMedia(media)) refs.push({ ownerKey, deleted, generation, media });
         if (media.posterUrl) refs.push({
           ownerKey,
@@ -814,13 +814,22 @@ async function handlePlaybackCommand(command, sender) {
     if (!archive.records.some((record) => Core.recordKey(record) === key)) return { ok: false, reason: "record-missing" };
     const capability = randomCapability();
     const revisionId = command.revisionId == null ? null : Core.normalizeText(command.revisionId).slice(0, 160);
+    if (command.mediaPart != null && command.mediaPart !== "body" && command.mediaPart !== "reply") {
+      return { ok: false, reason: "invalid-media-part" };
+    }
+    const mediaPart = command.mediaPart === "reply" ? "reply" : "body";
     const record = archive.records.find((candidate) => Core.recordKey(candidate) === key);
+    if (mediaPart === "reply" && revisionId) return { ok: false, reason: "invalid-media-part-revision" };
+    if (mediaPart === "reply" && !Core.sanitizeReply(record?.reply, record?.replyPreview)) {
+      return { ok: false, reason: "reply-missing" };
+    }
     if (revisionId && !record?.editHistory?.some((revision) => revision.revisionId === revisionId)) {
       return { ok: false, reason: "revision-missing" };
     }
     playbackCapabilities.set(capability, {
       key,
       revisionId,
+      mediaPart,
       tabId: Number.isInteger(sender.tab?.id) ? sender.tab.id : null,
       expiresAt: Date.now() + 10 * 60 * 1000,
       boundDocumentId: null,
@@ -842,13 +851,28 @@ async function handlePlaybackCommand(command, sender) {
     const archive = await readArchive();
     const record = archive.records.find((candidate) => Core.recordKey(candidate) === item.key) || null;
     const revision = item.revisionId && record?.editHistory?.find((candidate) => candidate.revisionId === item.revisionId);
-    const playbackRecord = item.revisionId
+    let playbackRecord = item.revisionId
       ? revision ? Object.assign({}, record, revision, { editHistory: [] }) : null
       : record;
+    if (playbackRecord && item.mediaPart === "reply") {
+      const reply = Core.sanitizeReply(record?.reply, record?.replyPreview);
+      playbackRecord = reply ? Object.assign({}, record, {
+        author: reply.author || "",
+        authorId: reply.authorId || null,
+        authorUsername: reply.authorUsername || null,
+        avatarUrl: reply.avatarUrl || null,
+        authorColor: reply.authorColor || null,
+        content: reply.content || reply.fallbackText || "",
+        attachments: reply.attachmentNames || [],
+        media: reply.media || [],
+        editHistory: [],
+        reply: null
+      }) : null;
+    }
     if (playbackRecord?.media?.length && !archive.paused) scheduleMediaRecovery([record]).catch(() => {});
     return {
       ok: Boolean(playbackRecord),
-      reason: playbackRecord ? "capability-redeemed" : item.revisionId ? "revision-missing" : "record-missing",
+      reason: playbackRecord ? "capability-redeemed" : item.mediaPart === "reply" ? "reply-missing" : item.revisionId ? "revision-missing" : "record-missing",
       record: playbackRecord ? Core.sanitizeRecordPresentation(playbackRecord) : null
     };
   }

@@ -23,7 +23,7 @@
 
   function emptyArchive() {
     return {
-      version: 5,
+      version: 6,
       generation: 0,
       revision: 0,
       paused: false,
@@ -40,7 +40,7 @@
     const base = emptyArchive();
     if (!value || !Array.isArray(value.records)) return base;
     return Object.assign(base, value, {
-      version: 5,
+      version: 6,
       generation: Number.isInteger(value.generation) ? value.generation : 0,
       revision: Number.isInteger(value.revision) ? value.revision : 0,
       paused: Boolean(value.paused),
@@ -129,6 +129,7 @@
       }
       const key = Core.recordKey(baseline);
       const existing = archive.records.find((record) => Core.recordKey(record) === key) || null;
+      const mergedReply = Core.mergeReplySnapshots(existing?.reply, baseline.reply);
       const revisionId = `${sessionId}:${sequence}`;
       if (existing?.editHistory?.some((revision) => revision.revisionId === revisionId)) {
         return unchanged(true, "duplicate-edit", archive);
@@ -145,7 +146,7 @@
         const next = changedArchive(archive, {
           records: Core.pruneRecords([
             ...archive.records.filter((record) => Core.recordKey(record) !== key),
-            Object.assign({}, existing, { editHistory: history, updatedAt: now })
+            Object.assign({}, existing, mergedReply ? { reply: mergedReply } : {}, { editHistory: history, updatedAt: now })
           ])
         });
         return { archive: next, accepted: true, changed: true, reason: "out-of-order-edit", data: next };
@@ -153,7 +154,7 @@
       if (existing && Number(existing.lastEditedAt) >= supersededAt) {
         return unchanged(true, "stale-edit", archive);
       }
-      const current = Object.assign({}, existing || baseline, {
+      const current = Object.assign({}, existing || baseline, mergedReply ? { reply: mergedReply } : {}, {
         editHistory: history,
         lastEditedAt: supersededAt,
         editSessionId: sessionId,
@@ -173,16 +174,21 @@
       const existingByKey = new Map(archive.records.map((record) => [Core.recordKey(record), record]));
       const confirmed = deletions.filter((item) => item && item.record &&
         (existingByKey.has(Core.recordKey(item.record)) || item.source === "message_store_preserved"))
-        .map((item) => Object.assign({}, existingByKey.get(Core.recordKey(item.record)) || Core.sanitizeRecordPresentation(item.record), {
-        status: "confirmed_deleted",
-        confirmedDeletedAt: now,
-        deletionSource: item.source === "message_store_preserved" ? "message_store_preserved" : "discord_lifecycle",
-        inferredPreviousId: item.previousId || null,
-        inferredNextId: item.nextId || null,
-        inferredTail: Boolean(item.tail),
-        inferredListIdentity: item.listIdentity || null,
-        updatedAt: now
-        }));
+        .map((item) => {
+          const incomingRecord = Core.sanitizeRecordPresentation(item.record);
+          const existingRecord = existingByKey.get(Core.recordKey(item.record));
+          const reply = Core.mergeReplySnapshots(existingRecord?.reply, incomingRecord?.reply);
+          return Object.assign({}, existingRecord || incomingRecord, reply ? { reply } : {}, {
+            status: "confirmed_deleted",
+            confirmedDeletedAt: now,
+            deletionSource: item.source === "message_store_preserved" ? "message_store_preserved" : "discord_lifecycle",
+            inferredPreviousId: item.previousId || null,
+            inferredNextId: item.nextId || null,
+            inferredTail: Boolean(item.tail),
+            inferredListIdentity: item.listIdentity || null,
+            updatedAt: now
+          });
+        });
       if (!confirmed.length) return unchanged(false, "missing-records");
       const next = changedArchive(archive, {
         records: Core.mergeRecords(archive.records, confirmed, { now })

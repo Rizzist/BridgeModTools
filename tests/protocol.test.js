@@ -323,7 +323,7 @@ test("confirmed deletions survive archive serialization and a fresh normalizatio
   assert.equal(restored.records[0].inferredNextId, "3");
 });
 
-test("archive normalization migrates to version 5 and sanitizes presentation", () => {
+test("archive normalization migrates to version 6 and sanitizes presentation", () => {
   const restored = Protocol.normalizeArchive({
     version: 2,
     generation: 4,
@@ -343,10 +343,59 @@ test("archive normalization migrates to version 5 and sanitizes presentation", (
       }]
     })]
   });
-  assert.equal(restored.version, 5);
+  assert.equal(restored.version, 6);
   assert.equal(restored.generation, 4);
   assert.equal(restored.records[0].authorStyle, undefined);
   assert.deepEqual(restored.records[0].authorBadges, []);
   assert.equal(restored.records[0].editHistory[0].content, "original text");
   assert.equal(restored.records[0].editHistory[0].media[0].kind, "image");
+});
+
+test("version 6 migration preserves legacy replies through edit, deletion, and serialization", () => {
+  const record = Object.assign(seen("2", 1), { replyPreview: "Quoted legacy text" });
+  let archive = Protocol.normalizeArchive({ version: 5, generation: 0, records: [record] });
+  assert.equal(archive.version, 6);
+  assert.deepEqual(archive.records[0].reply, { fallbackText: "Quoted legacy text", state: "legacy" });
+  assert.equal(archive.records[0].replyPreview, undefined);
+
+  archive = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_EDIT, generation: 0, record: archive.records[0], editedAt: 10,
+    editSessionId: "reply-session", editSequence: 1
+  }, 10).archive;
+  assert.equal(archive.records[0].editHistory[0].reply, undefined);
+  assert.equal(archive.records[0].reply.fallbackText, "Quoted legacy text");
+
+  archive = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_DELETED, generation: 0,
+    deletions: [{ record: archive.records[0], source: "message_store_preserved" }]
+  }, 20).archive;
+  const restored = Protocol.normalizeArchive(JSON.parse(JSON.stringify(archive)));
+  assert.equal(restored.version, 6);
+  assert.equal(restored.records[0].status, "confirmed_deleted");
+  assert.equal(restored.records[0].reply.state, "legacy");
+  assert.equal(restored.records[0].reply.fallbackText, "Quoted legacy text");
+});
+
+test("edit and deletion lifecycle commands can safely hydrate a missing reply snapshot", () => {
+  const base = Object.assign(Protocol.emptyArchive(), { records: [seen("2", 1)] });
+  const withReply = Object.assign(seen("2", 1), {
+    reply: {
+      messageId: "222222222222222222", channelId: "111111111111111111",
+      content: "quoted target", state: "available"
+    }
+  });
+  const edited = Protocol.applyCommand(base, {
+    type: T.CONFIRM_EDIT, generation: 0, record: withReply, editedAt: 10,
+    editSessionId: "reply-hydration", editSequence: 1
+  }, 10).archive;
+  assert.equal(edited.records[0].reply.content, "quoted target");
+  assert.equal(edited.records[0].editHistory[0].reply, undefined);
+
+  const deletedBase = Object.assign(Protocol.emptyArchive(), { records: [seen("3", 1)] });
+  const deleted = Protocol.applyCommand(deletedBase, {
+    type: T.CONFIRM_DELETED, generation: 0,
+    deletions: [{ record: Object.assign(seen("3", 1), { reply: withReply.reply }) }]
+  }, 20).archive;
+  assert.equal(deleted.records[0].status, "confirmed_deleted");
+  assert.equal(deleted.records[0].reply.content, "quoted target");
 });

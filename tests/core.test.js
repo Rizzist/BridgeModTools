@@ -629,3 +629,151 @@ test("searches author, content, channel, and attachments with a status filter", 
   assert.equal(Core.searchRecords(records, "updates", "inferred_deleted")[0].messageId, "2");
   assert.equal(Core.searchRecords(records, "Leah", "inferred_deleted").length, 0);
 });
+
+test("reply snapshots are strictly bounded, sanitized, and migrate legacy previews", () => {
+  const media = Array.from({ length: 8 }, (_value, index) => ({
+    url: `https://cdn.discordapp.com/attachments/111111111111111111/22222222222222222${index}/reply-${index}.png`,
+    kind: "image", source: "attachment", name: `reply-${index}.png`
+  }));
+  media.unshift({ url: "javascript:alert(1)", kind: "image" });
+  const sanitized = Core.sanitizeRecordPresentation({
+    messageId: "333333333333333333", channelId: "111111111111111111", status: "seen",
+    replyPreview: "legacy fallback",
+    reply: {
+      messageId: "222222222222222222", channelId: "111111111111111111",
+      guildId: "444444444444444444", authorId: "555555555555555555",
+      author: "A".repeat(200), authorUsername: "curiousbro", avatarUrl: "javascript:alert(1)",
+      authorColor: "url(https://evil.invalid)", content: "x".repeat(3000),
+      attachmentNames: Array.from({ length: 10 }, (_value, index) => `../file-${index}.png`),
+      media, state: "resolved", ignored: "not persisted"
+    }
+  });
+  assert.equal(sanitized.reply.state, "available");
+  assert.equal(sanitized.reply.author.length, 128);
+  assert.equal(sanitized.reply.content.length, 2000);
+  assert.equal(sanitized.reply.attachmentNames.length, 4);
+  assert.equal(sanitized.reply.media.length, 4);
+  assert.equal(sanitized.reply.avatarUrl, undefined);
+  assert.equal(sanitized.reply.authorColor, undefined);
+  assert.equal(sanitized.reply.ignored, undefined);
+  assert.equal(sanitized.replyPreview, undefined);
+
+  const legacy = Core.sanitizeRecordPresentation({
+    messageId: "333333333333333333", channelId: "111111111111111111", replyPreview: " old reply preview "
+  });
+  assert.deepEqual(legacy.reply, { fallbackText: "old reply preview", state: "legacy" });
+  assert.equal(legacy.replyPreview, undefined);
+  assert.equal(Core.sanitizeReply({
+    messageId: 222222222222222222, author: {}, fallbackText: {}, attachmentNames: [{}], state: "edited"
+  }), null);
+});
+
+test("reply merge preserves rich and deleted snapshots and rejects conflicting identities", () => {
+  const base = {
+    messageId: "333333333333333333", channelId: "111111111111111111", status: "seen", capturedAt: 1,
+    reply: {
+      messageId: "222222222222222222", channelId: "111111111111111111",
+      authorId: "555555555555555555", author: "Target", content: "original target",
+      media: [{
+        url: "https://cdn.discordapp.com/attachments/111111111111111111/666666666666666666/reply.png",
+        kind: "image", source: "attachment"
+      }], state: "available"
+    }
+  };
+  let merged = Core.mergeRecords([], [base], { now: 2, maxRecords: 10, maxBytes: 100000, seenReserve: 1 })[0];
+  merged = Core.mergeRecords([merged], [{
+    ...base, capturedAt: 3,
+    reply: { messageId: "222222222222222222", channelId: "111111111111111111", state: "unavailable" }
+  }], { now: 3, maxRecords: 10, maxBytes: 100000, seenReserve: 1 })[0];
+  assert.equal(merged.reply.state, "available");
+  assert.equal(merged.reply.content, "original target");
+  assert.equal(merged.reply.media.length, 1);
+
+  merged = Core.mergeRecords([merged], [{
+    ...base, capturedAt: 4,
+    reply: { messageId: "222222222222222222", channelId: "111111111111111111", state: "deleted" }
+  }], { now: 4, maxRecords: 10, maxBytes: 100000, seenReserve: 1 })[0];
+  assert.equal(merged.reply.state, "deleted");
+  merged = Core.mergeRecords([merged], [{
+    ...base, capturedAt: 5,
+    reply: { messageId: "222222222222222222", channelId: "111111111111111111", content: "stale", state: "available" }
+  }], { now: 5, maxRecords: 10, maxBytes: 100000, seenReserve: 1 })[0];
+  assert.equal(merged.reply.state, "deleted");
+  assert.equal(merged.reply.content, "original target");
+
+  merged = Core.mergeRecords([merged], [{
+    ...base, capturedAt: 6,
+    reply: { messageId: "777777777777777777", channelId: "111111111111111111", content: "wrong target", state: "deleted" }
+  }], { now: 6, maxRecords: 10, maxBytes: 100000, seenReserve: 1 })[0];
+  assert.equal(merged.reply.messageId, "222222222222222222");
+  assert.equal(merged.reply.content, "original target");
+});
+
+test("reply data is searchable and affects grouping but never edit history semantics", () => {
+  const record = {
+    messageId: "333333333333333333", channelId: "111111111111111111", authorId: "555555555555555555",
+    content: "body", status: "seen", capturedAt: 1,
+    reply: {
+      messageId: "222222222222222222", author: "Quoted Person", authorUsername: "quoted.user",
+      content: "secret quoted words", attachmentNames: ["quoted-file.png"], state: "available"
+    }
+  };
+  assert.equal(Core.searchRecords([record], "quoted person", "all").length, 1);
+  assert.equal(Core.searchRecords([record], "quoted-file", "all").length, 1);
+  assert.equal(Core.messageContinues({ ...record, reply: null }, record), false);
+  const withoutReply = { ...record };
+  delete withoutReply.reply;
+  assert.equal(Core.editPayloadSignature(record), Core.editPayloadSignature(withoutReply));
+  assert.equal(Core.editRevisionFromRecord(record, { revisionId: "s:1" }).reply, undefined);
+});
+
+test("confirmed deleted records reject stale reply upserts", () => {
+  const deleted = Core.sanitizeRecordPresentation({
+    messageId: "333333333333333333", channelId: "111111111111111111", status: "confirmed_deleted",
+    content: "deleted body", capturedAt: 10,
+    reply: { messageId: "222222222222222222", content: "deleted reply snapshot", state: "deleted" }
+  });
+  const merged = Core.mergeRecords([deleted], [{
+    messageId: deleted.messageId, channelId: deleted.channelId, status: "seen", content: "stale body", capturedAt: 20,
+    reply: { messageId: "777777777777777777", content: "stale unrelated reply", state: "available" }
+  }], { now: 20, maxRecords: 10, maxBytes: 100000, seenReserve: 1 })[0];
+  assert.equal(merged.content, "deleted body");
+  assert.equal(merged.reply.messageId, "222222222222222222");
+  assert.equal(merged.reply.content, "deleted reply snapshot");
+});
+
+test("lower-confidence inference cannot replace an already confirmed payload or reply", () => {
+  const confirmed = Core.sanitizeRecordPresentation({
+    messageId: "333333333333333333", channelId: "111111111111111111", status: "confirmed_deleted",
+    content: "confirmed body", attachments: ["confirmed.png"], capturedAt: 10,
+    confirmedDeletedAt: 11, deletionSource: "discord_lifecycle",
+    reply: { messageId: "222222222222222222", content: "confirmed quoted target", state: "available" }
+  });
+  const merged = Core.mergeRecords([confirmed], [{
+    messageId: confirmed.messageId, channelId: confirmed.channelId, status: "inferred_deleted",
+    content: "stale inferred body", attachments: ["stale.png"], capturedAt: 20,
+    reply: { messageId: "222222222222222222", content: "stale inferred target", state: "available" }
+  }], { now: 20, maxRecords: 10, maxBytes: 100000, seenReserve: 1 })[0];
+  assert.equal(merged.status, "confirmed_deleted");
+  assert.equal(merged.content, "confirmed body");
+  assert.deepEqual(merged.attachments, ["confirmed.png"]);
+  assert.equal(merged.reply.content, "confirmed quoted target");
+  assert.equal(merged.confirmedDeletedAt, 11);
+  assert.equal(merged.deletionSource, "discord_lifecycle");
+});
+
+test("reply snapshots count toward the existing archive byte bound", () => {
+  const plain = {
+    messageId: "333333333333333333", channelId: "111111111111111111",
+    status: "seen", content: "body", capturedAt: 1
+  };
+  const withReply = Core.sanitizeRecordPresentation({
+    ...plain,
+    reply: { messageId: "222222222222222222", content: "quoted ".repeat(200), state: "available" }
+  });
+  const ceiling = Core.estimateBytes(Core.sanitizeRecordPresentation(plain)) + 4;
+  assert.ok(Core.estimateBytes(withReply) > ceiling);
+  assert.deepEqual(Core.pruneRecords([withReply], {
+    maxRecords: 1, maxBytes: ceiling, seenReserve: 0, seenReserveBytes: 0
+  }), []);
+});

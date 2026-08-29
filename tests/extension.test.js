@@ -36,7 +36,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.6.7");
+  assert.equal(manifest.version, "2.7.0");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -262,7 +262,7 @@ test("persistent replacements use a Discord-style row and hide the retained nati
   assert.match(content, /\.message\.continuation \.header \.author-group,.message\.continuation \.header \.timestamp \{ display:none; \}/);
   assert.match(content, /new CSSStyleSheet\(\)/);
   assert.match(content, /shadow\.adoptedStyleSheets = \[sheet\]/);
-  for (const field of ["avatarUrl", "authorColor", "displayTimestamp", "replyPreview"]) {
+  for (const field of ["avatarUrl", "authorColor", "displayTimestamp", "reply", "replyPreview"]) {
     assert.match(content, new RegExp(field));
   }
 
@@ -280,6 +280,27 @@ test("persistent replacements use a Discord-style row and hide the retained nati
   assert.match(content, /reducedMotion\.addEventListener/);
   assert.match(content, /render\.dispose/);
   assert.equal(/innerHTML/.test(content), false);
+});
+
+test("restored replies retain structured Discord context without an eager page-world lookup", () => {
+  const content = fs.readFileSync(path.join(root, "src", "content.js"), "utf8");
+  assert.match(content, /function captureReply\(node, sourceIdentity, route, options\)/);
+  assert.match(content, /message-content-\(\\d\{15,25\}\)/);
+  assert.match(content, /img\[class\*='replyAvatar_'\]/);
+  assert.match(content, /Core\.sanitizeReply/);
+  assert.match(content, /Core\.versionMediaItems/);
+  assert.match(content, /archiveByKey: new Map\(\)/);
+  assert.match(content, /state\.archiveByKey\.get/);
+  assert.match(content, /captureReply\(node, identity, state\.route, \{ minimal: true \}\)/);
+  assert.match(content, /body\.append\(reply, header, history, contentLine, attachments, mediaFrame\)/);
+  assert.match(content, /reply\.append\(replyAvatar, replyAuthor, replyPreview, replyState\)/);
+  assert.match(content, /\.message\.has-reply \.avatar \{ margin-top:20px; \}/);
+  assert.match(content, /article\.classList\.toggle\("has-reply", Boolean\(nextReply\)\)/);
+  assert.match(content, /replyTarget\?\.status, replyTarget\?\.editHistory\?\.length/);
+  assert.match(content, /replyTargetEdited \? "• EDITED"/);
+  assert.match(content, /nextReply\?\.state === "deleted" \? "• DELETED"/);
+  const replyHelpers = content.slice(content.indexOf("  const REPLY_SELECTOR"), content.indexOf("  function groupRootFromNode("));
+  assert.doesNotMatch(replyHelpers, /send\(|RESOLVE_MESSAGE_AUTHORS|requestPageHook/);
 });
 
 test("live and deleted rows expose exactly two header-adjacent hover actions", () => {
@@ -545,7 +566,7 @@ test("deterministic demo and user documentation are present", () => {
   assert.equal(fs.existsSync(path.join(root, "README.md")), true);
 });
 
-test("live Discord DOM fixture covers route variants, current rows, and grouped ARIA authors", () => {
+test("live Discord DOM fixture covers routes, current rows, grouped authors, and native reply identities", () => {
   const fixture = JSON.parse(fs.readFileSync(path.join(root, "tests", "fixtures", "live-discord-dom.json"), "utf8"));
   for (const route of fixture.routes) {
     const parsed = require("../src/core.js").parseDiscordRoute(route.pathname);
@@ -560,4 +581,10 @@ test("live Discord DOM fixture covers route variants, current rows, and grouped 
   assert.equal(fixture.liveList.row.article.role, "article");
   assert.deepEqual(Core.parseMessageRowIdentity(fixture.liveList.row.article.dataListItemId), fixture.liveList.expectedIdentity);
   assert.equal(Core.messageUsernameLabelId(fixture.grouped.secondRowAriaLabelledBy), fixture.grouped.firstUsernameId);
+  assert.match(fixture.reply.guildHref, new RegExp(`/channels/\\d+/${fixture.liveList.expectedIdentity.channelId}/${fixture.reply.targetMessageId}$`));
+  assert.match(fixture.reply.dmHref, new RegExp(`/channels/@me/\\d+/${fixture.reply.targetMessageId}$`));
+  assert.match(fixture.reply.ariaLabelledBy, new RegExp(`message-content-${fixture.reply.targetMessageId}`));
+  assert.doesNotMatch(fixture.reply.ariaLabelledBy, new RegExp(`message-content-${fixture.reply.sourceMessageId}`));
+  assert.match(fixture.reply.avatarClass, /^replyAvatar_/);
+  assert.match(fixture.reply.deletedFallback, /deleted/i);
 });
