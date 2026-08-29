@@ -203,6 +203,97 @@
     return scrollHeight - scrollTop - clientHeight <= (tolerancePx === undefined ? 24 : tolerancePx);
   }
 
+  function createTrailingFrameScheduler(run, runtimeValue) {
+    if (typeof run !== "function") throw new TypeError("A scheduler callback is required");
+    const runtime = runtimeValue || {
+      requestFrame: (callback) => root.requestAnimationFrame(callback),
+      cancelFrame: (token) => root.cancelAnimationFrame(token),
+      setTimer: (callback, delay) => root.setTimeout(callback, delay),
+      clearTimer: (token) => root.clearTimeout(token)
+    };
+    let frameToken = null;
+    let timerToken = null;
+    let persist = false;
+
+    const schedule = (nextPersist, delayValue) => {
+      persist = Boolean(persist || nextPersist);
+      const delay = Math.max(0, Number(delayValue) || 0);
+      if (delay > 0) {
+        if (frameToken !== null) {
+          runtime.cancelFrame(frameToken);
+          frameToken = null;
+        }
+        if (timerToken !== null) runtime.clearTimer(timerToken);
+        timerToken = runtime.setTimer(() => {
+          timerToken = null;
+          schedule(false, 0);
+        }, delay);
+        return;
+      }
+      if (timerToken !== null) {
+        runtime.clearTimer(timerToken);
+        timerToken = null;
+      }
+      if (frameToken !== null) return;
+      frameToken = runtime.requestFrame(() => {
+        frameToken = null;
+        const shouldPersist = persist;
+        persist = false;
+        run(shouldPersist);
+      });
+    };
+    schedule.cancel = () => {
+      if (frameToken !== null) runtime.cancelFrame(frameToken);
+      if (timerToken !== null) runtime.clearTimer(timerToken);
+      frameToken = null;
+      timerToken = null;
+      persist = false;
+    };
+    schedule.pending = () => ({ frame: frameToken !== null, timer: timerToken !== null, persist });
+    return schedule;
+  }
+
+  function createRateLimitedScheduler(run, intervalValue, runtimeValue) {
+    if (typeof run !== "function") throw new TypeError("A scheduler callback is required");
+    const interval = Math.max(1, Number(intervalValue) || 1);
+    const runtime = runtimeValue || {
+      now: () => root.performance.now(),
+      setTimer: (callback, delay) => root.setTimeout(callback, delay),
+      clearTimer: (token) => root.clearTimeout(token)
+    };
+    let timerToken = null;
+    let lastRunAt = -Infinity;
+    let persist = false;
+
+    const invoke = () => {
+      timerToken = null;
+      lastRunAt = runtime.now();
+      const shouldPersist = persist;
+      persist = false;
+      run(shouldPersist);
+    };
+    const schedule = (nextPersist) => {
+      persist = Boolean(persist || nextPersist);
+      const remaining = interval - (runtime.now() - lastRunAt);
+      if (remaining <= 0) {
+        if (timerToken !== null) runtime.clearTimer(timerToken);
+        invoke();
+        return;
+      }
+      // Never reset this timer. A sustained event stream must not starve the
+      // bounded run the way a conventional debounce would.
+      if (timerToken === null) timerToken = runtime.setTimer(invoke, remaining);
+    };
+    schedule.cancel = () => {
+      if (timerToken !== null) runtime.clearTimer(timerToken);
+      timerToken = null;
+      persist = false;
+      lastRunAt = -Infinity;
+    };
+    schedule.pending = () => ({ timer: timerToken !== null, persist, lastRunAt });
+    return schedule;
+  }
+
   function chooseActiveList(candidates, channelId) {
     const eligible = (Array.isArray(candidates) ? candidates : []).filter((candidate) => {
       const rowIds = Array.isArray(candidate.rowIds) ? candidate.rowIds : [];
@@ -808,6 +899,8 @@
     sameContinuationAuthor,
     messageContinues,
     isAtScrollBottom,
+    createTrailingFrameScheduler,
+    createRateLimitedScheduler,
     chooseActiveList,
     tombstoneCleanupKeys,
     estimateBytes,

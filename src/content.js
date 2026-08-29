@@ -30,6 +30,9 @@
   const EDIT_EVENT = "LDMA_EDIT_BEFORE_V1";
   const RESOLVE_MESSAGE_AUTHORS = "LDMA_RESOLVE_MESSAGE_AUTHORS";
   const SNOWFLAKE = /^\d{15,25}$/;
+  const SCROLL_CAPTURE_INTERVAL_MS = 250;
+  const SCROLL_CAPTURE_ROWS_PER_FRAME = 4;
+  const SCROLL_CAPTURE_FRAME_BUDGET_MS = 5;
   const captureSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
   let captureSequence = 0;
 
@@ -40,11 +43,13 @@
     activeList: null, listIdentity: null, snapshots: new WeakMap(), signatures: new Map(),
     snapshotsByKey: new Map(), pageHookStatus: "searching", pageHookDetail: "Waiting for Discord's deletion event dispatcher.",
     pendingRecords: new Map(), pendingRetractions: new Set(), recentRemovals: new Map(), pendingRetainedKeys: new Set(), pendingReleaseKeys: new Set(), flushTimer: null, flushPromise: null,
-    healthSignature: "", refreshPromise: null, tombstoneRenderers: new Map(), editRenderers: new Map(), liveActionRenderers: new Map(), spacingFrame: 0,
+    healthSignature: "", refreshPromise: null, archiveInitialized: false,
+    tombstoneRenderers: new Map(), editRenderers: new Map(), liveActionRenderers: new Map(), spacingFrame: 0, retainedFrame: 0,
     pendingConfirmedMounts: new Map(), pendingEdits: new Map(), stagedSelfEdits: new Map(),
     resolvedAuthorIds: new Map(), resolvedAuthorUsernames: new Map(),
-    authorResolutionAttempts: new Map(), pendingAuthorResolutionIds: new Set(),
-    authorResolutionTimer: null, pendingTimeoutActions: new Set(),
+    pendingTimeoutActions: new Set(), snapshotScheduler: null,
+    scrollCaptureFrameScheduler: null, scrollCaptureLimiter: null, scrollSettleTimer: null,
+    pendingScrollRows: new Set(), priorityScrollRows: new Set(), mediaFrameWindows: new Map(),
     lastMediaRecoveryAt: -Infinity,
     pageHookLastSeenAt: -Infinity, bootstrapRequestedAt: -Infinity, bootstrapPromise: null
   };
@@ -297,70 +302,6 @@
 
   function resolvedAuthorUsername(channelId, messageId, fallback, fallbackUserId) {
     return resolvedAuthorIdentity(channelId, messageId, fallbackUserId, fallback).username;
-  }
-
-  function queueAuthorResolution(channelId, messageIds) {
-    if (state.route?.channelId !== channelId || !SNOWFLAKE.test(String(channelId || ""))) return;
-    const now = performance.now();
-    for (const messageId of messageIds || []) {
-      if (!SNOWFLAKE.test(String(messageId || ""))) continue;
-      const key = `${channelId}:${messageId}`;
-      if (state.resolvedAuthorIds.has(key) && state.resolvedAuthorUsernames.has(key) ||
-        now - (state.authorResolutionAttempts.get(key) || -Infinity) < 30000) continue;
-      state.pendingAuthorResolutionIds.add(key);
-    }
-    if (!state.pendingAuthorResolutionIds.size || state.authorResolutionTimer) return;
-    state.authorResolutionTimer = setTimeout(() => {
-      state.authorResolutionTimer = null;
-      const route = state.route;
-      if (!route) {
-        state.pendingAuthorResolutionIds.clear();
-        return;
-      }
-      const keys = [...state.pendingAuthorResolutionIds]
-        .filter((key) => key.startsWith(`${route.channelId}:`)).slice(0, 200);
-      for (const key of keys) state.pendingAuthorResolutionIds.delete(key);
-      if (!keys.length) return;
-      const attemptedAt = performance.now();
-      for (const key of keys) state.authorResolutionAttempts.set(key, attemptedAt);
-      const messageIdsForRequest = keys.map((key) => key.slice(key.indexOf(":") + 1));
-      const routeKey = route.routeKey;
-      send({ type: RESOLVE_MESSAGE_AUTHORS, messageIds: messageIdsForRequest }).then((response) => {
-        if (!response?.ok || state.route?.routeKey !== routeKey) return;
-        let changed = false;
-        for (const item of Array.isArray(response.authors) ? response.authors : []) {
-          const messageId = Core.snowflakeValue(item?.messageId);
-          const userId = Core.snowflakeValue(item?.userId);
-          const username = Core.discordUsernameValue(item?.username);
-          if (!messageId || !userId || !messageIdsForRequest.includes(messageId)) continue;
-          const key = `${route.channelId}:${messageId}`;
-          const previousResolvedId = state.resolvedAuthorIds.get(key);
-          if (previousResolvedId !== userId ||
-            username && state.resolvedAuthorUsernames.get(key) !== username) changed = true;
-          state.resolvedAuthorIds.set(key, userId);
-          if (username) state.resolvedAuthorUsernames.set(key, username);
-          else if (previousResolvedId !== userId) {
-            state.resolvedAuthorUsernames.delete(key);
-            changed = true;
-          }
-          const archived = state.archive.records.find((record) => Core.recordKey(record) === key);
-          if (archived && (archived.authorId !== userId || username && archived.authorUsername !== username)) {
-            const nextArchived = Object.assign({}, archived, { authorId: userId });
-            if (username) nextArchived.authorUsername = username;
-            else if (archived.authorId !== userId) delete nextArchived.authorUsername;
-            queueRecord(Core.sanitizeRecordPresentation(nextArchived));
-          }
-        }
-        while (state.resolvedAuthorIds.size > 5000) state.resolvedAuthorIds.delete(state.resolvedAuthorIds.keys().next().value);
-        while (state.resolvedAuthorUsernames.size > 5000) {
-          state.resolvedAuthorUsernames.delete(state.resolvedAuthorUsernames.keys().next().value);
-        }
-        while (state.authorResolutionAttempts.size > 5000) state.authorResolutionAttempts.delete(state.authorResolutionAttempts.keys().next().value);
-        if (changed) requestAnimationFrame(() => snapshotRenderedMessages(true));
-      }).finally(() => {
-        if (state.pendingAuthorResolutionIds.size) queueAuthorResolution(state.route?.channelId, []);
-      });
-    }, 40);
   }
 
   function allContent(node, messageId) {
@@ -738,13 +679,14 @@
     ]);
   }
 
-  function queueRecord(record) {
+  function queueRecord(record, options) {
     const key = Core.recordKey(record);
     const signature = recordSignature(record);
     if (state.signatures.get(key) === signature || state.pendingRecords.get(key)?.signature === signature) return;
     state.pendingRecords.set(key, { record, generation: state.generation, signature });
+    if (options?.deferDuringScroll && state.flushTimer) return;
     clearTimeout(state.flushTimer);
-    state.flushTimer = setTimeout(flushRecords, 180);
+    state.flushTimer = setTimeout(flushRecords, options?.deferDuringScroll ? 1250 : 180);
   }
 
   function flushRecords() {
@@ -796,6 +738,10 @@
 
   function applyArchive(archive) {
     if (!archive || !Array.isArray(archive.records)) return;
+    const rawGeneration = Number.isInteger(archive.generation) ? archive.generation : 0;
+    const rawRevision = Number.isInteger(archive.revision) ? archive.revision : 0;
+    if (state.archiveInitialized && rawGeneration === state.generation &&
+      rawRevision === state.archive.revision) return;
     if (!Protocol.shouldApplyArchive(state.archive, archive)) return;
     const incomingGeneration = Number.isInteger(archive.generation) ? archive.generation : 0;
     const wasPaused = state.paused;
@@ -817,6 +763,12 @@
       state.snapshots = new WeakMap();
       state.snapshotsByKey.clear();
       state.recentRemovals.clear();
+      state.pendingScrollRows.clear();
+      state.priorityScrollRows.clear();
+      state.scrollCaptureLimiter?.cancel();
+      state.scrollCaptureFrameScheduler?.cancel();
+      clearTimeout(state.scrollSettleTimer);
+      state.scrollSettleTimer = null;
       state.pendingRetainedKeys.clear();
       state.pendingConfirmedMounts.clear();
       state.pendingEdits.clear();
@@ -826,6 +778,7 @@
       removeEditHistories();
     }
     state.archive = archive;
+    state.archiveInitialized = true;
     state.generation = incomingGeneration;
     state.paused = Boolean(archive.paused);
     if (state.paused) removeLiveAuthorActions();
@@ -834,7 +787,7 @@
     reconcileTombstones();
     reconcileEditHistories();
     applyRetainedStyles();
-    if (wasPaused && !state.paused) requestAnimationFrame(() => snapshotRenderedMessages(true));
+    if (wasPaused && !state.paused) scheduleSnapshot(true, 0);
   }
 
   function requestMediaRecovery(archive) {
@@ -899,7 +852,7 @@
     return candidates.find((node) => !activeRoot || activeRoot.contains(node)) || null;
   }
 
-  function applyRetainedStyles() {
+  function applyRetainedStyles(activeValue) {
     const route = Core.parseDiscordRoute(location.pathname);
     const retainedIds = new Set(state.archive.records.filter((record) =>
       record.channelId === route?.channelId && record.status === "confirmed_deleted" &&
@@ -928,11 +881,20 @@
     }
     if (!route) return;
     for (const messageId of retainedIds) retainedRow(route.channelId, messageId)?.classList.add("ldma-retained-deleted");
-    requestAnimationFrame(replaceVisibleRetainedRows);
+    if (!state.retainedFrame) {
+      state.retainedFrame = requestAnimationFrame(() => {
+        state.retainedFrame = 0;
+        replaceVisibleRetainedRows(activeValue);
+      });
+    }
   }
 
   function replaceText(element, value) {
-    element.replaceChildren(document.createTextNode(String(value || "")));
+    const next = String(value || "");
+    if (element.childNodes.length === 1 && element.firstChild?.nodeType === Node.TEXT_NODE &&
+      element.firstChild.nodeValue === next) return false;
+    element.replaceChildren(document.createTextNode(next));
+    return true;
   }
 
   function suppressDiscordMessageGesture(element) {
@@ -1146,10 +1108,6 @@
     const update = (context) => {
       actions.hidden = !context || !SNOWFLAKE.test(String(context.messageId || ""));
       timeoutAction.hidden = !SNOWFLAKE.test(String(context?.guildId || ""));
-      if (context && (!state.resolvedAuthorIds.has(`${context.channelId}:${context.messageId}`) ||
-        !state.resolvedAuthorUsernames.has(`${context.channelId}:${context.messageId}`))) {
-        queueAuthorResolution(context.channelId, [context.messageId]);
-      }
     };
     update.dispose = () => {
       for (const timer of feedbackTimers.values()) clearTimeout(timer);
@@ -1239,37 +1197,61 @@
     return renderer;
   }
 
+  function activateLiveAuthorActions(row, active, records) {
+    const identity = rowIdentity(row);
+    if (!identity || identity.channelId && identity.channelId !== active.route.channelId ||
+      row.dataset.ldmaNativeReplaced === "true") return;
+    const insertion = nativeHeaderActionInsertion(row, identity.messageId);
+    if (!insertion) return;
+    const key = `${active.route.channelId}:${identity.messageId}`;
+    for (const [otherKey, otherRenderer] of [...state.liveActionRenderers]) {
+      if (otherKey === key && otherRenderer.row === row && otherRenderer.host.isConnected) continue;
+      otherRenderer.dispose();
+      state.liveActionRenderers.delete(otherKey);
+    }
+    let renderer = state.liveActionRenderers.get(key);
+    if (renderer && (renderer.row !== row || !renderer.host.isConnected || renderer.host.parentElement !== insertion.header)) {
+      renderer.dispose();
+      state.liveActionRenderers.delete(key);
+      renderer = null;
+    }
+    if (!renderer) renderer = createLiveAuthorActionRenderer(row, identity, insertion, active.route);
+    const index = active.rows.indexOf(row);
+    const record = index >= 0 && records?.[index] || state.snapshotsByKey.get(key)?.record ||
+      state.archive.records.find((item) => Core.recordKey(item) === key) || groupingRecordFromNode(row);
+    renderer.update(record, active.route);
+  }
+
   function reconcileLiveAuthorActions(active, records) {
     const managedHosts = new Set([...state.liveActionRenderers.values()].map((renderer) => renderer.host));
     document.querySelectorAll("[data-ldma-author-actions-host]").forEach((host) => {
       if (!managedHosts.has(host)) host.remove();
     });
-    const connected = new Set();
-    if (active) {
-      active.rows.forEach((row, index) => {
-        const identity = rowIdentity(row);
-        if (!identity || identity.channelId && identity.channelId !== active.route.channelId || row.dataset.ldmaNativeReplaced === "true") return;
-        const insertion = nativeHeaderActionInsertion(row, identity.messageId);
-        if (!insertion) return;
-        const key = `${active.route.channelId}:${identity.messageId}`;
-        let renderer = state.liveActionRenderers.get(key);
-        if (renderer && (renderer.row !== row || !renderer.host.isConnected || renderer.host.parentElement !== insertion.header)) {
-          renderer.dispose();
-          state.liveActionRenderers.delete(key);
-          renderer = null;
-        }
-        if (!renderer) renderer = createLiveAuthorActionRenderer(row, identity, insertion, active.route);
-        const record = records?.[index] || state.snapshotsByKey.get(key)?.record ||
-          state.archive.records.find((item) => Core.recordKey(item) === key) || groupingRecordFromNode(row);
-        renderer.update(record, active.route);
-        connected.add(key);
-      });
-    }
     for (const [key, renderer] of [...state.liveActionRenderers]) {
-      if (connected.has(key) && renderer.host.isConnected) continue;
+      const identity = rowIdentity(renderer.row);
+      const valid = Boolean(active && renderer.host.isConnected && active.node.contains(renderer.row) && identity &&
+        `${active.route.channelId}:${identity.messageId}` === key);
+      if (valid) continue;
       renderer.dispose();
       state.liveActionRenderers.delete(key);
     }
+    if (!active) return;
+    const focused = active.rows.find((row) => row.contains(document.activeElement));
+    const hovered = !focused && active.rows.find((row) => {
+      try { return row.matches(":hover"); } catch (_error) { return false; }
+    });
+    if (focused || hovered) activateLiveAuthorActions(focused || hovered, active, records);
+  }
+
+  function handleLiveAuthorActionInterest(event) {
+    if (state.paused || performance.now() - state.lastScrollAt < Core.DEFAULTS.scrollQuietMs ||
+      !(event.target instanceof Element)) return;
+    const row = event.target.closest(MESSAGE_SELECTOR);
+    if (!row || row.closest("[data-ldma-tombstone]") ||
+      event.relatedTarget instanceof Element && event.relatedTarget.closest(MESSAGE_SELECTOR) === row) return;
+    const active = findActiveMessageList();
+    if (!active || !active.node.contains(row)) return;
+    activateLiveAuthorActions(row, active);
   }
 
   function storedTime(record) {
@@ -1365,6 +1347,7 @@
     const scale = Math.max(1, Number(devicePixelRatio) || 1);
     const rounded = Math.round(shift * scale) / scale;
     for (const element of elements) {
+      if (element.dataset.ldmaSpacingShift === String(rounded)) continue;
       element.dataset.ldmaSpacingShift = String(rounded);
       element.style.setProperty("--ldma-spacing-shift", `${rounded}px`);
     }
@@ -1415,33 +1398,91 @@
   }
 
   function configureMediaFrame(frame, key, revisionId) {
-    const onSize = (event) => {
-      if (event.source !== frame.contentWindow || event.origin !== extensionFrameOrigin() || event.data?.type !== "LDMA_MEDIA_SIZE") return;
-      const width = Math.max(40, Math.min(550, Math.ceil(Number(event.data.width) || 550)));
-      const height = Math.max(24, Math.min(1600, Math.ceil(Number(event.data.height) || 40)));
-      frame.style.width = `${width}px`;
-      frame.style.height = `${height}px`;
-      const owner = frame.getRootNode()?.host?.closest?.("[data-ldma-tombstone], [data-ldma-edit-history]");
-      if (owner) {
-        owner.dataset.ldmaMediaWidth = String(width);
-        owner.dataset.ldmaMediaHeight = String(height);
-      }
-      scheduleTombstoneSpacing();
+    let enabled = false;
+    let nearViewport = typeof IntersectionObserver !== "function";
+    let activated = false;
+    let disposed = false;
+    let frameWindow = null;
+    let activationEpoch = 0;
+    const unregisterWindow = () => {
+      if (frameWindow) state.mediaFrameWindows.delete(frameWindow);
+      frameWindow = null;
     };
-    window.addEventListener("message", onSize);
+    const registerWindow = () => {
+      const nextWindow = frame.contentWindow;
+      if (nextWindow === frameWindow) return;
+      unregisterWindow();
+      frameWindow = nextWindow;
+      if (frameWindow) state.mediaFrameWindows.set(frameWindow, frame);
+    };
+    const deactivate = () => {
+      activationEpoch += 1;
+      if (!activated && !frame.hasAttribute("src")) return;
+      activated = false;
+      unregisterWindow();
+      frame.removeAttribute("src");
+    };
+    const activate = () => {
+      if (!enabled || !nearViewport || activated) return;
+      activationEpoch += 1;
+      activated = true;
+      frame.src = new URL(chrome.runtime.getURL("media/view.html")).href;
+      registerWindow();
+    };
+    const observer = typeof IntersectionObserver === "function" ? new IntersectionObserver((entries) => {
+      nearViewport = entries.some((entry) => entry.target === frame && entry.isIntersecting);
+      if (nearViewport) activate();
+      else deactivate();
+    }, { rootMargin: "600px 0px" }) : null;
+    if (observer) observer.observe(frame);
     frame.addEventListener("load", () => {
+      if (disposed || !enabled || !activated || !frame.hasAttribute("src")) return;
+      registerWindow();
+      const loadedEpoch = activationEpoch;
+      const loadedWindow = frame.contentWindow;
       send({ type: T.CREATE_MEDIA_CAPABILITY, key, revisionId: revisionId || undefined }).then((response) => {
-        if (!response.ok || !response.capability || !frame.contentWindow || !frame.src) return;
-        frame.contentWindow.postMessage({
+        if (!response.ok || !response.capability || !activated || !frame.hasAttribute("src") ||
+          loadedEpoch !== activationEpoch || !loadedWindow || frame.contentWindow !== loadedWindow ||
+          state.mediaFrameWindows.get(loadedWindow) !== frame) return;
+        loadedWindow.postMessage({
           type: "LDMA_MEDIA_CAPABILITY",
           capability: response.capability
         }, extensionFrameOrigin());
       }).catch(() => {});
     });
-    return () => {
-      window.removeEventListener("message", onSize);
-      frame.removeAttribute("src");
+    const dispose = () => {
+      disposed = true;
+      observer?.disconnect();
+      deactivate();
     };
+    dispose.setEnabled = (value) => {
+      enabled = Boolean(value);
+      if (!enabled) {
+        deactivate();
+        return;
+      }
+      activate();
+    };
+    return dispose;
+  }
+
+  function handleMediaFrameSize(event) {
+    if (event.origin !== extensionFrameOrigin() || event.data?.type !== "LDMA_MEDIA_SIZE") return;
+    const frame = state.mediaFrameWindows.get(event.source);
+    if (!frame) return;
+    const width = Math.max(40, Math.min(550, Math.ceil(Number(event.data.width) || 550)));
+    const height = Math.max(24, Math.min(1600, Math.ceil(Number(event.data.height) || 40)));
+    if (frame.dataset.ldmaMediaWidth === String(width) && frame.dataset.ldmaMediaHeight === String(height)) return;
+    frame.dataset.ldmaMediaWidth = String(width);
+    frame.dataset.ldmaMediaHeight = String(height);
+    frame.style.width = `${width}px`;
+    frame.style.height = `${height}px`;
+    const owner = frame.getRootNode()?.host?.closest?.("[data-ldma-tombstone], [data-ldma-edit-history]");
+    if (owner) {
+      owner.dataset.ldmaMediaWidth = String(width);
+      owner.dataset.ldmaMediaHeight = String(height);
+    }
+    scheduleTombstoneSpacing();
   }
 
   function createRevisionPayload(record, key, tone, marker) {
@@ -1474,7 +1515,7 @@
     mediaFrame.hidden = !hasMedia;
     mediaFrame.setAttribute("sandbox", "allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-downloads");
     const disposeMedia = configureMediaFrame(mediaFrame, key, record.revisionId || null);
-    if (hasMedia) mediaFrame.src = new URL(chrome.runtime.getURL("media/view.html")).href;
+    disposeMedia.setEnabled(hasMedia);
     payload.append(line, attachments, mediaFrame);
     return { element: payload, dispose: disposeMedia };
   }
@@ -1632,6 +1673,7 @@
     let lastRecord = null;
     let continuation = false;
     let historySignature = "";
+    let renderSignature = "";
     let historyDisposers = [];
     const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
@@ -1735,6 +1777,12 @@
       const name = record.author || "Unknown author";
       const nextAuthorIdentity = resolvedAuthorIdentity(
         record.channelId, record.messageId, record.authorId, record.authorUsername);
+      const nextRenderSignature = JSON.stringify([
+        recordSignature(record), record.status, Core.sanitizeEditHistory(record.editHistory),
+        nextAuthorIdentity.userId, nextAuthorIdentity.username
+      ]);
+      if (nextRenderSignature === renderSignature) return;
+      renderSignature = nextRenderSignature;
       const nextUserId = nextAuthorIdentity.userId;
       const nextGuildId = SNOWFLAKE.test(String(record.guildId || "")) ? String(record.guildId) : null;
       actionUserId = nextUserId;
@@ -1783,10 +1831,7 @@
         return item;
       }));
       mediaFrame.hidden = !hasMedia;
-      if (hasMedia && !mediaFrame.hasAttribute("src")) {
-        const viewerUrl = new URL(chrome.runtime.getURL("media/view.html"));
-        mediaFrame.src = viewerUrl.href;
-      }
+      disposeCurrentMedia.setEnabled(hasMedia);
       const avatarUrl = normalizedAvatarUrl(record.avatarUrl);
       replaceText(avatarFallback, name.trim().slice(0, 1).toLocaleUpperCase() || "?");
       avatarFallback.hidden = Boolean(avatarUrl);
@@ -2061,10 +2106,11 @@
     return true;
   }
 
-  function replaceVisibleRetainedRows() {
+  function replaceVisibleRetainedRows(activeValue) {
     const route = Core.parseDiscordRoute(location.pathname);
     if (!route) return;
-    const active = findActiveMessageList();
+    const active = activeValue?.node?.isConnected && activeValue.route?.routeKey === route.routeKey
+      ? activeValue : findActiveMessageList();
     if (!active) return;
     const retained = state.archive.records.filter((record) =>
       record.channelId === route.channelId && record.status === "confirmed_deleted" &&
@@ -2090,8 +2136,8 @@
     }
   }
 
-  function reconcileTombstones() {
-    const active = findActiveMessageList() || findEmptyConfirmedRestoreList();
+  function reconcileTombstones(activeValue) {
+    const active = activeValue || findActiveMessageList() || findEmptyConfirmedRestoreList();
     const deleted = new Map(state.archive.records.filter((record) => Core.isDeletedStatus(record.status)).map((record) => [Core.recordKey(record), record]));
     const elements = [...document.querySelectorAll("[data-ldma-tombstone]")];
     const connectedRendererKeys = new Set(elements.map((element) => element.dataset.ldmaMessageKey));
@@ -2161,7 +2207,7 @@
     }
     const nowDate = Date.now();
     const nowPerf = performance.now();
-    const records = active.rows.map((node) => recordFromNode(node, nowDate));
+    const records = new Array(active.rows.length).fill(null);
     const scrollContainer = findChatScrollContainer(active.node);
     const scrollerRect = scrollContainer?.getBoundingClientRect();
     const wasAtBottom = Core.isAtScrollBottom(scrollContainer && {
@@ -2169,26 +2215,30 @@
       scrollHeight: scrollContainer.scrollHeight,
       clientHeight: scrollContainer.clientHeight
     });
-    active.rows.forEach((node, index) => {
-      const rect = node.getBoundingClientRect();
+    const rowMeasurements = active.rows.map((node) => ({
+      node,
+      identity: rowIdentity(node),
+      rect: node.getBoundingClientRect()
+    }));
+    rowMeasurements.forEach(({ node, identity, rect }, index) => {
       const clipTop = Math.max(0, scrollerRect?.top || 0);
       const clipBottom = Math.min(innerHeight, scrollerRect?.bottom || innerHeight);
       const visibleHeight = Math.max(0, Math.min(rect.bottom, clipBottom) - Math.max(rect.top, clipTop));
       const visibleRatio = rect.height > 0 ? Math.min(1, visibleHeight / rect.height) : 0;
       const wasActuallyVisible = document.visibilityState === "visible" && visibleRatio >= 0.05;
       const center = rect.top + rect.height / 2;
-      const extractedRecord = records[index];
-      const record = wasActuallyVisible ? extractedRecord : null;
+      const record = wasActuallyVisible ? recordFromNode(node, nowDate) : null;
+      records[index] = record;
       const snapshot = {
-        record, messageId: rowIdentity(node)?.messageId, routeKey: active.route.routeKey,
+        record, messageId: identity?.messageId, routeKey: active.route.routeKey,
         listNode: active.node, listIdentity: active.identity, parentNode: node.parentElement,
         capturedAtPerf: nowPerf, visibleRatio,
         innerViewport: center >= Math.max(56, innerHeight * 0.12) && center <= innerHeight * 0.88,
         tailCandidate: index === active.rows.length - 1,
         wasAtBottom,
-        previousId: index > 0 ? rowIdentity(active.rows[index - 1])?.messageId : null,
-        nextId: index + 1 < active.rows.length ? rowIdentity(active.rows[index + 1])?.messageId : null,
-        previousTop: index > 0 ? active.rows[index - 1].getBoundingClientRect().top : null
+        previousId: index > 0 ? rowMeasurements[index - 1].identity?.messageId : null,
+        nextId: index + 1 < active.rows.length ? rowMeasurements[index + 1].identity?.messageId : null,
+        previousTop: index > 0 ? rowMeasurements[index - 1].rect.top : null
       };
       state.snapshots.set(node, snapshot);
       if (record) {
@@ -2201,10 +2251,160 @@
         if (persist) queueRecord(record);
       }
     });
-    reconcileTombstones();
+    reconcileTombstones(active);
     reconcileEditHistories(active);
     reconcileLiveAuthorActions(active, records);
-    applyRetainedStyles();
+    applyRetainedStyles(active);
+  }
+
+  function scheduleSnapshot(persist, delayValue) {
+    if (!state.snapshotScheduler) {
+      state.snapshotScheduler = Core.createTrailingFrameScheduler(snapshotRenderedMessages, {
+        requestFrame: (callback) => requestAnimationFrame(callback),
+        cancelFrame: (token) => cancelAnimationFrame(token),
+        setTimer: (callback, delay) => setTimeout(callback, delay),
+        clearTimer: (token) => clearTimeout(token)
+      });
+    }
+    state.snapshotScheduler(Boolean(persist), Math.max(0, Number(delayValue) || 0));
+  }
+
+  function captureScrollMessageNode(node, route, persist) {
+    const identity = rowIdentity(node);
+    if (!route || !identity || (identity.channelId && identity.channelId !== route.channelId)) return null;
+    const record = recordFromNode(node, Date.now());
+    if (!record) return null;
+    const existing = state.snapshots.get(node);
+    const snapshot = Object.assign({
+      record,
+      messageId: identity.messageId,
+      routeKey: route.routeKey,
+      listNode: state.activeList,
+      listIdentity: state.listIdentity,
+      parentNode: node.parentElement,
+      capturedAtPerf: performance.now(),
+      visibleRatio: 0,
+      innerViewport: false,
+      tailCandidate: false,
+      wasAtBottom: false,
+      previousId: null,
+      nextId: null,
+      previousTop: null
+    }, existing || {}, {
+      record,
+      messageId: identity.messageId,
+      routeKey: route.routeKey,
+      capturedAtPerf: performance.now()
+    });
+    state.snapshots.set(node, snapshot);
+    state.snapshotsByKey.set(Core.recordKey(record), snapshot);
+    while (state.snapshotsByKey.size > 2500) state.snapshotsByKey.delete(state.snapshotsByKey.keys().next().value);
+    verifyPendingEditsForRecord(record);
+    retractIfReappeared(record);
+    if (persist) queueRecord(record, { deferDuringScroll: true });
+    return snapshot;
+  }
+
+  function capturePendingScrollRows(persist) {
+    const route = Core.parseDiscordRoute(location.pathname);
+    const startedAt = performance.now();
+    const rows = [...state.pendingScrollRows]
+      .sort((left, right) => {
+        const priorityDelta = Number(state.priorityScrollRows.has(right)) - Number(state.priorityScrollRows.has(left));
+        return priorityDelta || Number(Boolean(left.isConnected)) - Number(Boolean(right.isConnected));
+      });
+    let captured = 0;
+    for (const row of rows) {
+      state.pendingScrollRows.delete(row);
+      state.priorityScrollRows.delete(row);
+      try { captureScrollMessageNode(row, route, persist); } catch (_error) {}
+      captured += 1;
+      if (captured >= SCROLL_CAPTURE_ROWS_PER_FRAME ||
+        performance.now() - startedAt >= SCROLL_CAPTURE_FRAME_BUDGET_MS) break;
+    }
+    if (state.pendingScrollRows.size) state.scrollCaptureFrameScheduler(Boolean(persist), 0);
+  }
+
+  function scheduleScrollingCapture(persist) {
+    if (!state.pendingScrollRows.size) return;
+    if (!state.scrollCaptureFrameScheduler) {
+      state.scrollCaptureFrameScheduler = Core.createTrailingFrameScheduler(capturePendingScrollRows, {
+        requestFrame: (callback) => requestAnimationFrame(callback),
+        cancelFrame: (token) => cancelAnimationFrame(token),
+        setTimer: (callback, delay) => setTimeout(callback, delay),
+        clearTimer: (token) => clearTimeout(token)
+      });
+    }
+    if (!state.scrollCaptureLimiter) {
+      state.scrollCaptureLimiter = Core.createRateLimitedScheduler(
+        (shouldPersist) => state.scrollCaptureFrameScheduler(shouldPersist, 0),
+        SCROLL_CAPTURE_INTERVAL_MS,
+        {
+          now: () => performance.now(),
+          setTimer: (callback, delay) => setTimeout(callback, delay),
+          clearTimer: (token) => clearTimeout(token)
+        }
+      );
+    }
+    state.scrollCaptureLimiter(Boolean(persist));
+  }
+
+  function collectScrollCaptureRows(mutations, route) {
+    const queue = (row) => {
+      if (!row) return;
+      const identity = rowIdentity(row);
+      if (!identity || identity.channelId && identity.channelId !== route?.channelId) return;
+      state.pendingScrollRows.add(row);
+    };
+    const addOwner = (node) => {
+      if (!node || node.nodeType !== Node.ELEMENT_NODE || extensionManagedNode(node)) return;
+      const owner = node.matches?.(MESSAGE_SELECTOR) ? node : node.closest?.(MESSAGE_SELECTOR);
+      queue(owner);
+    };
+    const addChangedSubtree = (node) => {
+      addOwner(node);
+      if (!node || node.nodeType !== Node.ELEMENT_NODE || extensionManagedNode(node)) return;
+      uniqueMessageNodes(node, route).forEach(queue);
+    };
+    for (const mutation of mutations) {
+      // The target is often Discord's whole virtual list. Only use its nearest
+      // owning row; recursively inspect the actually added subtree instead.
+      addOwner(mutation.target);
+      mutation.addedNodes.forEach(addChangedSubtree);
+    }
+  }
+
+  function rememberRecentRemovedMessages(mutations, route) {
+    const now = performance.now();
+    for (const mutation of mutations) {
+      mutation.removedNodes.forEach((node) => {
+        uniqueMessageNodes(node, route).forEach((message) => {
+          const snapshot = state.snapshots.get(message);
+          const pending = state.pendingScrollRows.has(message);
+          if ((!snapshot && !pending) || (snapshot && state.activeList && snapshot.listNode !== state.activeList)) return;
+          const identity = rowIdentity(message);
+          const messageId = snapshot?.messageId || identity?.messageId;
+          const channelId = route?.channelId || snapshot?.record?.channelId || identity?.channelId;
+          if (!channelId || !messageId) return;
+          // Keep a newly detached row in pendingScrollRows. The bounded capture
+          // owns extraction; lifecycle confirmation retries after it completes.
+          if (pending) {
+            state.priorityScrollRows.add(message);
+          }
+          state.recentRemovals.set(`${channelId}:${messageId}`, now);
+          while (state.recentRemovals.size > 500) state.recentRemovals.delete(state.recentRemovals.keys().next().value);
+        });
+      });
+    }
+  }
+
+  function trimPendingScrollRows() {
+    while (state.pendingScrollRows.size > 500) {
+      const victim = [...state.pendingScrollRows].find((candidate) => !state.priorityScrollRows.has(candidate)) ||
+        state.pendingScrollRows.values().next().value;
+      state.pendingScrollRows.delete(victim);
+      state.priorityScrollRows.delete(victim);
+    }
   }
 
   function findChatScrollContainer(list) {
@@ -2220,6 +2420,27 @@
   function countElementTree(node) {
     if (!node || node.nodeType !== Node.ELEMENT_NODE) return 0;
     return 1 + Math.min(2000, node.querySelectorAll("*").length);
+  }
+
+  function extensionManagedNode(node) {
+    const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+    if (!element) return false;
+    const selector = "[data-ldma-tombstone], [data-ldma-edit-history], [data-ldma-author-actions-host]";
+    return Boolean(element.matches?.(selector) || element.closest?.(selector));
+  }
+
+  function extensionOnlyMutation(mutation) {
+    const changed = [...mutation.addedNodes, ...mutation.removedNodes];
+    return changed.length > 0 && changed.every(extensionManagedNode);
+  }
+
+  function mutationTouchesMessageSurface(mutation, activeList) {
+    if (!activeList) return true;
+    const touches = (node) => {
+      const element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+      return Boolean(element && (element === activeList || activeList.contains(element) || element.contains?.(activeList)));
+    };
+    return touches(mutation.target) || [...mutation.addedNodes, ...mutation.removedNodes].some(touches);
   }
 
   function explicitRootReplacement(removedRoots, activeList) {
@@ -2274,16 +2495,25 @@
 
   function handleMutations(mutations) {
     if (state.paused) return;
-    if (!state.activeList) {
-      requestAnimationFrame(() => snapshotRenderedMessages(true));
+    const relevantMutations = mutations.filter((mutation) =>
+      !extensionOnlyMutation(mutation) && mutationTouchesMessageSurface(mutation, state.activeList));
+    if (!relevantMutations.length) return;
+    const route = Core.parseDiscordRoute(location.pathname);
+    if (!state.activeList || performance.now() - state.lastScrollAt < Core.DEFAULTS.scrollQuietMs) {
+      // Discord's virtual list deliberately removes large subtrees while the
+      // user scrolls. Capture only changed message rows at a bounded rate and
+      // retain known removals, while skipping global scans and inference work.
+      collectScrollCaptureRows(relevantMutations, route);
+      rememberRecentRemovedMessages(relevantMutations, route);
+      trimPendingScrollRows();
+      scheduleScrollingCapture(true);
       return;
     }
     const removedRoots = [];
     const candidateMap = new Map();
     let totalRemovedElementCount = 0;
     let addedMessageCount = 0;
-    const route = Core.parseDiscordRoute(location.pathname);
-    for (const mutation of mutations) {
+    for (const mutation of relevantMutations) {
       mutation.removedNodes.forEach((node) => {
         removedRoots.push(node);
         totalRemovedElementCount += countElementTree(node);
@@ -2309,7 +2539,7 @@
         removedMessageCount: candidateMap.size, totalRemovedElementCount, addedMessageCount
       }));
     }
-    requestAnimationFrame(() => snapshotRenderedMessages(true));
+    scheduleSnapshot(true, 0);
   }
 
   function noteScroll(event) {
@@ -2319,7 +2549,11 @@
     // actual virtual-list movement is independently invalidated by its native
     // snowflake range signature.
     if (event?.type === "wheel" || event?.type === "touchmove") state.anchorlessEpoch += 1;
-    setTimeout(() => snapshotRenderedMessages(false), Core.DEFAULTS.scrollQuietMs + 50);
+    clearTimeout(state.scrollSettleTimer);
+    state.scrollSettleTimer = setTimeout(() => {
+      state.scrollSettleTimer = null;
+      scheduleSnapshot(false, 0);
+    }, Core.DEFAULTS.scrollQuietMs + 50);
   }
 
   function knownDeletion(channelId, messageId, allowConfirmed) {
@@ -2720,13 +2954,16 @@
       state.anchorlessEpoch += 1;
       state.signatures.clear();
       state.recentRemovals.clear();
+      state.pendingScrollRows.clear();
+      state.priorityScrollRows.clear();
+      state.scrollCaptureLimiter?.cancel();
+      state.scrollCaptureFrameScheduler?.cancel();
+      clearTimeout(state.scrollSettleTimer);
+      state.scrollSettleTimer = null;
       state.pendingRetainedKeys.clear();
       state.pendingReleaseKeys.clear();
       state.pendingConfirmedMounts.clear();
       state.stagedSelfEdits.clear();
-      clearTimeout(state.authorResolutionTimer);
-      state.authorResolutionTimer = null;
-      state.pendingAuthorResolutionIds.clear();
       state.activeList = null;
       state.listIdentity = null;
       removeTombstone();
@@ -2735,7 +2972,7 @@
       if (!route) send({ type: LIVE_HEALTH, status: "inactive", detail: "This Discord document is outside a channel route." }).catch(() => {});
       refreshArchive().catch(() => {});
       if (route) requestPageHook("channel-route-entered").catch(() => {});
-      setTimeout(() => snapshotRenderedMessages(true), Core.DEFAULTS.routeQuietMs + 50);
+      setTimeout(() => scheduleSnapshot(true, 0), Core.DEFAULTS.routeQuietMs + 50);
     }
   }
 
@@ -2758,9 +2995,15 @@
     document.addEventListener("scroll", noteScroll, true);
     document.addEventListener("wheel", noteScroll, { capture: true, passive: true });
     document.addEventListener("touchmove", noteScroll, { capture: true, passive: true });
+    document.addEventListener("pointerover", handleLiveAuthorActionInterest, true);
+    document.addEventListener("focusin", handleLiveAuthorActionInterest, true);
+    window.addEventListener("message", handleMediaFrameSize);
     window.addEventListener("resize", scheduleTombstoneSpacing, { passive: true });
     setInterval(checkRoute, 300);
-    setInterval(() => snapshotRenderedMessages(true), 2000);
+    setInterval(() => {
+      if (performance.now() - state.lastScrollAt < Core.DEFAULTS.scrollQuietMs) scheduleScrollingCapture(true);
+      else scheduleSnapshot(true, 0);
+    }, 2000);
     setInterval(() => {
       if (state.route && (state.pageHookStatus !== "active" ||
         performance.now() - state.pageHookLastSeenAt > 15000)) {
@@ -2778,7 +3021,7 @@
       requestPageHook(reason || "content-recovery").catch(() => {});
       refreshArchive().then(() => {
         checkRoute();
-        snapshotRenderedMessages(true);
+        scheduleSnapshot(true, 0);
         signalPageBridgeReady();
       }).catch(() => {});
     };

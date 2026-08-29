@@ -36,7 +36,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.6.6");
+  assert.equal(manifest.version, "2.6.7");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -104,6 +104,7 @@ test("background self-heals fresh, restored, updated, and SPA Discord documents"
   assert.match(hook, /scanWebpack\(requireFunction, true\)/);
   assert.match(hook, /bridgeMessage\("ready-request"\)/);
   assert.match(hook, /reconcileMessageStore/);
+  assert.match(hook, /if \(!messageStorePatched\) \{[\s\S]*scanWebpack\(requireFunction\)/);
   assert.match(hook, /recoveryTicks % 4/);
   assert.match(hook, /recoveryTicks % 20/);
 });
@@ -134,7 +135,15 @@ test("content contains retraction and tombstone reconciliation hooks", () => {
   assert.match(content, /generationAtMutation/);
   assert.match(content, /pendingRecords\.set\(key, \{ record, generation: state\.generation, signature \}\)/);
   assert.match(content, /Protocol\.shouldApplyArchive/);
-  assert.match(content, /snapshotRenderedMessages\(true\), 2000/);
+  assert.match(content, /scheduleScrollingCapture\(true\)[\s\S]*scheduleSnapshot\(true, 0\)[\s\S]*}, 2000\)/);
+  assert.match(content, /Core\.createTrailingFrameScheduler/);
+  assert.match(content, /Core\.createRateLimitedScheduler/);
+  assert.match(content, /function rememberRecentRemovedMessages/);
+  assert.match(content, /mediaFrameWindows\.get\(event\.source\)/);
+  assert.match(content, /else deactivate\(\)/);
+  assert.match(content, /function extensionOnlyMutation/);
+  assert.match(content, /performance\.now\(\) - state\.lastScrollAt < Core\.DEFAULTS\.scrollQuietMs/);
+  assert.doesNotMatch(content, /setTimeout\(\(\) => snapshotRenderedMessages\(false\), Core\.DEFAULTS\.scrollQuietMs/);
   assert.match(content, /broker-unavailable/);
   assert.match(content, /authorFromAriaLabelledBy/);
   assert.match(content, /function groupRootFromNode/);
@@ -294,6 +303,12 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.match(content, /`\[id="message-username-\$\{messageId\}"\]`/);
   assert.match(content, /function reconcileLiveAuthorActions/);
   assert.match(content, /reconcileLiveAuthorActions\(active, records\)/);
+  assert.match(content, /function handleLiveAuthorActionInterest/);
+  assert.match(content, /document\.addEventListener\("pointerover", handleLiveAuthorActionInterest, true\)/);
+  assert.equal((content.match(/type: RESOLVE_MESSAGE_AUTHORS/g) || []).length, 1,
+    "author resolution must occur only in the click-time resolver");
+  assert.equal(/queueAuthorResolution/.test(content), false,
+    "scroll-time live action rendering must not resolve authors eagerly");
   assert.match(content, /data-ldma-author-actions-host/);
   assert.match(content, /host\.attachShadow\(\{ mode: "closed" \}\)/);
   assert.match(content, /child\.matches\("\[class\*='hiddenVisually_'\], \[aria-hidden='true'\], \[data-ldma-author-actions\]"\)/);
@@ -461,7 +476,10 @@ test("media capture, cache broker, offscreen downloader, and local player are pa
   assert.match(viewerCss, /border-radius:\s*8px/);
   assert.match(viewerCss, /overflow-y: auto/);
   assert.match(viewer, /LDMA_MEDIA_SIZE/);
-  assert.match(content, /event\.source !== frame\.contentWindow/);
+  assert.match(content, /mediaFrameWindows\.get\(event\.source\)/);
+  assert.match(content, /new IntersectionObserver/);
+  assert.match(viewer, /lastReportedSize/);
+  assert.match(viewer, /window\.addEventListener\("pagehide", disposeView\)/);
   assert.equal(/height:480px/.test(content.replace(/\s+/g, "")), false);
   assert.match(history, /Core\.exportMediaUrl/);
   assert.match(history, /recordViews/);

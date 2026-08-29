@@ -41,6 +41,76 @@ test("parses server and direct-message channel routes", () => {
   assert.equal(Core.parseDiscordRoute("/settings/account"), null);
 });
 
+test("trailing frame scheduler collapses scroll storms and preserves persistent capture", () => {
+  const frames = new Map();
+  const timers = new Map();
+  const runs = [];
+  let token = 0;
+  const scheduler = Core.createTrailingFrameScheduler((persist) => runs.push(persist), {
+    requestFrame(callback) { const id = ++token; frames.set(id, callback); return id; },
+    cancelFrame(id) { frames.delete(id); },
+    setTimer(callback, delay) { const id = ++token; timers.set(id, { callback, delay }); return id; },
+    clearTimer(id) { timers.delete(id); }
+  });
+
+  for (let index = 0; index < 1000; index += 1) scheduler(index === 400, 1550);
+  assert.deepEqual(scheduler.pending(), { frame: false, timer: true, persist: true });
+  assert.equal(timers.size, 1);
+  assert.equal(frames.size, 0);
+  const trailing = [...timers.values()][0];
+  timers.clear();
+  trailing.callback();
+  assert.equal(frames.size, 1);
+  [...frames.values()][0]();
+  frames.clear();
+  assert.deepEqual(runs, [true]);
+  assert.deepEqual(scheduler.pending(), { frame: false, timer: false, persist: false });
+});
+
+test("trailing frame scheduler runs at most once for a mutation burst", () => {
+  const frames = new Map();
+  const runs = [];
+  let token = 0;
+  const scheduler = Core.createTrailingFrameScheduler((persist) => runs.push(persist), {
+    requestFrame(callback) { const id = ++token; frames.set(id, callback); return id; },
+    cancelFrame(id) { frames.delete(id); },
+    setTimer() { throw new Error("unexpected timer"); },
+    clearTimer() {}
+  });
+  for (let index = 0; index < 500; index += 1) scheduler(index % 2 === 0, 0);
+  assert.equal(frames.size, 1);
+  [...frames.values()][0]();
+  assert.deepEqual(runs, [true]);
+});
+
+test("rate-limited scheduler cannot be starved by a continuous event stream", () => {
+  const timers = new Map();
+  const runs = [];
+  let now = 0;
+  let token = 0;
+  const scheduler = Core.createRateLimitedScheduler((persist) => runs.push({ at: now, persist }), 250, {
+    now: () => now,
+    setTimer(callback, delay) { const id = ++token; timers.set(id, { callback, delay }); return id; },
+    clearTimer(id) { timers.delete(id); }
+  });
+
+  scheduler(false);
+  assert.deepEqual(runs, [{ at: 0, persist: false }]);
+  now = 10;
+  for (let index = 0; index < 1000; index += 1) scheduler(index === 500);
+  assert.equal(timers.size, 1);
+  assert.equal([...timers.values()][0].delay, 240);
+  now = 250;
+  const bounded = [...timers.values()][0];
+  timers.clear();
+  bounded.callback();
+  assert.deepEqual(runs, [
+    { at: 0, persist: false },
+    { at: 250, persist: true }
+  ]);
+  assert.deepEqual(scheduler.pending(), { timer: false, persist: false, lastRunAt: 250 });
+});
+
 test("live action ownership accepts Discord's nested article inside its outer message row", () => {
   const messageId = "888888888888888881";
   const channelId = "777777777777777777";

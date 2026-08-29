@@ -56,7 +56,7 @@ function backgroundHarness(options) {
   const chrome = {
     runtime: {
       id: "extension-id",
-      getManifest() { return { version: options?.version || "2.6.6" }; },
+      getManifest() { return { version: options?.version || "2.6.7" }; },
       getURL(relative) { return `chrome-extension://extension-id/${relative}`; },
       onMessage: events.message,
       onConnect: events.connect,

@@ -25,6 +25,8 @@
   let retryTimer = null;
   let retryDelayMs = 250;
   let retryDeadline = 0;
+  let sizeFrame = 0;
+  let lastReportedSize = "";
 
   function clearRetryTimer() {
     if (retryTimer !== null) clearTimeout(retryTimer);
@@ -192,7 +194,9 @@
   }
 
   function reportSize() {
-    requestAnimationFrame(() => {
+    if (sizeFrame) return;
+    sizeFrame = requestAnimationFrame(() => {
+      sizeFrame = 0;
       const rect = root.getBoundingClientRect();
       let desiredWidth = rect.width;
       if (root.classList.contains("gallery")) desiredWidth = 550;
@@ -208,10 +212,15 @@
       for (const element of root.querySelectorAll(".asset--file, .asset--link")) {
         desiredWidth = Math.max(desiredWidth, Math.min(430, element.scrollWidth));
       }
+      const width = Math.min(550, Math.max(40, Math.ceil(desiredWidth)));
+      const height = Math.min(1600, Math.max(24, Math.ceil(root.scrollHeight)));
+      const signature = `${width}:${height}`;
+      if (signature === lastReportedSize) return;
+      lastReportedSize = signature;
       parent.postMessage({
         type: "LDMA_MEDIA_SIZE",
-        width: Math.min(550, Math.max(40, Math.ceil(desiredWidth))),
-        height: Math.min(1600, Math.max(24, Math.ceil(root.scrollHeight)))
+        width,
+        height
       }, PARENT_ORIGIN);
     });
   }
@@ -317,11 +326,18 @@
       root.replaceChildren(textElement("p", "empty", "This cached-media view is not authorized."));
     });
   });
-  window.addEventListener("beforeunload", () => {
+  let viewDisposed = false;
+  const disposeView = () => {
+    if (viewDisposed) return;
+    viewDisposed = true;
     clearRetryTimer();
+    if (sizeFrame) cancelAnimationFrame(sizeFrame);
+    sizeFrame = 0;
     clearRenderedAssets();
     revokeObjectUrls();
-  });
+  };
+  window.addEventListener("pagehide", disposeView);
+  window.addEventListener("beforeunload", disposeView);
   connectUpdates();
   if (typeof ResizeObserver === "function") new ResizeObserver(reportSize).observe(root);
   renderCurrent().catch(() => {});

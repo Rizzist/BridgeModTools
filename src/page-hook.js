@@ -992,7 +992,12 @@
   if (controller.pendingRecovery) recoverHook("queued-injection");
   let recoveryTicks = 0;
   setInterval(() => {
-    for (const requireFunction of webpackInstances) scanWebpack(requireFunction);
+    // Once retention is healthy, reconcileMessageStore below is the cheap
+    // integrity check. Enumerating Discord's full module cache every tick is
+    // unnecessary and can contend with scrolling in image-heavy channels.
+    if (!messageStorePatched) {
+      for (const requireFunction of webpackInstances) scanWebpack(requireFunction);
+    }
     if (!dispatchers.size && !webpackInstances.size && "webpackChunkdiscord_app" in window) observeWebpackGlobal();
     if (messageStoreCandidate) reconcileMessageStore("integrity-tick");
     recoveryTicks += 1;
