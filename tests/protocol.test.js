@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const Protocol = require("../src/protocol.js");
+const Core = require("../src/core.js");
 
 const T = Protocol.TYPES;
 
@@ -206,7 +207,90 @@ test("MessageStore retention is persisted as a distinct confirmed deletion sourc
   assert.equal(confirmed.archive.records[0].deletionSource, "message_store_preserved");
 });
 
-test("MessageStore retention can promote a just-captured row even when the seen archive is saturated", () => {
+test("direct retained confirmation promotes the freshest observed body without a seen upsert", () => {
+  const old = { ...seen("2", 10), content: "old body", captureSessionId: "page", captureSequence: 1,
+    attachments: ["old.png"], media: [{ kind: "image", url: "https://cdn.discordapp.com/attachments/1/2/old.png" }],
+    reply: { messageId: "222222222222222222", content: "old quote", state: "available" } };
+  const fresh = { ...old, content: "fresh body", capturedAt: 20, captureSequence: 2,
+    attachments: ["new.png"], media: [{ kind: "image", url: "https://cdn.discordapp.com/attachments/1/2/new.png" }],
+    reply: { ...old.reply, content: "fresh quote" } };
+  const confirmed = Protocol.applyCommand({ ...Protocol.emptyArchive(), records: [old] }, {
+    type: T.CONFIRM_DELETED, generation: 0, deletions: [{ record: fresh, source: "message_store_preserved" }]
+  }, 30).archive.records[0];
+  assert.equal(confirmed.status, "confirmed_deleted");
+  assert.equal(confirmed.content, "fresh body");
+  assert.deepEqual(confirmed.attachments, ["new.png"]);
+  assert.equal(confirmed.media[0].url, fresh.media[0].url);
+  assert.equal(confirmed.reply.content, "fresh quote");
+  assert.equal(confirmed.capturedAt, 20);
+  assert.equal(confirmed.captureSequence, 2);
+});
+
+test("confirmation snapshot freshness uses session sequence and cross-session capture time", () => {
+  const current = { ...seen("2", 20), content: "current", captureSessionId: "page-a", captureSequence: 2,
+    reply: { messageId: "222222222222222222", content: "current quote", state: "available" } };
+  const cases = [
+    { snapshot: { ...current, content: "older sequence", captureSequence: 1, capturedAt: 100 }, expected: "current" },
+    { snapshot: { ...current, content: "same sequence", capturedAt: 100 }, expected: "current" },
+    { snapshot: { ...current, content: "new sequence", captureSequence: 3, capturedAt: 10 }, expected: "new sequence" },
+    { snapshot: { ...current, content: "older session capture", captureSessionId: "page-b", captureSequence: 999, capturedAt: 10 }, expected: "current" },
+    { snapshot: { ...current, content: "newer session capture", captureSessionId: "page-b", captureSequence: 1, capturedAt: 30 }, expected: "newer session capture" },
+    { snapshot: { ...seen("2", 30), content: "newer unsequenced capture" }, expected: "newer unsequenced capture" }
+  ];
+  for (const { snapshot, expected } of cases) {
+    snapshot.reply = { ...current.reply, content: "incoming quote" };
+    const result = Protocol.applyCommand({ ...Protocol.emptyArchive(), records: [current] }, {
+      type: T.CONFIRM_DELETED, generation: 0, deletions: [{ record: snapshot, source: "message_store_preserved" }]
+    }, 200).archive.records[0];
+    assert.equal(result.content, expected, snapshot.content);
+    assert.equal(result.reply.content, expected === "current" ? "current quote" : "incoming quote", snapshot.content);
+  }
+});
+
+test("direct deletion payload refresh preserves compounded edit history and its cursor", () => {
+  const original = { ...seen("2", 1), content: "A", captureSessionId: "capture", captureSequence: 1 };
+  let archive = Protocol.applyCommand({ ...Protocol.emptyArchive(), records: [original] }, {
+    type: T.CONFIRM_EDIT, generation: 0, record: original, editedAt: 10,
+    editSessionId: "edit-page", editSequence: 1
+  }, 10).archive;
+  const second = { ...original, content: "B", capturedAt: 11, captureSequence: 2 };
+  archive = Protocol.applyCommand(archive, { type: T.UPSERT_RECORDS, generation: 0, records: [second] }, 11).archive;
+  archive = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_EDIT, generation: 0, record: second, editedAt: 20,
+    editSessionId: "edit-page", editSequence: 2
+  }, 20).archive;
+  const latest = { ...second, content: "C", capturedAt: 21, captureSequence: 3,
+    editHistory: [{ revisionId: "stale:1", content: "stale incoming history", supersededAt: 2 }],
+    editSessionId: "stale-edit-page", lastEditSequence: 1, lastEditedAt: 2 };
+  const confirmed = Protocol.applyCommand(archive, {
+    type: T.CONFIRM_DELETED, generation: 0, deletions: [{ record: latest, source: "message_store_preserved" }]
+  }, 30).archive.records[0];
+  assert.equal(confirmed.content, "C");
+  assert.deepEqual(confirmed.editHistory.map((revision) => revision.content), ["A", "B"]);
+  assert.equal(confirmed.editSessionId, "edit-page");
+  assert.equal(confirmed.lastEditSequence, 2);
+  assert.equal(confirmed.lastEditedAt, 20);
+});
+
+test("replayed confirmations cannot replace an already confirmed body or reply", () => {
+  const prior = { ...seen("2", 10), content: "authoritative body", status: "confirmed_deleted",
+    captureSessionId: "page", captureSequence: 1,
+    attachments: ["original.png"], media: [{ kind: "image", url: "https://cdn.discordapp.com/attachments/1/2/original.png" }],
+    reply: { messageId: "222222222222222222", content: "authoritative quote", state: "available" } };
+  const replay = { ...prior, content: "stale retained DOM", capturedAt: 20, captureSequence: 2,
+    attachments: [], media: [], reply: { ...prior.reply, content: "stale retained quote" } };
+  const result = Protocol.applyCommand({ ...Protocol.emptyArchive(), records: [prior] }, {
+    type: T.CONFIRM_DELETED, generation: 0, deletions: [{ record: replay, source: "message_store_preserved" }]
+  }, 30).archive.records[0];
+  assert.equal(result.content, prior.content);
+  assert.deepEqual(result.attachments, prior.attachments);
+  assert.equal(result.media[0].url, prior.media[0].url);
+  assert.equal(result.reply.content, prior.reply.content);
+  assert.equal(result.capturedAt, prior.capturedAt);
+  assert.equal(result.captureSequence, prior.captureSequence);
+});
+
+test("MessageStore retention can promote a just-captured row absent from the archive", () => {
   const confirmed = Protocol.applyCommand(Protocol.emptyArchive(), {
     type: T.CONFIRM_DELETED,
     generation: 0,
@@ -215,6 +299,38 @@ test("MessageStore retention can promote a just-captured row even when the seen 
   assert.equal(confirmed.accepted, true);
   assert.equal(confirmed.archive.records[0].messageId, "77");
   assert.equal(confirmed.archive.records[0].status, "confirmed_deleted");
+});
+
+test("actual saturation preserves a newly posted tail for lifecycle confirmation", () => {
+  const deleted = Array.from({ length: Core.DEFAULTS.maxRecords }, (_, index) => ({
+    ...seen(String(100000000000000000n + BigInt(index)), index + 1), status: "confirmed_deleted"
+  }));
+  const fresh = Array.from({ length: Core.DEFAULTS.seenReserve + 10 }, (_, index) =>
+    seen(String(200000000000000000n + BigInt(index)), 2000));
+  const captured = Protocol.applyCommand({ ...Protocol.emptyArchive(), records: deleted }, {
+    type: T.UPSERT_RECORDS, generation: 0, records: fresh
+  }, 3000);
+  assert.equal(captured.archive.records.length, Core.DEFAULTS.maxRecords);
+  assert.equal(captured.archive.records.filter((record) => record.status === "seen").length, Core.DEFAULTS.seenReserve);
+  const tail = fresh.at(-1);
+  assert.ok(captured.archive.records.some((record) => record.messageId === tail.messageId));
+  const confirmed = Protocol.applyCommand(captured.archive, {
+    type: T.CONFIRM_DELETED, generation: 0, deletions: [{ record: tail }]
+  }, 3001);
+  assert.equal(confirmed.accepted, true);
+  assert.equal(confirmed.archive.records.find((record) => record.messageId === tail.messageId).status, "confirmed_deleted");
+
+  const pruned = fresh[0];
+  assert.equal(captured.archive.records.some((record) => record.messageId === pruned.messageId), false);
+  const unverified = Protocol.applyCommand(captured.archive, {
+    type: T.CONFIRM_DELETED, generation: 0, deletions: [{ record: pruned }]
+  }, 3001);
+  assert.equal(unverified.reason, "missing-records", "generic lifecycle events cannot introduce unknown snapshots");
+  const retained = Protocol.applyCommand(captured.archive, {
+    type: T.CONFIRM_DELETED, generation: 0, deletions: [{ record: pruned, source: "message_store_preserved" }]
+  }, 3001);
+  assert.equal(retained.accepted, true);
+  assert.equal(retained.archive.records.find((record) => record.messageId === pruned.messageId).status, "confirmed_deleted");
 });
 
 test("a clear or pause generation boundary rejects an old lifecycle deletion", () => {

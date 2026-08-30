@@ -1,7 +1,7 @@
 (function installLocalDiscordLifecycleHook() {
   "use strict";
 
-  const HOOK_API_VERSION = 3;
+  const HOOK_API_VERSION = 4;
   const INSTALL_KEY = Symbol.for("BridgeModTools.pageHook.v1");
   const existingController = window[INSTALL_KEY];
   if (existingController && typeof existingController.recover === "function") {
@@ -32,6 +32,7 @@
   const SNOWFLAKE = /^\d{15,25}$/;
   const MAX_BULK_IDS = 200;
   const MAX_RETAINED_KEYS = 5000;
+  const MAX_PENDING_DELETIONS = 5000;
   const TIMEOUT_7D_SECONDS = 7 * 24 * 60 * 60;
   const webpackInstances = new Set();
   const scannedModules = new WeakMap();
@@ -43,6 +44,10 @@
   const patchedRetentionDispatchers = new WeakMap();
   const releaseKeys = new Set();
   const retainedKeys = new Set();
+  // A retained native row is not a durable archive record. Keep only its IDs
+  // until the isolated script acknowledges persistence, including off-route
+  // events that cannot be captured until their channel is visited again.
+  const pendingRetainedDeletes = new Map();
   const activeSelfEdits = new Map();
   const recentSelfEdits = new Map();
   let isolatedReady = false;
@@ -54,6 +59,9 @@
   let userProfileActionsCandidate = null;
   let timeoutUntilActionsCandidate = null;
   let messageStorePatched = false;
+  let deletionLedgerOverflowed = false;
+  let deletionResetReleaseFailed = false;
+  let lastDeletionReset = null;
   let lastStatus = "";
   let captureSequence = 0;
   let editSequence = 0;
@@ -67,6 +75,13 @@
   }
 
   function report(status, detail, force) {
+    if (status === "active" && deletionResetReleaseFailed) {
+      status = "degraded";
+      detail = "Some unarchived retained messages could not be released during archive reset; reload Discord to discard their native cache.";
+    } else if (status === "active" && deletionLedgerOverflowed) {
+      status = "degraded";
+      detail = "The 5,000-message deletion retry limit was reached; additional native deletions were not retained.";
+    }
     const signature = `${status}:${detail}`;
     if (!force && signature === lastStatus) return;
     lastStatus = signature;
@@ -103,13 +118,48 @@
     const ids = [...new Set((Array.isArray(idValues) ? idValues : [idValues]).map(cleanId).filter(Boolean))]
       .slice(0, MAX_BULK_IDS);
     if (!channelId || !ids.length) return;
-    const message = { bridge: BRIDGE, kind: "retained", channelId, ids, bulk: Boolean(bulk) };
-    if (!isolatedReady) {
-      bufferedEvents.push(message);
-      if (bufferedEvents.length > 100) bufferedEvents.shift();
-      return;
+    const admittedIds = [];
+    for (const id of ids) {
+      const key = `${channelId}:${id}`;
+      if (!pendingRetainedDeletes.has(key) && pendingRetainedDeletes.size >= MAX_PENDING_DELETIONS) {
+        deletionLedgerOverflowed = true;
+        continue;
+      }
+      pendingRetainedDeletes.set(key, { channelId, id, bulk: Boolean(bulk) });
+      admittedIds.push(id);
     }
-    window.postMessage(message, "*");
+    if (deletionLedgerOverflowed) report("active", "");
+    if (isolatedReady && admittedIds.length) bridgeMessage("retained", { channelId, ids: admittedIds, bulk: Boolean(bulk) });
+  }
+
+  function replayRetainedDeletes(channelValue) {
+    if (!isolatedReady) return;
+    const channelId = channelValue == null ? null : cleanId(channelValue);
+    if (channelValue != null && !channelId) return;
+    const groups = new Map();
+    for (const entry of pendingRetainedDeletes.values()) {
+      if (channelId && entry.channelId !== channelId) continue;
+      const key = `${entry.channelId}:${entry.bulk}`;
+      if (!groups.has(key)) groups.set(key, { channelId: entry.channelId, bulk: entry.bulk, ids: [] });
+      groups.get(key).ids.push(entry.id);
+    }
+    for (const group of groups.values()) {
+      for (let offset = 0; offset < group.ids.length; offset += MAX_BULK_IDS) {
+        bridgeMessage("retained", {
+          channelId: group.channelId,
+          ids: group.ids.slice(offset, offset + MAX_BULK_IDS),
+          bulk: group.bulk
+        });
+      }
+    }
+  }
+
+  function forgetPendingRetainedDeletes(channelValue, idValues) {
+    const channelId = cleanId(channelValue);
+    if (!channelId || !Array.isArray(idValues)) return;
+    for (const id of idValues.slice(0, MAX_BULK_IDS).map(cleanId).filter(Boolean)) {
+      pendingRetainedDeletes.delete(`${channelId}:${id}`);
+    }
   }
 
   function editTimestamp(value) {
@@ -436,24 +486,39 @@
 
   function retainCachedMessages(store, action, isBulk, captured) {
     const channelId = cleanId(action && (action.channelId || action.channel_id));
-    if (!channelId || !captured.length) return;
+    const result = { retainedIds: [], failedIds: captured.map((entry) => entry.id) };
+    if (!channelId || !captured.length) return result;
     let channelMessages;
-    try { channelMessages = store.getMessages(channelId); } catch (_error) { return; }
-    if (!channelMessages || typeof channelMessages.receiveMessage !== "function") return;
-    const retainedIds = [];
+    try { channelMessages = store.getMessages(channelId); } catch (_error) { return result; }
+    if (!channelMessages || typeof channelMessages.receiveMessage !== "function") return result;
     for (const entry of captured) {
+      const key = `${channelId}:${entry.id}`;
+      // Never keep a native row whose unresolved ID cannot remain replayable and
+      // reset-releasable. The caller forwards rejected IDs to native deletion.
+      if (!pendingRetainedDeletes.has(key) && pendingRetainedDeletes.size >= MAX_PENDING_DELETIONS) {
+        deletionLedgerOverflowed = true;
+        continue;
+      }
       const message = markedDeletedMessage(entry.message);
       if (!message) continue;
       try {
         channelMessages.receiveMessage(message);
-        retainedIds.push(entry.id);
-        retainedKeys.add(`${channelId}:${entry.id}`);
+        if (store.getMessage(channelId, entry.id)?.deleted !== true) continue;
+        // Register each success immediately so the next item in this same bulk
+        // batch observes the remaining capacity, before emitRetained runs.
+        pendingRetainedDeletes.set(key, { channelId, id: entry.id, bulk: Boolean(isBulk) });
+        result.retainedIds.push(entry.id);
+        retainedKeys.add(key);
         while (retainedKeys.size > MAX_RETAINED_KEYS) {
           retainedKeys.delete(retainedKeys.values().next().value);
         }
       } catch (_error) {}
     }
-    if (retainedIds.length) emitRetained(channelId, retainedIds, isBulk);
+    const retainedIds = new Set(result.retainedIds);
+    result.failedIds = result.failedIds.filter((id) => !retainedIds.has(id));
+    if (result.retainedIds.length) emitRetained(channelId, result.retainedIds, isBulk);
+    else if (deletionLedgerOverflowed) report("active", "");
+    return result;
   }
 
   function captureCachedMessages(store, action, isBulk) {
@@ -576,7 +641,17 @@
         if (releaseKeys.has(key)) return original.apply(this, arguments);
         const captured = captureCachedMessages(store, action, isBulk).captured;
         if (!captured.length) return original.apply(this, arguments);
-        retainCachedMessages(store, action, isBulk, captured);
+        const retained = retainCachedMessages(store, action, isBulk, captured);
+        if (!retained.retainedIds.length) return original.apply(this, arguments);
+        if (isBulk) {
+          const retainedIds = new Set(retained.retainedIds);
+          const remainingIds = action.ids.filter((id) => !retainedIds.has(cleanId(id)));
+          if (remainingIds.length) {
+            const forwarded = Array.from(arguments);
+            forwarded[0] = Object.assign({}, action, { ids: remainingIds });
+            return original.apply(this, forwarded);
+          }
+        }
         return undefined;
       };
       try {
@@ -934,14 +1009,31 @@
   }
 
   function releaseRetainedMessages(channelValue, idValues) {
+    // Explicit removal must also discard retry knowledge when the native cache
+    // or dispatcher has already disappeared.
+    forgetPendingRetainedDeletes(channelValue, idValues);
     const channelId = cleanId(channelValue);
+    const ids = [...new Set((Array.isArray(idValues) ? idValues : []).slice(0, MAX_BULK_IDS).map(cleanId).filter(Boolean))];
+    const result = { releasedIds: [], failedIds: [] };
     const dispatcher = coreDispatcher || fallbackDispatcher;
-    if (!channelId || !dispatcher) return;
-    for (const id of (Array.isArray(idValues) ? idValues : []).map(cleanId).filter(Boolean).slice(0, MAX_BULK_IDS)) {
+    if (!channelId) return result;
+    if (!dispatcher) return { releasedIds: [], failedIds: ids };
+    for (const id of ids) {
       const key = `${channelId}:${id}`;
+      let cachedMessage = null;
+      let cacheKnown = false;
       let markedInStore = false;
-      try { markedInStore = messageStoreCandidate?.getMessage(channelId, id)?.deleted === true; } catch (_error) {}
-      if (!retainedKeys.has(key) && !markedInStore) continue;
+      try {
+        if (typeof messageStoreCandidate?.getMessage === "function") {
+          cachedMessage = messageStoreCandidate.getMessage(channelId, id);
+          cacheKnown = true;
+          markedInStore = cachedMessage?.deleted === true;
+        }
+      } catch (_error) {}
+      if (!retainedKeys.has(key) && !markedInStore) {
+        (cacheKnown && !cachedMessage ? result.releasedIds : result.failedIds).push(id);
+        continue;
+      }
       releaseKeys.add(key);
       let dispatched = false;
       try {
@@ -954,9 +1046,51 @@
         } catch (_ignored) {}
       } finally {
         releaseKeys.delete(key);
-        if (dispatched) retainedKeys.delete(key);
+      }
+      let released = false;
+      try {
+        released = dispatched && typeof messageStoreCandidate?.getMessage === "function" &&
+          !messageStoreCandidate.getMessage(channelId, id);
+      } catch (_error) {}
+      if (released) retainedKeys.delete(key);
+      (released ? result.releasedIds : result.failedIds).push(id);
+    }
+    return result;
+  }
+
+  function resetPendingRetainedDeletes(resetToken) {
+    const validToken = Number.isSafeInteger(resetToken) && resetToken >= 0;
+    if (validToken && lastDeletionReset && resetToken <= lastDeletionReset.resetToken) {
+      bridgeMessage("deletions-reset", resetToken === lastDeletionReset.resetToken
+        ? lastDeletionReset : { resetToken, discarded: [] });
+      return;
+    }
+    const byChannel = new Map();
+    for (const entry of pendingRetainedDeletes.values()) {
+      if (!byChannel.has(entry.channelId)) byChannel.set(entry.channelId, []);
+      byChannel.get(entry.channelId).push(entry.id);
+    }
+    // A generation reset must not leave an unarchived native row behind to be
+    // captured as live in the new archive. ACKed rows are intentionally outside
+    // this retry ledger and keep their independent explicit-release lifecycle.
+    const discarded = [];
+    for (const [channelId, ids] of byChannel) {
+      for (let offset = 0; offset < ids.length; offset += MAX_BULK_IDS) {
+        const batch = ids.slice(offset, offset + MAX_BULK_IDS);
+        discarded.push({ channelId, ids: batch });
+        const released = releaseRetainedMessages(channelId, batch);
+        if (released.failedIds.length) deletionResetReleaseFailed = true;
       }
     }
+    pendingRetainedDeletes.clear();
+    for (let index = bufferedEvents.length - 1; index >= 0; index -= 1) {
+      if (bufferedEvents[index].kind === "delete" || bufferedEvents[index].kind === "retained") bufferedEvents.splice(index, 1);
+    }
+    deletionLedgerOverflowed = false;
+    if (deletionResetReleaseFailed) report("active", "");
+    const result = validToken ? { resetToken, discarded } : { discarded };
+    if (validToken) lastDeletionReset = result;
+    bridgeMessage("deletions-reset", result);
   }
 
   window.addEventListener("message", (event) => {
@@ -965,9 +1099,22 @@
       releaseRetainedMessages(event.data.channelId, event.data.ids);
       return;
     }
+    if (event.data.kind === "deletion-ack") {
+      forgetPendingRetainedDeletes(event.data.channelId, event.data.ids);
+      return;
+    }
+    if (event.data.kind === "reset-deletions") {
+      resetPendingRetainedDeletes(event.data.resetToken);
+      return;
+    }
+    if (event.data.kind === "sync-deletions") {
+      replayRetainedDeletes(event.data.channelId);
+      return;
+    }
     if (event.data.kind !== "isolated-ready") return;
     isolatedReady = true;
     while (bufferedEvents.length) window.postMessage(bufferedEvents.shift(), "*");
+    replayRetainedDeletes();
     lastStatus = "";
     if (messageStorePatched) {
       report("active", "Discord MessageStore edit history and deletion retention are active.");

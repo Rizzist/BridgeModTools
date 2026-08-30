@@ -277,6 +277,7 @@ test("scroll fast path records known removals without subtree classification", (
   const context = vm.createContext({
     state: {
       activeList: list,
+      scrollCaptureContexts: new WeakMap(), pendingDeletions: new Map(), generation: 0,
       snapshots: new WeakMap([[message, snapshot]]),
       pendingScrollRows: new Set([newlyMountedThenRemoved]),
       priorityScrollRows: new Set(),
@@ -306,7 +307,7 @@ test("list-level mutations queue only changed rows, never the whole virtual list
   const context = vm.createContext({
     Node: { ELEMENT_NODE: 1 },
     MESSAGE_SELECTOR: "message",
-    state: { pendingScrollRows: new Set() },
+    state: { pendingScrollRows: new Set(), scrollCaptureContexts: new WeakMap(), generation: 0 },
     extensionManagedNode: () => false,
     rowIdentity: (node) => node.messageId ? { channelId: "111111111111111111", messageId: node.messageId } : null,
     uniqueMessageNodes: (node) => node.descendants || (node.messageId ? [node] : [])
@@ -339,6 +340,7 @@ test("removal priority is assigned before a full scroll queue is trimmed", () =>
     MESSAGE_SELECTOR: "message",
     state: {
       activeList: null,
+      scrollCaptureContexts: new WeakMap(), pendingDeletions: new Map(), generation: 0,
       pendingScrollRows: new Set(pending),
       priorityScrollRows: new Set(),
       snapshots: new WeakMap(),
@@ -376,7 +378,7 @@ test("scroll row capture is rate-limited and retains detached row references", (
   const row = { isConnected: false };
   const captures = [];
   const context = vm.createContext({
-    state: { pendingScrollRows: new Set([row]), priorityScrollRows: new Set() },
+    state: { pendingScrollRows: new Set([row]), priorityScrollRows: new Set(), scrollCaptureContexts: new WeakMap() },
     Core: { parseDiscordRoute: () => ({ channelId: "111111111111111111" }) },
     location: { pathname: "/channels/111/222" },
     performance: { now: () => 10 },
@@ -398,6 +400,7 @@ test("one scroll frame captures a small detached-first work budget", () => {
   const context = vm.createContext({
     state: {
       pendingScrollRows: new Set(rows),
+      scrollCaptureContexts: new WeakMap(),
       priorityScrollRows: new Set(),
       scrollCaptureFrameScheduler: (persist, delay) => continuation.push({ persist, delay })
     },
@@ -424,6 +427,7 @@ test("a lifecycle removal jumps ahead of a 500-row detached backlog", () => {
   const context = vm.createContext({
     state: {
       pendingScrollRows: new Set(rows),
+      scrollCaptureContexts: new WeakMap(),
       priorityScrollRows: new Set([removed]),
       scrollCaptureFrameScheduler() {}
     },
@@ -447,7 +451,7 @@ test("scroll persistence batches many captures into one bounded archive flush", 
   let token = 0;
   let clears = 0;
   const context = vm.createContext({
-    state: { signatures: new Map(), pendingRecords: new Map(), generation: 7, flushTimer: null },
+    state: { signatures: new Map(), pendingRecords: new Map(), discardedDeletionKeys: new Set(), generation: 7, flushTimer: null },
     Core: { recordKey: (record) => record.key },
     recordSignature: (record) => record.value,
     setTimeout(callback, delay) { const id = ++token; timers.set(id, { callback, delay }); return id; },

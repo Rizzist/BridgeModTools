@@ -199,7 +199,7 @@ function runHook(options) {
   const ready = () => window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "isolated-ready" }, "*");
   if (!settings.deferReady && !settings.readyBeforeHook) ready();
   return {
-    posted, dispatched, subscriptions, fallbackSubscriptions, handlerNode, messages, users, dispatcher, window, ready,
+    posted, dispatched, subscriptions, fallbackSubscriptions, handlerNode, messages, users, dispatcher, window, ready, messageStore,
     reloads: () => settings.reloads || 0,
     legacyRecoveries: () => settings.legacyRecoveries || 0,
     userActionCalls,
@@ -256,7 +256,7 @@ function runHook(options) {
 test("duplicate page-hook injection recovers in place without duplicate listeners, timers, wrappers, or events", () => {
   const result = runHook();
   const originalDeleteWrapper = result.handlerNode.actionHandler.MESSAGE_DELETE;
-  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 3);
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 4);
   assert.equal(result.intervalCount(), 1);
   assert.equal(result.listenerCount("message"), 1);
 
@@ -396,6 +396,264 @@ test("MessageStore bulk deletes retain every cached native message", () => {
     bulk: true
   }]);
   assert.equal(JSON.stringify(retained).includes("must not cross"), false);
+});
+
+test("unacknowledged off-route retention replays on channel sync without crossing message content", () => {
+  const result = runHook();
+  const channelId = "777777777777777777";
+  const otherChannelId = "777777777777777778";
+  const id = "888888888888888881";
+  let activeChannelId = otherChannelId;
+  const captured = [];
+  result.window.addEventListener("message", (event) => {
+    if (event.data.kind === "retained" && event.data.channelId === activeChannelId) captured.push(event.data);
+  });
+  result.handlerNode.actionHandler.MESSAGE_DELETE({ channelId, id });
+  assert.equal(captured.length, 0);
+  assert.equal(result.messages.get(id).deleted, true);
+  activeChannelId = channelId;
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "sync-deletions", channelId: otherChannelId }, "*");
+  assert.equal(captured.length, 0);
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "sync-deletions", channelId }, "*");
+  assert.deepEqual(JSON.parse(JSON.stringify(captured)), [{
+    bridge: "LDMA_BRIDGE_V1", kind: "retained", channelId, ids: [id], bulk: false
+  }]);
+  assert.equal(JSON.stringify(captured).includes("retained content"), false);
+});
+
+test("retained IDs replay once per ready until acknowledgment, without changing release eligibility", () => {
+  const result = runHook({ deferReady: true });
+  const channelId = "777777777777777777";
+  const id = "888888888888888881";
+  result.handlerNode.actionHandler.MESSAGE_DELETE({ channelId, id });
+  const retainedCount = () => result.posted.filter((message) => message.kind === "retained").length;
+  assert.equal(retainedCount(), 0);
+  result.ready();
+  assert.equal(retainedCount(), 1, "initial readiness must not deliver both buffered and replay copies");
+  result.ready();
+  assert.equal(retainedCount(), 2, "lack of durable acknowledgment keeps the ID replayable");
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "deletion-ack", channelId, ids: [id] }, "*");
+  result.ready();
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "sync-deletions", channelId }, "*");
+  assert.equal(retainedCount(), 2);
+  // A native rehydration can drop the deleted property, but ACK must not drop
+  // retainedKeys: explicit archive removal still owns this cached native row.
+  result.messages.set(id, Object.assign({}, result.messages.get(id), { deleted: false }));
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "release", channelId, ids: [id] }, "*");
+  assert.equal(result.messages.has(id), false);
+});
+
+test("acknowledgment is scoped to validated channel IDs and at most 200 message IDs", () => {
+  const result = runHook();
+  const channelId = "777777777777777777";
+  const original = result.messages.values().next().value;
+  const ids = Array.from({ length: 201 }, (_, index) => String(888888888888888000n + BigInt(index)));
+  for (const id of ids) {
+    result.messages.set(id, Object.assign({}, original, { id }));
+    result.handlerNode.actionHandler.MESSAGE_DELETE({ channelId, id });
+  }
+  for (const message of [
+    { channelId: "invalid", ids },
+    { channelId: "777777777777777778", ids },
+    { channelId, ids: "not-an-array" }
+  ]) result.window.postMessage(Object.assign({ bridge: "LDMA_BRIDGE_V1", kind: "deletion-ack" }, message), "*");
+  let start = result.posted.length;
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "sync-deletions", channelId }, "*");
+  assert.equal(result.posted.slice(start).filter((message) => message.kind === "retained").flatMap((message) => message.ids).length, 201);
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "deletion-ack", channelId, ids }, "*");
+  start = result.posted.length;
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "sync-deletions", channelId }, "*");
+  assert.deepEqual(Array.from(result.posted.slice(start).filter((message) => message.kind === "retained").flatMap((message) => message.ids)), [ids[200]]);
+});
+
+test("release discards evicted-cache retries and reset releases only unacknowledged native messages", () => {
+  const result = runHook();
+  const channelId = "777777777777777777";
+  const id = "888888888888888881";
+  const secondId = "888888888888888882";
+  const archivedId = "888888888888888883";
+  result.messages.set(secondId, Object.assign({}, result.messages.get(id), { id: secondId }));
+  result.messages.set(archivedId, Object.assign({}, result.messages.get(id), { id: archivedId }));
+  result.handlerNode.actionHandler.MESSAGE_DELETE_BULK({ channelId, ids: [id, secondId, archivedId] });
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "deletion-ack", channelId, ids: [archivedId] }, "*");
+  result.messages.delete(id);
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "release", channelId, ids: [id] }, "*");
+  let start = result.posted.length;
+  result.ready();
+  assert.deepEqual(Array.from(result.posted.slice(start).filter((message) => message.kind === "retained").flatMap((message) => message.ids)), [secondId]);
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "reset-deletions" }, "*");
+  assert.equal(result.messages.has(secondId), false, "reset removes an unarchived retained native row");
+  assert.equal(result.messages.get(archivedId).deleted, true, "ACKed rows are outside the pending-reset lifecycle");
+  assert.equal(result.posted.filter((message) => message.kind === "deletions-reset").length, 1);
+  start = result.posted.length;
+  result.ready();
+  assert.equal(result.posted.slice(start).some((message) => message.kind === "retained"), false);
+  result.messages.set(archivedId, Object.assign({}, result.messages.get(archivedId), { deleted: false }));
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "release", channelId, ids: [archivedId] }, "*");
+  assert.equal(result.messages.has(archivedId), false);
+});
+
+test("reset acknowledges once and discards retries even when native release cannot be verified", () => {
+  const result = runHook();
+  const channelId = "777777777777777777";
+  const id = "888888888888888881";
+  result.handlerNode.actionHandler.MESSAGE_DELETE({ channelId, id });
+  result.messageStore.getMessage = () => { throw new Error("native cache unavailable"); };
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "reset-deletions" }, "*");
+  assert.equal(result.posted.filter((message) => message.kind === "deletions-reset").length, 1);
+  const start = result.posted.length;
+  result.ready();
+  result.tick(20);
+  assert.equal(result.posted.slice(start).some((message) => message.kind === "retained"), false);
+  const status = result.posted.filter((message) => message.kind === "status").at(-1);
+  assert.equal(status.status, "degraded");
+  assert.match(status.detail, /could not be released/);
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "reset-deletions" }, "*");
+  assert.equal(result.posted.filter((message) => message.kind === "deletions-reset").length, 2);
+});
+
+test("a pre-ready reset discards buffered deletion signals as well as retained retries", () => {
+  const result = runHook({ deferReady: true });
+  const channelId = "777777777777777777";
+  const id = "888888888888888881";
+  result.handlerNode.actionHandler.MESSAGE_DELETE({ channelId, id });
+  result.subscriptions.get("MESSAGE_DELETE")({ channelId, id });
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "reset-deletions" }, "*");
+  result.ready();
+  assert.equal(result.messages.has(id), false);
+  assert.equal(result.posted.some((message) => ["retained", "delete"].includes(message.kind)), false);
+  assert.equal(result.posted.filter((message) => message.kind === "deletions-reset").length, 1);
+});
+
+test("a full 5000-ID ledger preserves unresolved IDs and lets overflowing native deletions proceed", () => {
+  const result = runHook({ deferReady: true });
+  const channelId = "777777777777777777";
+  const original = result.messages.values().next().value;
+  const ids = Array.from({ length: 5003 }, (_, index) => String(888888888888800000n + BigInt(index)));
+  for (let offset = 0; offset < ids.length; offset += 200) {
+    const batch = ids.slice(offset, offset + 200);
+    for (const id of batch) result.messages.set(id, Object.assign({}, original, { id }));
+    result.handlerNode.actionHandler.MESSAGE_DELETE_BULK({ channelId, ids: batch });
+  }
+  const start = result.posted.length;
+  result.ready();
+  const retained = result.posted.slice(start).filter((message) => message.kind === "retained");
+  assert.equal(retained.length, 25);
+  assert.equal(retained.every((message) => message.ids.length <= 200 && message.channelId === channelId && message.bulk === true), true);
+  const replayedIds = retained.flatMap((message) => message.ids);
+  assert.equal(replayedIds.length, 5000);
+  assert.equal(new Set(replayedIds).size, 5000);
+  assert.equal(replayedIds.includes(ids[0]), true, "the oldest unresolved ID must remain replayable");
+  assert.equal(ids.slice(5000).every((id) => !replayedIds.includes(id) && !result.messages.has(id)), true,
+    "overflowed messages must follow the native deletion path rather than become untracked retained rows");
+  result.tick(20);
+  assert.equal(result.posted.filter((message) => message.kind === "status").at(-1).status, "degraded");
+  result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "reset-deletions", resetToken: 1 }, "*");
+  const reset = result.posted.filter((message) => message.kind === "deletions-reset").at(-1);
+  assert.equal(reset.discarded.flatMap((batch) => batch.ids).length, 5000);
+  assert.equal(reset.discarded.some((batch) => batch.ids.includes(ids[0])), true);
+  assert.equal(ids.some((id) => result.messages.has(id)), false, "reset must not leave an evicted-ID ghost behind");
+  result.ready();
+  assert.equal(result.posted.filter((message) => message.kind === "status").at(-1).status, "active");
+});
+
+test("native and fallback bulk admission count earlier successes at the retry limit", () => {
+  const channelId = "777777777777777777";
+  for (const hideHandlerNode of [false, true]) {
+    const result = runHook({ deferReady: true, hideHandlerNode });
+    const template = result.messages.values().next().value;
+    const ids = Array.from({ length: 5002 }, (_, index) => String(888888888888700000n + BigInt(index)));
+    const dispatchBulk = (batch) => {
+      for (const id of batch) result.messages.set(id, Object.assign({}, template, { id }));
+      result.dispatcher.dispatch({ type: "MESSAGE_DELETE_BULK", channelId, ids: batch });
+    };
+    for (let offset = 0; offset < 4999; offset += 200) dispatchBulk(ids.slice(offset, Math.min(4999, offset + 200)));
+    dispatchBulk(ids.slice(4999));
+    assert.equal(result.messages.get(ids[4999])?.deleted, true, "the final available slot should retain its message");
+    assert.equal(result.messages.has(ids[5000]), false, "the second item in the same batch must be deleted natively");
+    assert.equal(result.messages.has(ids[5001]), false);
+    result.ready();
+    const replay = result.posted.filter((message) => message.kind === "retained").flatMap((message) => message.ids);
+    assert.equal(replay.length, 5000);
+    assert.equal(replay.includes(ids[0]), true);
+    result.window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "deletion-ack", channelId, ids: [ids[0]] }, "*");
+    dispatchBulk([ids[5000]]);
+    assert.equal(result.messages.get(ids[5000])?.deleted, true, "an acknowledgment frees admission capacity");
+  }
+});
+
+test("failed native retention never suppresses the original single-message deletion or queues retries", () => {
+  for (const getMessages of [
+    () => { throw new Error("collection unavailable"); },
+    () => ({}),
+    () => ({ receiveMessage() { throw new Error("receive failed"); } }),
+    () => ({ receiveMessage() {} })
+  ]) {
+    const result = runHook();
+    const channelId = "777777777777777777";
+    const id = "888888888888888881";
+    result.messageStore.getMessages = getMessages;
+    result.handlerNode.actionHandler.MESSAGE_DELETE({ channelId, id });
+    result.ready();
+    assert.equal(result.messages.has(id), false);
+    assert.equal(result.posted.some((message) => message.kind === "retained"), false);
+  }
+});
+
+test("mixed bulk retention passes failures and uncaptured IDs to the native handler without deleting successes", () => {
+  const result = runHook();
+  const channelId = "777777777777777777";
+  const retainedId = "888888888888888881";
+  const failedId = "888888888888888882";
+  const uncapturedId = "888888888888888883";
+  result.messages.set(failedId, Object.assign({}, result.messages.get(retainedId), { id: failedId }));
+  result.messageStore.getMessages = () => ({
+    receiveMessage(message) {
+      if (message.id === failedId) throw new Error("one message failed");
+      result.messages.set(message.id, message);
+    }
+  });
+  const action = { channelId, ids: [retainedId, failedId, uncapturedId] };
+  result.handlerNode.actionHandler.MESSAGE_DELETE_BULK(action);
+  assert.equal(result.messages.get(retainedId).deleted, true);
+  assert.equal(result.messages.has(failedId), false);
+  assert.equal(result.messages.has(uncapturedId), false);
+  assert.deepEqual(action.ids, [retainedId, failedId, uncapturedId], "do not mutate Discord's action payload");
+  const retained = result.posted.filter((message) => message.kind === "retained");
+  assert.deepEqual(Array.from(retained[0].ids), [retainedId]);
+});
+
+test("bulk retention cap does not suppress native deletion of IDs beyond the capture limit", () => {
+  const result = runHook();
+  const channelId = "777777777777777777";
+  const original = result.messages.values().next().value;
+  const ids = Array.from({ length: 201 }, (_, index) => String(888888888888888000n + BigInt(index)));
+  for (const id of ids) result.messages.set(id, Object.assign({}, original, { id }));
+  result.handlerNode.actionHandler.MESSAGE_DELETE_BULK({ channelId, ids });
+  assert.equal(ids.slice(0, 200).every((id) => result.messages.get(id)?.deleted === true), true);
+  assert.equal(result.messages.has(ids[200]), false);
+  const retained = result.posted.filter((message) => message.kind === "retained");
+  assert.equal(retained.length, 1);
+  assert.equal(retained[0].ids.length, 200);
+});
+
+test("dispatcher fallback leaves failed restores deleted while replaying only successful restores", () => {
+  const result = runHook({ hideHandlerNode: true });
+  const channelId = "777777777777777777";
+  const retainedId = "888888888888888881";
+  const failedId = "888888888888888882";
+  result.messages.set(failedId, Object.assign({}, result.messages.get(retainedId), { id: failedId }));
+  result.messageStore.getMessages = () => ({
+    receiveMessage(message) {
+      if (message.id === failedId) throw new Error("restore failed");
+      result.messages.set(message.id, message);
+    }
+  });
+  result.dispatcher.dispatch({ type: "MESSAGE_DELETE_BULK", channelId, ids: [retainedId, failedId] });
+  assert.equal(result.messages.get(retainedId).deleted, true);
+  assert.equal(result.messages.has(failedId), false);
+  result.ready();
+  assert.equal(result.posted.filter((message) => message.kind === "retained").every((message) => message.ids.length === 1 && message.ids[0] === retainedId), true);
 });
 
 test("MessageStore update handlers emit an ID-only synchronous edit lifecycle before applying a genuine edit", () => {
@@ -738,7 +996,7 @@ test("a newer page hook never self-reloads an older controller contract", () => 
   const result = runHook(settings);
   assert.equal(result.legacyRecoveries(), 0);
   assert.equal(result.reloads(), 0);
-  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].upgradeRequired, 3);
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].upgradeRequired, 4);
   result.reinject();
   assert.equal(result.legacyRecoveries(), 0);
   assert.equal(result.reloads(), 0);

@@ -5,6 +5,8 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const RealCore = require("../src/core.js");
+const RealProtocol = require("../src/protocol.js");
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
@@ -56,7 +58,7 @@ function backgroundHarness(options) {
   const chrome = {
     runtime: {
       id: "extension-id",
-      getManifest() { return { version: options?.version || "2.7.0" }; },
+      getManifest() { return { version: options?.version || "2.7.1" }; },
       getURL(relative) { return `chrome-extension://extension-id/${relative}`; },
       onMessage: events.message,
       onConnect: events.connect,
@@ -70,7 +72,7 @@ function backgroundHarness(options) {
         if (Array.isArray(options.files) && options.files.includes("src/page-hook.js") &&
           !mainWorld[Symbol.for("BridgeModTools.pageHook.v1")]) {
           mainWorld[Symbol.for("BridgeModTools.pageHook.v1")] = pageHookFileInstallController || {
-            apiVersion: 3, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}
+            apiVersion: 4, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}
           };
         }
         if (typeof options.func === "function") {
@@ -132,8 +134,9 @@ function backgroundHarness(options) {
     crypto: { getRandomValues(bytes) { bytes.fill(1); return bytes; } },
     URL, Date, Promise, Map, Set, WeakMap, Uint8Array, Object, Array, String, Number, Boolean, RegExp,
     async fetch(...args) { networkCalls.push(args); return { ok: true }; },
-    LocalDiscordArchiveProtocol: { TYPES, normalizeArchive: (value) => value || { records: [], generation: 0 } },
-    LocalDiscordArchiveCore: {
+    LocalDiscordArchiveProtocol: options?.realProtocol ? RealProtocol
+      : { TYPES, normalizeArchive: (value) => value || { records: [], generation: 0 } },
+    LocalDiscordArchiveCore: options?.realProtocol ? RealCore : {
       normalizeText: (value) => String(value || "").replace(/\s+/g, " ").trim(),
       recordKey: (record) => `${record.channelId}:${record.messageId}`,
       isDeletedStatus: (status) => status === "confirmed_deleted" || status === "inferred_deleted",
@@ -152,11 +155,13 @@ function backgroundHarness(options) {
     BridgeModToolsMediaStore: {
       fetchableMedia: (value) => Boolean(value?.url && value.kind !== "link"),
       async setGeneration() {},
+      async reconcileArchive() {},
+      async clearAll() {},
       async getStats() { return mediaStats; }
     }
   });
   const source = fs.readFileSync(path.resolve(__dirname, "../src/background.js"), "utf8");
-  vm.runInContext(`${source}\n;globalThis.__testApi = { ensureDiscordBootstrap, discordContentSender, discordChannelContentSender, discordChannelContext, extensionSenderPath, reportLiveHealth, bestLiveHealth, pruneLiveHealth, liveHealthByDocument, handleUserAction, handleResolveMessageAuthors, handleMediaCommand, handlePlaybackCommand, mediaRefs, playbackCapabilities, userActionRateLimits, timeoutActionsInFlight };`, context);
+  vm.runInContext(`${source}\n;globalThis.__testApi = { ensureDiscordBootstrap, discordContentSender, discordChannelContentSender, discordChannelContext, archiveCommandAllowed, extensionSenderPath, reportLiveHealth, bestLiveHealth, pruneLiveHealth, liveHealthByDocument, handleUserAction, handleResolveMessageAuthors, handleMediaCommand, handlePlaybackCommand, mediaRefs, playbackCapabilities, userActionRateLimits, timeoutActionsInFlight };`, context);
   return {
     api: context.__testApi,
     calls,
@@ -283,7 +288,7 @@ test("a stale page controller gets one bounded background reload and never loops
   assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
 
   harness.calls.length = 0;
-  harness.setPageHookProbeState({ apiVersion: 3, ready: true });
+  harness.setPageHookProbeState({ apiVersion: 4, ready: true });
   const recovered = await harness.api.ensureDiscordBootstrap(12, "document-13", true);
   assert.equal(recovered.ok, true);
   assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
@@ -337,6 +342,92 @@ test("Discord and extension sender authorization rejects route, origin, frame, a
 
   assert.equal(api.extensionSenderPath({ id: "extension-id", url: "chrome-extension://extension-id/popup/popup.html" }), "/popup/popup.html");
   assert.equal(api.extensionSenderPath({ id: "extension-id", url: "https://discord.com/popup/popup.html" }), null);
+});
+
+test("archive reads reach the real broker from channel and non-channel Discord routes", async () => {
+  const harness = backgroundHarness({ realProtocol: true });
+  harness.setStoredArchive(Object.assign(RealProtocol.emptyArchive(), {
+    generation: 3,
+    records: [{ channelId: "777777777777777777", messageId: "888888888888888888",
+      content: "saved deletion", status: "confirmed_deleted", updatedAt: 1 }]
+  }));
+  for (const pathname of ["/channels/@me/777777777777777777", "/app", "/channels/@me"]) {
+    const result = await new Promise((resolve) => harness.events.message.listener({
+      type: RealProtocol.TYPES.GET_ARCHIVE
+    }, discordSender({ tab: { id: 1, url: `https://discord.com${pathname}` } }), resolve));
+    assert.equal(result.ok, true, pathname);
+    assert.equal(result.reason, "read", pathname);
+    assert.equal(result.archive.generation, 3, pathname);
+    assert.equal(result.archive.records[0].status, "confirmed_deleted", pathname);
+  }
+  assert.equal(harness.storageWrites.length, 0, "reads must not rewrite the archive");
+});
+
+test("already captured records and confirmations finish after leaving their channel", async () => {
+  const harness = backgroundHarness({ realProtocol: true });
+  const sender = discordSender({ tab: { id: 1, url: "https://discord.com/app" } });
+  const send = (command) => new Promise((resolve) => harness.events.message.listener(command, sender, resolve));
+  const record = { channelId: "777777777777777777", messageId: "888888888888888888",
+    content: "captured before navigation", status: "seen", capturedAt: 1 };
+  harness.setStoredArchive(Object.assign(RealProtocol.emptyArchive(), { generation: 4 }));
+  const captured = await send({ type: RealProtocol.TYPES.UPSERT_RECORDS, generation: 4, records: [record] });
+  assert.equal(captured.ok, true);
+  const confirmed = await send({ type: RealProtocol.TYPES.CONFIRM_DELETED, generation: 4,
+    deletions: [{ record }] });
+  assert.equal(confirmed.ok, true);
+  assert.equal(confirmed.archive.records[0].status, "confirmed_deleted");
+  assert.equal(confirmed.archive.records[0].channelId, record.channelId);
+  assert.equal(harness.storageWrites.at(-1).ldmaArchive.records[0].status, "confirmed_deleted");
+  const missing = await send({ type: RealProtocol.TYPES.CONFIRM_DELETED, generation: 4,
+    deletions: [{ record: { ...record, messageId: "999999999999999999" } }] });
+  assert.equal(missing.ok, false);
+  assert.equal(missing.reason, "missing-records", "navigation must not bypass snapshot admission");
+});
+
+test("deferred captures and retained confirmations still reject stale archive generations", async () => {
+  const harness = backgroundHarness({ realProtocol: true });
+  harness.setStoredArchive(Object.assign(RealProtocol.emptyArchive(), { generation: 5 }));
+  const sender = discordSender({ tab: { id: 1, url: "https://discord.com/app" } });
+  const record = { channelId: "777777777777777777", messageId: "888888888888888888", content: "old snapshot" };
+  for (const command of [
+    { type: RealProtocol.TYPES.UPSERT_RECORDS, generation: 4, records: [record] },
+    { type: RealProtocol.TYPES.CONFIRM_DELETED, generation: 4,
+      deletions: [{ record, source: "message_store_preserved" }] }
+  ]) {
+    const result = await new Promise((resolve) => harness.events.message.listener(command, sender, resolve));
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "stale-generation");
+    assert.equal(result.archive.records.length, 0);
+  }
+  assert.equal(harness.storageWrites.length, 0);
+});
+
+test("deferred archive authorization retains document trust and other channel-only scopes", () => {
+  const { api } = backgroundHarness();
+  const app = discordSender({ tab: { id: 1, url: "https://discord.com/app" } });
+  for (const type of ["GET", "UPSERT", "DELETE"]) {
+    assert.equal(api.archiveCommandAllowed({ type }, app), true, type);
+    for (const overrides of [
+      { id: "another-extension" }, { origin: "https://discord.com.evil.test" },
+      { url: "https://discord.com.evil.test/app" }, { frameId: 1 }, { documentId: "" }, { tab: { id: -1 } }
+    ]) {
+      assert.equal(api.archiveCommandAllowed({ type }, { ...app, ...overrides }), false, type);
+    }
+  }
+  for (const type of ["EDIT", "INFER", "RETRACT", "HEALTH", "PAUSE", "CLEAR", "DELETE_RECORD", "GET_RECORD"]) {
+    assert.equal(api.archiveCommandAllowed({ type }, app), false, type);
+  }
+  for (const type of ["EDIT", "INFER", "RETRACT", "HEALTH"]) {
+    assert.equal(api.archiveCommandAllowed({ type }, discordSender()), true, type);
+  }
+});
+
+test("a surviving API v3 hook is reloaded for the durable acknowledgment contract", async () => {
+  const harness = backgroundHarness();
+  harness.setPageHookProbeState({ apiVersion: 3, ready: true });
+  const result = await harness.api.ensureDiscordBootstrap(1, "document-1", true);
+  assert.equal(result.reason, "page-hook-upgrade-reload-scheduled");
+  assert.equal(harness.calls.filter((call) => call.kind === "reload").length, 1);
 });
 
 test("popup media stats include message metadata and combined local data bytes", async () => {
@@ -620,7 +711,7 @@ test("message author resolution repairs a missing page controller and retries th
   const pageUrl = `https://discord.com/channels/111111111111111111/${channelId}`;
   harness.setLocation(pageUrl);
   harness.setPageHookFileInstallController({
-    apiVersion: 3,
+    apiVersion: 4,
     recover() {},
     invokeUserAction() { return { ok: true }; },
     resolveMessageAuthors() {

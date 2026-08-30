@@ -67,3 +67,7 @@ li[id^="chat-messages-"]:focus-within [data-ldma-author-actions-host="true"],
   font-weight: 750;
   text-transform: uppercase;
 }
+
+.ldma-retained-deleted[data-ldma-save-pending="true"] [id^="message-content-"]::after {
+  content: "  • deleted · saving";
+}

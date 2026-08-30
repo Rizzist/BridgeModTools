@@ -64,6 +64,18 @@
     return true;
   }
 
+  function newerCapturedSnapshot(existing, incoming) {
+    if (!existing) return true;
+    if (existing.status === "confirmed_deleted") return false;
+    if (existing.captureSessionId && existing.captureSessionId === incoming.captureSessionId &&
+      existing.captureSequence && incoming.captureSequence) {
+      return incoming.captureSequence > existing.captureSequence;
+    }
+    const existingTime = Number(existing.capturedAt) || 0;
+    const incomingTime = Number(incoming.capturedAt) || 0;
+    return Number.isFinite(incomingTime) && incomingTime > existingTime;
+  }
+
   function applyCommand(current, command, nowValue) {
     const archive = normalizeArchive(current);
     const now = nowValue || Date.now();
@@ -177,8 +189,25 @@
         .map((item) => {
           const incomingRecord = Core.sanitizeRecordPresentation(item.record);
           const existingRecord = existingByKey.get(Core.recordKey(item.record));
-          const reply = Core.mergeReplySnapshots(existingRecord?.reply, incomingRecord?.reply);
-          return Object.assign({}, existingRecord || incomingRecord, reply ? { reply } : {}, {
+          const newerSnapshot = newerCapturedSnapshot(existingRecord, incomingRecord);
+          let observedRecord = existingRecord || incomingRecord;
+          if (existingRecord && newerSnapshot) {
+            // A retained deletion may arrive before its latest seen UPSERT. Use
+            // observation freshness, not broker arrival time, to select its body.
+            // Only CONFIRM_EDIT owns the accumulated edit history and cursor.
+            const observed = Object.assign({}, incomingRecord, { status: "seen" });
+            for (const field of ["editHistory", "editSessionId", "lastEditSequence", "lastEditedAt"]) delete observed[field];
+            observedRecord = Core.mergeRecords([existingRecord], [observed], {
+              now,
+              // This is a one-record merge, not archive admission. The final
+              // merge below still enforces the ordinary archive byte bound.
+              maxBytes: Number.MAX_SAFE_INTEGER
+            })[0] || existingRecord;
+          }
+          const reply = existingRecord?.status === "confirmed_deleted" ? existingRecord.reply
+            : newerSnapshot ? Core.mergeReplySnapshots(existingRecord?.reply, incomingRecord?.reply)
+              : existingRecord?.reply || incomingRecord?.reply;
+          return Object.assign({}, observedRecord, reply ? { reply } : {}, {
             status: "confirmed_deleted",
             confirmedDeletedAt: now,
             deletionSource: item.source === "message_store_preserved" ? "message_store_preserved" : "discord_lifecycle",

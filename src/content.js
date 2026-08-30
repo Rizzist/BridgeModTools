@@ -43,13 +43,15 @@
     activeList: null, listIdentity: null, snapshots: new WeakMap(), signatures: new Map(),
     snapshotsByKey: new Map(), pageHookStatus: "searching", pageHookDetail: "Waiting for Discord's deletion event dispatcher.",
     pendingRecords: new Map(), pendingRetractions: new Set(), recentRemovals: new Map(), pendingRetainedKeys: new Set(), pendingReleaseKeys: new Set(), flushTimer: null, flushPromise: null,
+    pendingDeletions: new Map(), pendingDeletionTimer: null, pendingDeletionPromise: null, deletionResetPending: false, deletionResetToken: 0,
+    discardedDeletionKeys: new Set(), pendingRetainedStyleFrame: null, captureSafetySuspended: false,
     healthSignature: "", refreshPromise: null, archiveInitialized: false,
     tombstoneRenderers: new Map(), editRenderers: new Map(), liveActionRenderers: new Map(), spacingFrame: 0, retainedFrame: 0,
     pendingConfirmedMounts: new Map(), pendingEdits: new Map(), stagedSelfEdits: new Map(),
     resolvedAuthorIds: new Map(), resolvedAuthorUsernames: new Map(),
     pendingTimeoutActions: new Set(), snapshotScheduler: null,
     scrollCaptureFrameScheduler: null, scrollCaptureLimiter: null, scrollSettleTimer: null,
-    pendingScrollRows: new Set(), priorityScrollRows: new Set(), mediaFrameWindows: new Map(),
+    pendingScrollRows: new Set(), priorityScrollRows: new Set(), scrollCaptureContexts: new WeakMap(), mediaFrameWindows: new Map(),
     lastMediaRecoveryAt: -Infinity,
     pageHookLastSeenAt: -Infinity, bootstrapRequestedAt: -Infinity, bootstrapPromise: null
   };
@@ -195,8 +197,12 @@
   function reportCombinedHealth(active, force) {
     if (!state.route) {
       return;
+    } else if (state.captureSafetySuspended) {
+      reportHealth("degraded", "Capture stopped safely: too many discarded native messages remain. Reload Discord to discard its stale page cache.", force);
     } else if (!active) {
       reportHealth("degraded", "No active Discord message list was found; capture is suspended.", force);
+    } else if ([...state.pendingDeletions.values()].some((item) => item.record || item.channelId === state.route.channelId)) {
+      reportHealth("degraded", "Deletion detected; waiting for local capture/storage confirmation. Keep this tab open until saved.", force);
     } else if (state.pageHookStatus === "active") {
       reportHealth("active", `${state.pageHookDetail} Archiving rendered messages locally.`, force);
     } else {
@@ -854,8 +860,8 @@
     }
   }
 
-  function presentationFromNode(node, timeElement, replyValue) {
-    const route = Core.parseDiscordRoute(location.pathname);
+  function presentationFromNode(node, timeElement, replyValue, captureRoute) {
+    const route = captureRoute || Core.parseDiscordRoute(location.pathname);
     const identity = rowIdentity(node);
     const authorElement = authorNameElement(node);
     const authorStyle = captureAuthorStyle(authorElement);
@@ -874,10 +880,11 @@
     };
   }
 
-  function recordFromNode(node, now) {
-    const route = Core.parseDiscordRoute(location.pathname);
+  function recordFromNode(node, now, captureRoute) {
+    const route = captureRoute || Core.parseDiscordRoute(location.pathname);
     const identity = rowIdentity(node);
     if (!route || !identity || (identity.channelId && identity.channelId !== route.channelId)) return null;
+    if (state.captureSafetySuspended || state.deletionResetPending || state.discardedDeletionKeys.has(`${route.channelId}:${identity.messageId}`)) return null;
     const media = captureMedia(node, identity.messageId);
     const attachments = media.filter((item) => item.source === "attachment").map((item) => item.name).slice(0, 12);
     const content = allContent(node, identity.messageId);
@@ -887,7 +894,8 @@
     const groupRootMessageId = groupRootFromNode(node, identity.messageId);
     return Core.sanitizeRecordPresentation(Object.assign({
       messageId: identity.messageId, channelId: route.channelId, guildId: route.guildId,
-      channelName: visibleChannelName(),
+      channelName: Core.parseDiscordRoute(location.pathname)?.channelId === route.channelId
+        ? visibleChannelName() : state.archiveByKey.get(`${route.channelId}:${identity.messageId}`)?.channelName || "",
       author: visibleElementText(authorNameElement(node)) || firstText(node, AUTHOR_SELECTORS) ||
         authorFromAriaLabelledBy(node) || "Unknown author",
       content, attachments, media, messageTimestamp: timeElement?.getAttribute("datetime") || null,
@@ -895,7 +903,7 @@
       sourceContinuation: Boolean(groupRootMessageId && groupRootMessageId !== identity.messageId),
       capturedAt: now, updatedAt: now, status: "seen",
       captureSessionId, captureSequence: captureSequence += 1
-    }, presentationFromNode(node, timeElement, reply)));
+    }, presentationFromNode(node, timeElement, reply, route)));
   }
 
   function recordSignature(record) {
@@ -909,6 +917,7 @@
 
   function queueRecord(record, options) {
     const key = Core.recordKey(record);
+    if (state.captureSafetySuspended || state.deletionResetPending || state.discardedDeletionKeys.has(key)) return;
     const signature = recordSignature(record);
     if (state.signatures.get(key) === signature || state.pendingRecords.get(key)?.signature === signature) return;
     state.pendingRecords.set(key, { record, generation: state.generation, signature });
@@ -921,6 +930,7 @@
     clearTimeout(state.flushTimer);
     state.flushTimer = null;
     if (state.flushPromise) return state.flushPromise;
+    if (state.captureSafetySuspended || state.deletionResetPending) return Promise.resolve();
     const pending = [...state.pendingRecords.values()];
     state.pendingRecords.clear();
     if (!pending.length) return Promise.resolve();
@@ -931,7 +941,9 @@
         groups.get(item.generation).push(item);
       }
       for (const [generation, items] of groups) {
-        const records = items.map((item) => item.record);
+        if (state.captureSafetySuspended || state.deletionResetPending || generation !== state.generation) continue;
+        const records = items.map((item) => item.record).filter((record) => !state.discardedDeletionKeys.has(Core.recordKey(record)));
+        if (!records.length) continue;
         const response = await send({ type: T.UPSERT_RECORDS, generation, records });
         if (response.ok && generation === state.generation) {
           const persistedKeys = new Set((response.archive?.records || []).map(Core.recordKey));
@@ -944,7 +956,10 @@
         }
         if (!response.ok && (response.reason === "broker-unavailable" || response.reason === "broker-error")) {
           for (const item of items) {
-            if (generation === state.generation) state.pendingRecords.set(Core.recordKey(item.record), item);
+            const key = Core.recordKey(item.record);
+            // A failed older batch must not replace a newer capture queued while
+            // its broker request was in flight.
+            if (generation === state.generation && !state.pendingRecords.has(key)) state.pendingRecords.set(key, item);
           }
         }
         if (response.archive) applyArchive(response.archive);
@@ -978,6 +993,7 @@
     for (const record of state.archive.records) {
       if (record.deletionSource !== "message_store_preserved" || nextKeys.has(Core.recordKey(record))) continue;
       const key = Core.recordKey(record);
+      discardDeletionKey(key);
       state.pendingReleaseKeys.add(key);
       if (!releasedByChannel.has(record.channelId)) releasedByChannel.set(record.channelId, []);
       releasedByChannel.get(record.channelId).push(record.messageId);
@@ -987,12 +1003,15 @@
         window.postMessage({ bridge: BRIDGE, kind: "release", channelId, ids: ids.slice(offset, offset + 200) }, "*");
       }
     }
+    const firstArchive = !state.archiveInitialized;
     if (incomingGeneration > state.generation) {
+      if (!firstArchive) for (const key of state.pendingRetainedKeys) discardDeletionKey(key);
       state.snapshots = new WeakMap();
       state.snapshotsByKey.clear();
       state.recentRemovals.clear();
       state.pendingScrollRows.clear();
       state.priorityScrollRows.clear();
+      state.scrollCaptureContexts = new WeakMap();
       state.scrollCaptureLimiter?.cancel();
       state.scrollCaptureFrameScheduler?.cancel();
       clearTimeout(state.scrollSettleTimer);
@@ -1004,18 +1023,42 @@
       state.pendingRecords.clear();
       state.signatures.clear();
       removeEditHistories();
+      if (!firstArchive) {
+        state.pendingDeletions.clear();
+        clearTimeout(state.pendingDeletionTimer);
+        state.pendingDeletionTimer = null;
+        state.deletionResetPending = true;
+        state.deletionResetToken += 1;
+        window.postMessage({ bridge: BRIDGE, kind: "reset-deletions", resetToken: state.deletionResetToken }, "*");
+      }
     }
     state.archive = archive;
     state.archiveByKey = new Map(archive.records.map((record) => [Core.recordKey(record), record]));
     state.archiveInitialized = true;
     state.generation = incomingGeneration;
     state.paused = Boolean(archive.paused);
+    if (firstArchive && state.paused) {
+      state.deletionResetPending = true;
+      state.deletionResetToken += 1;
+      window.postMessage({ bridge: BRIDGE, kind: "reset-deletions", resetToken: state.deletionResetToken }, "*");
+    }
+    for (const [key, pending] of state.pendingDeletions) {
+      if (pending.generation === null && firstArchive) pending.generation = incomingGeneration;
+      if (pending.generation !== incomingGeneration || state.paused) {
+        state.pendingDeletions.delete(key);
+        state.pendingRetainedKeys.delete(key);
+        continue;
+      }
+      if (pending.source === "message_store_preserved") state.pendingRetainedKeys.add(key);
+      if (state.archiveByKey.get(key)?.status === "confirmed_deleted") acknowledgeDeletion(key, pending);
+    }
     if (state.paused) removeLiveAuthorActions();
     if (wasPaused && !state.paused) state.lastMediaRecoveryAt = -Infinity;
     requestMediaRecovery(archive);
     reconcileTombstones();
     reconcileEditHistories();
     applyRetainedStyles();
+    scheduleDeletionDrain(0);
     if (wasPaused && !state.paused) scheduleSnapshot(true, 0);
   }
 
@@ -1080,8 +1123,29 @@
     return candidates.find((node) => !activeRoot || activeRoot.contains(node)) || null;
   }
 
+  function retainedRowsByKey() {
+    const rows = new Map();
+    const route = Core.parseDiscordRoute(location.pathname);
+    for (const node of document.querySelectorAll(MESSAGE_SELECTOR)) {
+      const identity = rowIdentity(node);
+      if (!identity || node.closest("[data-ldma-tombstone]")) continue;
+      const key = `${identity.channelId || route?.channelId}:${identity.messageId}`;
+      if (!rows.has(key)) rows.set(key, node);
+    }
+    return rows;
+  }
+
+  function scheduleRetainedStyles() {
+    if (state.pendingRetainedStyleFrame !== null) return;
+    state.pendingRetainedStyleFrame = requestAnimationFrame(() => {
+      state.pendingRetainedStyleFrame = null;
+      applyRetainedStyles();
+    });
+  }
+
   function applyRetainedStyles(activeValue) {
     const route = Core.parseDiscordRoute(location.pathname);
+    const nativeRows = retainedRowsByKey();
     const retainedIds = new Set(state.archive.records.filter((record) =>
       record.channelId === route?.channelId && record.status === "confirmed_deleted" &&
       record.deletionSource === "message_store_preserved").map((record) => record.messageId));
@@ -1093,6 +1157,7 @@
       const identity = rowIdentity(row);
       if (!identity || identity.channelId !== route?.channelId || !retainedIds.has(identity.messageId)) {
         row.classList.remove("ldma-retained-deleted");
+        row.removeAttribute("data-ldma-save-pending");
       }
     });
     document.querySelectorAll("[data-ldma-native-replaced]").forEach((row) => {
@@ -1105,14 +1170,21 @@
     });
     for (const key of [...state.pendingReleaseKeys]) {
       const [channelId, messageId] = key.split(":");
-      if (channelId === route?.channelId && !retainedRow(channelId, messageId)) state.pendingReleaseKeys.delete(key);
+      if (channelId === route?.channelId && !nativeRows.has(key)) state.pendingReleaseKeys.delete(key);
     }
     if (!route) return;
-    for (const messageId of retainedIds) retainedRow(route.channelId, messageId)?.classList.add("ldma-retained-deleted");
+    for (const [key, row] of nativeRows) {
+      const [channelId, messageId] = key.split(":");
+      if (channelId !== route.channelId || !retainedIds.has(messageId)) continue;
+      row.classList.add("ldma-retained-deleted");
+      if (state.archiveByKey.get(`${route.channelId}:${messageId}`)?.status === "confirmed_deleted") {
+        row.removeAttribute("data-ldma-save-pending");
+      } else row.setAttribute("data-ldma-save-pending", "true");
+    }
     if (!state.retainedFrame) {
       state.retainedFrame = requestAnimationFrame(() => {
         state.retainedFrame = 0;
-        replaceVisibleRetainedRows(activeValue);
+        replaceVisibleRetainedRows(activeValue, nativeRows);
       });
     }
   }
@@ -2387,18 +2459,19 @@
     return true;
   }
 
-  function replaceVisibleRetainedRows(activeValue) {
+  function replaceVisibleRetainedRows(activeValue, rowsValue) {
     const route = Core.parseDiscordRoute(location.pathname);
     if (!route) return;
     const active = activeValue?.node?.isConnected && activeValue.route?.routeKey === route.routeKey
       ? activeValue : findActiveMessageList();
     if (!active) return;
+    const nativeRows = rowsValue || retainedRowsByKey();
     const retained = state.archive.records.filter((record) =>
       record.channelId === route.channelId && record.status === "confirmed_deleted" &&
       record.deletionSource === "message_store_preserved");
     for (const record of retained) {
-      const nativeRow = retainedRow(route.channelId, record.messageId, active.node);
-      if (!nativeRow || nativeRow.closest("[data-ldma-tombstone]")) continue;
+      const nativeRow = nativeRows.get(Core.recordKey(record));
+      if (!nativeRow || !active.node.contains(nativeRow) || nativeRow.closest("[data-ldma-tombstone]")) continue;
       const scroller = findChatScrollContainer(active.node);
       const rowRect = nativeRow.getBoundingClientRect();
       const clipRect = scroller?.getBoundingClientRect();
@@ -2466,6 +2539,7 @@
 
   function retractIfReappeared(record) {
     const key = Core.recordKey(record);
+    if (state.captureSafetySuspended || state.deletionResetPending || state.discardedDeletionKeys.has(key)) return;
     const archived = state.archive.records.find((item) => Core.recordKey(item) === key);
     if (!archived || archived.status !== "inferred_deleted" || state.pendingRetractions.has(key)) return;
     state.pendingRetractions.add(key);
@@ -2476,7 +2550,7 @@
   }
 
   function snapshotRenderedMessages(persist) {
-    if (state.paused) {
+    if (state.captureSafetySuspended || state.paused || state.deletionResetPending) {
       removeLiveAuthorActions();
       return;
     }
@@ -2502,6 +2576,7 @@
       rect: node.getBoundingClientRect()
     }));
     rowMeasurements.forEach(({ node, identity, rect }, index) => {
+      state.scrollCaptureContexts.set(node, { route: active.route, generation: state.generation });
       const clipTop = Math.max(0, scrollerRect?.top || 0);
       const clipBottom = Math.min(innerHeight, scrollerRect?.bottom || innerHeight);
       const visibleHeight = Math.max(0, Math.min(rect.bottom, clipBottom) - Math.max(rect.top, clipTop));
@@ -2530,12 +2605,19 @@
         verifyPendingEditsForRecord(record);
         retractIfReappeared(record);
         if (persist) queueRecord(record);
+        const pending = state.pendingDeletions.get(Core.recordKey(record));
+        if (pending && pending.generation === state.generation) {
+          const changed = !pending.record || recordSignature(pending.record) !== recordSignature(record);
+          pending.record = record;
+          if (changed) pending.nextAttemptAt = 0;
+        }
       }
     });
     reconcileTombstones(active);
     reconcileEditHistories(active);
     reconcileLiveAuthorActions(active, records);
     applyRetainedStyles(active);
+    scheduleDeletionDrain(0);
   }
 
   function scheduleSnapshot(persist, delayValue) {
@@ -2553,7 +2635,8 @@
   function captureScrollMessageNode(node, route, persist) {
     const identity = rowIdentity(node);
     if (!route || !identity || (identity.channelId && identity.channelId !== route.channelId)) return null;
-    const record = recordFromNode(node, Date.now());
+    if (state.captureSafetySuspended || state.deletionResetPending || state.discardedDeletionKeys.has(`${route.channelId}:${identity.messageId}`)) return null;
+    const record = recordFromNode(node, Date.now(), route);
     if (!record) return null;
     const existing = state.snapshots.get(node);
     const snapshot = Object.assign({
@@ -2583,10 +2666,18 @@
     verifyPendingEditsForRecord(record);
     retractIfReappeared(record);
     if (persist) queueRecord(record, { deferDuringScroll: true });
+    const pending = state.pendingDeletions.get(Core.recordKey(record));
+    if (pending && pending.generation === state.generation) {
+      const changed = !pending.record || recordSignature(pending.record) !== recordSignature(record);
+      pending.record = record;
+      if (changed) pending.nextAttemptAt = 0;
+      scheduleDeletionDrain(0);
+    }
     return snapshot;
   }
 
   function capturePendingScrollRows(persist) {
+    if (state.captureSafetySuspended || state.deletionResetPending || state.paused) return;
     const route = Core.parseDiscordRoute(location.pathname);
     const startedAt = performance.now();
     const rows = [...state.pendingScrollRows]
@@ -2598,7 +2689,10 @@
     for (const row of rows) {
       state.pendingScrollRows.delete(row);
       state.priorityScrollRows.delete(row);
-      try { captureScrollMessageNode(row, route, persist); } catch (_error) {}
+      const context = state.scrollCaptureContexts.get(row);
+      try {
+        if (!context || context.generation === state.generation) captureScrollMessageNode(row, context?.route || route, persist);
+      } catch (_error) {}
       captured += 1;
       if (captured >= SCROLL_CAPTURE_ROWS_PER_FRAME ||
         performance.now() - startedAt >= SCROLL_CAPTURE_FRAME_BUDGET_MS) break;
@@ -2635,6 +2729,8 @@
       if (!row) return;
       const identity = rowIdentity(row);
       if (!identity || identity.channelId && identity.channelId !== route?.channelId) return;
+      if (!route) return;
+      state.scrollCaptureContexts.set(row, { route, generation: state.generation });
       state.pendingScrollRows.add(row);
     };
     const addOwner = (node) => {
@@ -2659,13 +2755,19 @@
     const now = performance.now();
     for (const mutation of mutations) {
       mutation.removedNodes.forEach((node) => {
-        uniqueMessageNodes(node, route).forEach((message) => {
+        uniqueMessageNodes(node).forEach((message) => {
           const snapshot = state.snapshots.get(message);
-          const pending = state.pendingScrollRows.has(message);
-          if ((!snapshot && !pending) || (snapshot && state.activeList && snapshot.listNode !== state.activeList)) return;
           const identity = rowIdentity(message);
+          let context = state.scrollCaptureContexts.get(message);
+          if (!context && route && (!identity?.channelId || identity.channelId === route.channelId)) {
+            context = { route, generation: state.generation };
+            state.scrollCaptureContexts.set(message, context);
+          }
+          if (!context || context.generation !== state.generation) return;
+          if (!snapshot?.record) state.pendingScrollRows.add(message);
+          const pending = state.pendingScrollRows.has(message);
           const messageId = snapshot?.messageId || identity?.messageId;
-          const channelId = route?.channelId || snapshot?.record?.channelId || identity?.channelId;
+          const channelId = context.route.channelId;
           if (!channelId || !messageId) return;
           // Keep a newly detached row in pendingScrollRows. The bounded capture
           // owns extraction; lifecycle confirmation retries after it completes.
@@ -2673,6 +2775,11 @@
             state.priorityScrollRows.add(message);
           }
           state.recentRemovals.set(`${channelId}:${messageId}`, now);
+          const deletion = state.pendingDeletions.get(`${channelId}:${messageId}`);
+          if (deletion && route?.channelId === channelId && state.route?.channelId === channelId) {
+            deletion.removalObserved = true;
+            deletion.nextAttemptAt = 0;
+          }
           while (state.recentRemovals.size > 500) state.recentRemovals.delete(state.recentRemovals.keys().next().value);
         });
       });
@@ -2735,7 +2842,9 @@
 
   function evaluateCandidate(candidate) {
     setTimeout(async () => {
-      if (state.paused) return;
+      if (state.paused || state.captureSafetySuspended || state.deletionResetPending ||
+        candidate.generationAtMutation !== state.generation ||
+        state.discardedDeletionKeys.has(Core.recordKey(candidate.snapshot.record || {}))) return;
       const active = findActiveMessageList();
       const rows = active ? active.rows : [];
       const previous = active ? findMessage(candidate.snapshot.previousId, rows) : null;
@@ -2775,7 +2884,7 @@
   }
 
   function handleMutations(mutations) {
-    if (state.paused) return;
+    if (state.captureSafetySuspended || state.paused || state.deletionResetPending) return;
     const relevantMutations = mutations.filter((mutation) =>
       !extensionOnlyMutation(mutation) && mutationTouchesMessageSurface(mutation, state.activeList));
     if (!relevantMutations.length) return;
@@ -2814,6 +2923,13 @@
       });
     }
     const rootReplacement = explicitRootReplacement(removedRoots, state.activeList);
+    // Retain references to detached rows even if they were added and removed
+    // before the normal capture frame. This does not infer deletion; only the
+    // independent lifecycle signal can confirm these snapshots.
+    rememberRecentRemovedMessages(relevantMutations, route);
+    trimPendingScrollRows();
+    scheduleScrollingCapture(true);
+    scheduleDeletionDrain(0);
     for (const candidate of candidateMap.values()) {
       evaluateCandidate(Object.assign(candidate, {
         routeKeyAtMutation: route?.routeKey, generationAtMutation: state.generation, rootReplacement,
@@ -2863,72 +2979,237 @@
     return new Promise((resolve) => setTimeout(resolve, milliseconds));
   }
 
-  async function confirmLifecycleDeletion(channelId, ids, attempt) {
-    const retryAttempt = Number.isInteger(attempt) ? attempt : 0;
-    if (state.paused || !SNOWFLAKE.test(channelId) || state.route?.channelId !== channelId) return;
-    await flushAllRecords();
-    let eligibleIds = ids.slice(0, 200).filter((id) => SNOWFLAKE.test(id));
-    const recentlyRemoved = (id) => performance.now() - (state.recentRemovals.get(`${channelId}:${id}`) || -Infinity) < 1800;
-    if (eligibleIds.some((id) => liveMessageExists(channelId, id) || !recentlyRemoved(id))) {
-      await delay(100);
-      if (eligibleIds.some((id) => liveMessageExists(channelId, id) || !recentlyRemoved(id))) await delay(300);
-      eligibleIds = eligibleIds.filter((id) => !liveMessageExists(channelId, id) && recentlyRemoved(id));
-    }
-    const deletions = eligibleIds.map((id) => knownDeletion(channelId, id)).filter(Boolean);
-    if (!deletions.length) {
-      if (retryAttempt < 3 && eligibleIds.length) {
-        setTimeout(() => confirmLifecycleDeletion(channelId, ids, retryAttempt + 1).catch(() => {}), 500);
-      }
-      return;
-    }
-    const response = await send({ type: T.CONFIRM_DELETED, generation: state.generation, deletions });
-    if (response.archive) applyArchive(response.archive);
-    if (response.ok) queueConfirmedMounts(channelId, deletions);
-    else if (retryAttempt < 3 && (response.reason === "broker-unavailable" || response.reason === "broker-error")) {
-      setTimeout(() => confirmLifecycleDeletion(channelId, ids, retryAttempt + 1).catch(() => {}), 500);
-    }
-    requestAnimationFrame(reconcileTombstones);
-    setTimeout(reconcileTombstones, 120);
-    setTimeout(reconcileTombstones, 500);
+  function acknowledgeDeletion(key, pending) {
+    if (state.pendingDeletions.get(key) !== pending) return;
+    state.pendingDeletions.delete(key);
+    state.pendingRetainedKeys.delete(key);
+    window.postMessage({ bridge: BRIDGE, kind: "deletion-ack", channelId: pending.channelId, ids: [pending.messageId] }, "*");
   }
 
-  async function confirmRetainedDeletion(channelId, ids, attempt) {
-    const retryAttempt = Number.isInteger(attempt) ? attempt : 0;
-    if (state.paused || !SNOWFLAKE.test(channelId) || state.route?.channelId !== channelId) return;
-    for (const id of ids.slice(0, 200).filter((id) => SNOWFLAKE.test(id))) {
-      state.pendingRetainedKeys.add(`${channelId}:${id}`);
-      while (state.pendingRetainedKeys.size > 500) state.pendingRetainedKeys.delete(state.pendingRetainedKeys.values().next().value);
+  function discardDeletionKey(key) {
+    if (!state.discardedDeletionKeys.has(key) && state.discardedDeletionKeys.size >= 5000) {
+      // Do not forget an older suppression ID while its native row may still
+      // exist (for example if Discord's release adapter failed).
+      state.captureSafetySuspended = true;
+      state.pendingRecords.clear();
+      state.pendingEdits.clear();
+      state.stagedSelfEdits.clear();
+    } else state.discardedDeletionKeys.add(key);
+    state.pendingRecords.delete(key);
+    state.snapshotsByKey.delete(key);
+    for (const [id, pending] of state.pendingEdits) {
+      if (pending.recordKey === key) state.pendingEdits.delete(id);
     }
-    applyRetainedStyles();
-    // A user can delete their own newly sent message before the normal DOM
-    // capture debounce has persisted it. The MessageStore hook kept the native
-    // row alive, so snapshot and flush that row synchronously before marking it
-    // deleted in the archive.
-    snapshotRenderedMessages(true);
-    await flushAllRecords();
-    const deletions = ids.slice(0, 200).filter((id) => SNOWFLAKE.test(id))
-      .map((id) => knownDeletion(channelId, id, true)).filter(Boolean)
-      .map((item) => Object.assign(item, { source: "message_store_preserved" }));
-    if (!deletions.length) {
-      if (retryAttempt < 3) setTimeout(() => confirmRetainedDeletion(channelId, ids, retryAttempt + 1).catch(() => {}), 500);
+    for (const [id, staged] of state.stagedSelfEdits) {
+      if (Core.recordKey(staged.baseline) === key) state.stagedSelfEdits.delete(id);
+    }
+  }
+
+  function captureRetainedMessage(channelId, messageId, rowIndex) {
+    const key = `${channelId}:${messageId}`;
+    if (state.captureSafetySuspended || state.deletionResetPending || state.discardedDeletionKeys.has(key)) return null;
+    const archived = state.archiveByKey.get(key);
+    if (archived?.status === "confirmed_deleted") return archived;
+    let row = null;
+    let route = null;
+    if (state.route?.channelId === channelId) {
+      row = rowIndex ? rowIndex.get(key) : retainedRow(channelId, messageId);
+      route = state.route;
+    }
+    if (!row && rowIndex?.has(key)) {
+      row = rowIndex.get(key);
+      route = state.scrollCaptureContexts.get(row)?.route;
+    }
+    if (!row && !rowIndex) {
+      row = [...state.pendingScrollRows].find((candidate) => {
+        const context = state.scrollCaptureContexts.get(candidate);
+        return context?.generation === state.generation && context.route.channelId === channelId &&
+          rowIdentity(candidate)?.messageId === messageId;
+      });
+      route = row && state.scrollCaptureContexts.get(row)?.route;
+    }
+    // Exact lifecycle capture must not depend on viewport intersection or tab
+    // visibility. This reads only an already-rendered DOM row, never store bodies.
+    let record = null;
+    try { if (row && route) record = recordFromNode(row, Date.now(), route); } catch (_error) {}
+    const snapshot = state.snapshotsByKey.get(key);
+    if (record) {
+      state.snapshotsByKey.set(key, Object.assign({}, snapshot || {}, {
+        record, messageId, routeKey: route.routeKey,
+        listNode: snapshot?.listNode || row.parentElement,
+        parentNode: snapshot?.parentNode || row.parentElement
+      }));
+      while (state.snapshotsByKey.size > 2500) state.snapshotsByKey.delete(state.snapshotsByKey.keys().next().value);
+    }
+    return record || state.pendingRecords.get(key)?.record || snapshot?.record || archived || null;
+  }
+
+  function scheduleDeletionDrain(delayMs) {
+    if (!state.pendingDeletions.size || state.captureSafetySuspended || state.paused || !state.archiveInitialized || state.deletionResetPending) return;
+    clearTimeout(state.pendingDeletionTimer);
+    state.pendingDeletionTimer = setTimeout(() => {
+      state.pendingDeletionTimer = null;
+      drainPendingDeletions().catch(() => {});
+    }, Math.max(0, Number(delayMs) || 0));
+  }
+
+  function fresherDeletionRecord(previous, candidate) {
+    if (!candidate) return previous;
+    if (!previous || candidate.status === "confirmed_deleted") return candidate;
+    if (previous.status === "confirmed_deleted") return previous;
+    if (previous.captureSessionId && previous.captureSessionId === candidate.captureSessionId) {
+      return Number(candidate.captureSequence || 0) >= Number(previous.captureSequence || 0) ? candidate : previous;
+    }
+    return Number(candidate.capturedAt || 0) >= Number(previous.capturedAt || 0) ? candidate : previous;
+  }
+
+  function queueLifecycleDeletions(channelId, ids, source) {
+    if (!SNOWFLAKE.test(channelId) || !Array.isArray(ids) || state.deletionResetPending) return;
+    const cleanIds = [...new Set(ids.slice(0, 200).map(String).filter((id) => SNOWFLAKE.test(id)))];
+    if (state.captureSafetySuspended || state.paused && state.archiveInitialized) {
+      window.postMessage({ bridge: BRIDGE, kind: "release", channelId, ids: cleanIds }, "*");
       return;
     }
-    const response = await send({ type: T.CONFIRM_DELETED, generation: state.generation, deletions });
-    if (response.archive) applyArchive(response.archive);
-    if (response.ok) {
-      for (const id of ids) state.pendingRetainedKeys.delete(`${channelId}:${id}`);
-      // Discord can remove the rendered row even when its MessageStore record was
-      // retained. Mount from the pre-delete snapshot immediately in that case;
-      // the helper skips rows that are still native, so this cannot duplicate them.
-      queueConfirmedMounts(channelId, deletions);
+    const startupRows = !state.archiveInitialized ? retainedRowsByKey() : null;
+    for (const messageId of cleanIds) {
+      const key = `${channelId}:${messageId}`;
+      if (state.discardedDeletionKeys.has(key)) {
+        window.postMessage({ bridge: BRIDGE, kind: "release", channelId, ids: [messageId] }, "*");
+        continue;
+      }
+      const previous = state.pendingDeletions.get(key);
+      const retained = source === "message_store_preserved" || previous?.source === "message_store_preserved";
+      const promoted = retained && previous?.source !== "message_store_preserved";
+      const pending = previous || {
+        channelId, messageId, generation: state.archiveInitialized ? state.generation : null,
+        record: null, attempts: 0, nextAttemptAt: 0, removalObserved: false, needsCapture: true
+      };
+      pending.source = retained ? "message_store_preserved" : "discord_lifecycle";
+      if (startupRows?.has(key) && state.route?.channelId === channelId) {
+        pending.nativeRow = startupRows.get(key);
+        pending.captureRoute = state.route;
+      }
+      if (retained) state.pendingRetainedKeys.add(key);
+      // Pin the available snapshot in this operation; unrelated scrolling/pruning
+      // must not evict the payload while a storage retry is outstanding.
+      const captured = state.pendingRecords.get(key)?.record || state.snapshotsByKey.get(key)?.record || state.archiveByKey.get(key);
+      const becameCapturable = !pending.record && Boolean(captured);
+      pending.record = fresherDeletionRecord(pending.record, captured);
+      const removedAt = state.recentRemovals.get(key);
+      if (removedAt !== undefined && performance.now() - removedAt < 1800 && !liveMessageExists(channelId, messageId)) {
+        pending.removalObserved = true;
+      }
+      if (!previous || promoted || becameCapturable) pending.nextAttemptAt = 0;
+      if (promoted) pending.needsCapture = true;
+      state.pendingDeletions.set(key, pending);
+      if (state.archiveByKey.get(key)?.status === "confirmed_deleted") acknowledgeDeletion(key, pending);
     }
-    if (!response.ok && retryAttempt < 3 && (response.reason === "broker-unavailable" || response.reason === "broker-error")) {
-      setTimeout(() => confirmRetainedDeletion(channelId, ids, retryAttempt + 1).catch(() => {}), 500);
+    // The MAIN-world ledger retains unacknowledged IDs for later replay if this
+    // bounded work queue fills. Never ACK an entry merely to make room.
+    while (state.pendingDeletions.size > 5000) {
+      const victim = [...state.pendingDeletions].find(([, item]) => !item.record)?.[0] || state.pendingDeletions.keys().next().value;
+      state.pendingDeletions.delete(victim);
+      state.pendingRetainedKeys.delete(victim);
     }
-    requestAnimationFrame(applyRetainedStyles);
-    setTimeout(applyRetainedStyles, 120);
-    requestAnimationFrame(reconcileTombstones);
-    setTimeout(reconcileTombstones, 120);
+    scheduleRetainedStyles();
+    scheduleDeletionDrain(0);
+  }
+
+  async function drainPendingDeletions() {
+    if (state.pendingDeletionPromise) return state.pendingDeletionPromise;
+    if (!state.archiveInitialized || state.captureSafetySuspended || state.paused || state.deletionResetPending || !state.pendingDeletions.size) return;
+    const generation = state.generation;
+    const run = (async () => {
+      const now = performance.now();
+      const groups = new Map();
+      const nativeRows = retainedRowsByKey();
+      for (const row of state.pendingScrollRows) {
+        const context = state.scrollCaptureContexts.get(row);
+        const identity = rowIdentity(row);
+        if (context?.generation === generation && identity) {
+          nativeRows.set(`${context.route.channelId}:${identity.messageId}`, row);
+        }
+      }
+      for (const [key, pending] of state.pendingDeletions) {
+        if (pending.generation === generation && pending.nativeRow && pending.captureRoute) {
+          nativeRows.set(key, pending.nativeRow);
+          state.scrollCaptureContexts.set(pending.nativeRow, { route: pending.captureRoute, generation });
+        }
+      }
+      let examined = 0;
+      let richCaptures = 0;
+      for (const [key, pending] of state.pendingDeletions) {
+        if (pending.generation !== generation || pending.nextAttemptAt > now) continue;
+        if (examined++ >= 200) break;
+        if (state.archiveByKey.get(key)?.status === "confirmed_deleted") {
+          acknowledgeDeletion(key, pending);
+          continue;
+        }
+        if (nativeRows.has(key) && (pending.needsCapture || !pending.record)) {
+          if (richCaptures >= SCROLL_CAPTURE_ROWS_PER_FRAME || richCaptures > 0 && performance.now() - now >= SCROLL_CAPTURE_FRAME_BUDGET_MS) break;
+          richCaptures += 1;
+          pending.record = fresherDeletionRecord(pending.record, captureRetainedMessage(pending.channelId, pending.messageId, nativeRows));
+          if (pending.record) {
+            pending.needsCapture = false;
+            delete pending.nativeRow;
+            delete pending.captureRoute;
+          }
+        } else {
+          pending.record = fresherDeletionRecord(pending.record,
+            state.pendingRecords.get(key)?.record || state.snapshotsByKey.get(key)?.record || state.archiveByKey.get(key));
+        }
+        const removedAt = state.recentRemovals.get(key);
+        if (state.route?.channelId === pending.channelId && removedAt !== undefined && now - removedAt < 1800 &&
+          !liveMessageExists(pending.channelId, pending.messageId)) pending.removalObserved = true;
+        pending.attempts += 1;
+        pending.nextAttemptAt = now + Math.min(30000, 250 * (2 ** Math.min(pending.attempts, 7)));
+        if (!pending.record || (pending.source !== "message_store_preserved" && !pending.removalObserved)) continue;
+        const snapshot = state.snapshotsByKey.get(key);
+        const item = {
+          record: pending.record, source: pending.source,
+          previousId: snapshot?.previousId || pending.record.inferredPreviousId || null,
+          nextId: snapshot?.nextId || pending.record.inferredNextId || null,
+          tail: snapshot ? Boolean(snapshot.tailCandidate) : Boolean(pending.record.inferredTail),
+          listIdentity: snapshot?.listIdentity || pending.record.inferredListIdentity || null
+        };
+        if (!groups.has(pending.channelId)) groups.set(pending.channelId, []);
+        groups.get(pending.channelId).push(item);
+      }
+      for (const [channelId, deletions] of groups) {
+        if (generation !== state.generation || state.captureSafetySuspended || state.paused || state.deletionResetPending) break;
+        // The ordinary dispatcher fallback requires a previously saved record;
+        // retained snapshots can be confirmed atomically without a seen upsert.
+        if (deletions.some((item) => item.source !== "message_store_preserved")) await flushAllRecords();
+        if (generation !== state.generation || state.captureSafetySuspended || state.paused || state.deletionResetPending) break;
+        const response = await send({ type: T.CONFIRM_DELETED, generation, deletions });
+        if (response.archive) applyArchive(response.archive);
+        if (generation !== state.generation || state.captureSafetySuspended || state.paused || state.deletionResetPending) break;
+        const saved = deletions.filter((item) => state.archiveByKey.get(Core.recordKey(item.record))?.status === "confirmed_deleted");
+        // applyArchive performs the ACK only after seeing the persisted record.
+        // An `ok` response alone can include a pruned/missing result.
+        if (saved.length) queueConfirmedMounts(channelId, saved);
+      }
+      scheduleRetainedStyles();
+      reconcileTombstones();
+    })();
+    state.pendingDeletionPromise = run.finally(() => {
+      state.pendingDeletionPromise = null;
+      if (state.pendingDeletions.size) {
+        const nextAt = Math.min(...[...state.pendingDeletions.values()].map((item) => item.nextAttemptAt));
+        scheduleDeletionDrain(Math.max(100, nextAt - performance.now()));
+      }
+    });
+    return state.pendingDeletionPromise;
+  }
+
+  async function confirmLifecycleDeletion(channelId, ids) {
+    queueLifecycleDeletions(channelId, ids, "discord_lifecycle");
+    await drainPendingDeletions();
+  }
+
+  async function confirmRetainedDeletion(channelId, ids) {
+    queueLifecycleDeletions(channelId, ids, "message_store_preserved");
+    await drainPendingDeletions();
   }
 
   function mountConfirmedFromSnapshots(channelId, deletions) {
@@ -3022,7 +3303,8 @@
   }
 
   function commitPendingEdit(pendingId, pending) {
-    if (state.pendingEdits.get(pendingId) !== pending || pending.sending || pending.generation !== state.generation || state.paused) return;
+    if (state.pendingEdits.get(pendingId) !== pending || pending.sending || pending.generation !== state.generation || state.paused ||
+      state.captureSafetySuspended || state.deletionResetPending || state.discardedDeletionKeys.has(pending.recordKey)) return;
     pending.sending = true;
     send({
       type: T.CONFIRM_EDIT,
@@ -3058,6 +3340,7 @@
 
   function verifyPendingEdit(pendingId, pending, renderedRecord) {
     if (state.pendingEdits.get(pendingId) !== pending || pending.generation !== state.generation || state.paused ||
+      state.captureSafetySuspended || state.deletionResetPending || state.discardedDeletionKeys.has(pending.recordKey) ||
       performance.now() >= pending.expiresAt) {
       discardPendingEdit(pendingId, pending);
       return;
@@ -3088,7 +3371,8 @@
     const messageId = String(message?.ids?.[0] || "");
     const editSessionId = Core.normalizeText(message?.editSessionId).slice(0, 100);
     const editSequence = Math.max(0, Math.floor(Number(message?.editSequence) || 0));
-    if (state.paused || state.route?.channelId !== channelId || !SNOWFLAKE.test(channelId) ||
+    if (state.paused || state.captureSafetySuspended || state.deletionResetPending ||
+      state.discardedDeletionKeys.has(`${channelId}:${messageId}`) || state.route?.channelId !== channelId || !SNOWFLAKE.test(channelId) ||
       !SNOWFLAKE.test(messageId) || !editSessionId || !editSequence) return null;
     return {
       channelId,
@@ -3195,6 +3479,20 @@
         signalPageBridgeReady();
         return;
       }
+      if (message.kind === "deletions-reset") {
+        if (state.deletionResetPending && message.resetToken === state.deletionResetToken) {
+          for (const batch of (Array.isArray(message.discarded) ? message.discarded : []).slice(0, 5000)) {
+            if (!SNOWFLAKE.test(String(batch?.channelId || "")) || !Array.isArray(batch.ids)) continue;
+            for (const id of batch.ids.slice(0, 200).map(String).filter((id) => SNOWFLAKE.test(id))) {
+              discardDeletionKey(`${batch.channelId}:${id}`);
+            }
+          }
+          state.deletionResetPending = false;
+          window.postMessage({ bridge: BRIDGE, kind: "isolated-ready" }, "*");
+          if (!state.paused) window.postMessage({ bridge: BRIDGE, kind: "sync-deletions" }, "*");
+        }
+        return;
+      }
       if (message.kind === "status" && ["active", "searching", "degraded"].includes(message.status)) {
         state.pageHookLastSeenAt = performance.now();
         state.pageHookStatus = message.status;
@@ -3224,7 +3522,9 @@
   }
 
   function signalPageBridgeReady() {
-    window.postMessage({ bridge: BRIDGE, kind: "isolated-ready" }, "*");
+    window.postMessage(state.deletionResetPending
+      ? { bridge: BRIDGE, kind: "reset-deletions", resetToken: state.deletionResetToken }
+      : { bridge: BRIDGE, kind: "isolated-ready" }, "*");
   }
 
   function checkRoute() {
@@ -3234,14 +3534,10 @@
       state.lastRouteAt = performance.now();
       state.anchorlessEpoch += 1;
       state.signatures.clear();
-      state.recentRemovals.clear();
-      state.pendingScrollRows.clear();
-      state.priorityScrollRows.clear();
-      state.scrollCaptureLimiter?.cancel();
-      state.scrollCaptureFrameScheduler?.cancel();
+      // Extraction owns its original route and generation. Do not throw away
+      // detached rows or deletion facts merely because the view changed.
       clearTimeout(state.scrollSettleTimer);
       state.scrollSettleTimer = null;
-      state.pendingRetainedKeys.clear();
       state.pendingReleaseKeys.clear();
       state.pendingConfirmedMounts.clear();
       state.stagedSelfEdits.clear();
@@ -3253,6 +3549,10 @@
       if (!route) send({ type: LIVE_HEALTH, status: "inactive", detail: "This Discord document is outside a channel route." }).catch(() => {});
       refreshArchive().catch(() => {});
       if (route) requestPageHook("channel-route-entered").catch(() => {});
+      for (const pending of state.pendingDeletions.values()) pending.nextAttemptAt = 0;
+      scheduleScrollingCapture(true);
+      scheduleDeletionDrain(0);
+      window.postMessage({ bridge: BRIDGE, kind: "sync-deletions" }, "*");
       setTimeout(() => scheduleSnapshot(true, 0), Core.DEFAULTS.routeQuietMs + 50);
     }
   }
@@ -3280,12 +3580,21 @@
     document.addEventListener("focusin", handleLiveAuthorActionInterest, true);
     window.addEventListener("message", handleMediaFrameSize);
     window.addEventListener("resize", scheduleTombstoneSpacing, { passive: true });
+    window.addEventListener("pagehide", () => {
+      // Send already-captured records before document teardown; never claim a
+      // successful save without the broker's persisted archive response.
+      flushRecords().catch(() => {});
+      drainPendingDeletions().catch(() => {});
+    });
     setInterval(checkRoute, 300);
     setInterval(() => {
       if (performance.now() - state.lastScrollAt < Core.DEFAULTS.scrollQuietMs) scheduleScrollingCapture(true);
       else scheduleSnapshot(true, 0);
     }, 2000);
     setInterval(() => {
+      if (state.deletionResetPending) signalPageBridgeReady();
+      else window.postMessage({ bridge: BRIDGE, kind: "sync-deletions" }, "*");
+      scheduleDeletionDrain(0);
       if (state.route && (state.pageHookStatus !== "active" ||
         performance.now() - state.pageHookLastSeenAt > 15000)) {
         requestPageHook("lifecycle-watchdog").catch(() => {});

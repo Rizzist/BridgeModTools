@@ -383,6 +383,35 @@ test("a full deleted archive reserves room for newly rendered messages", () => {
   assert.equal(pruned.filter((record) => Core.isDeletedStatus(record.status)).length, 4);
 });
 
+test("a saturated archive reserves the newest tail of an equal-timestamp capture batch", () => {
+  const deleted = Array.from({ length: Core.DEFAULTS.maxRecords }, (_, index) => ({
+    messageId: String(100000000000000000n + BigInt(index)), channelId: "1",
+    status: "confirmed_deleted", content: "saved", updatedAt: index + 1
+  }));
+  const captured = Array.from({ length: Core.DEFAULTS.seenReserve + 10 }, (_, index) => ({
+    messageId: String(200000000000000000n + BigInt(index)), channelId: "1",
+    status: "seen", content: "new", capturedAt: 2000,
+    captureSessionId: "one-page", captureSequence: index + 1
+  }));
+  const expected = captured.slice(-Core.DEFAULTS.seenReserve).map((record) => record.messageId).reverse();
+  for (const batch of [captured, [...captured].reverse()]) {
+    const merged = Core.mergeRecords(deleted, batch, { now: 3000 });
+    assert.equal(merged.length, Core.DEFAULTS.maxRecords);
+    assert.deepEqual(merged.filter((record) => record.status === "seen").map((record) => record.messageId), expected);
+  }
+});
+
+test("equal-write-time pruning uses capture time before snowflake chronology", () => {
+  const records = [
+    { channelId: "1", messageId: "200000000000000002", status: "seen", capturedAt: 10 },
+    { channelId: "1", messageId: "200000000000000001", status: "seen", capturedAt: 20 }
+  ];
+  for (const batch of [records, [...records].reverse()]) {
+    const merged = Core.mergeRecords([], batch, { now: 30, maxRecords: 1 });
+    assert.equal(merged[0].messageId, "200000000000000001");
+  }
+});
+
 test("author presentation sanitizer keeps Discord visuals and rejects executable CSS or assets", () => {
   const record = Core.sanitizeRecordPresentation({
     messageId: "1",

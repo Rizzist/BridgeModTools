@@ -19,7 +19,7 @@ const GET_LIVE_HEALTH = "LDMA_GET_LIVE_HEALTH";
 const USER_ACTION_COMMAND = "LDMA_USER_ACTION";
 const RESOLVE_MESSAGE_AUTHORS_COMMAND = "LDMA_RESOLVE_MESSAGE_AUTHORS";
 const DISCORD_TAB_PATTERN = "https://discord.com/*";
-const PAGE_HOOK_API_VERSION = 3;
+const PAGE_HOOK_API_VERSION = 4;
 const PAGE_HOOK_RELOAD_SESSION_KEY = "ldmaPageHookUpgradeReloadsV1";
 const bootstrapJobs = new Map();
 let pageHookReloadQueue = Promise.resolve();
@@ -882,15 +882,20 @@ async function handlePlaybackCommand(command, sender) {
 function archiveCommandAllowed(command, sender) {
   const type = command && command.type;
   if (!type) return false;
-  if (discordChannelContentSender(sender)) return new Set([
+  // Reads must also work while a channel is active. Captures and exact deletion
+  // confirmations can finish after their originating channel was navigated away
+  // from; their generation still has to pass the broker's archive boundary.
+  if (discordContentSender(sender) && new Set([
+    Protocol.TYPES.GET_ARCHIVE,
     Protocol.TYPES.UPSERT_RECORDS,
+    Protocol.TYPES.CONFIRM_DELETED
+  ]).has(type)) return true;
+  if (discordChannelContentSender(sender)) return new Set([
     Protocol.TYPES.CONFIRM_EDIT,
-    Protocol.TYPES.CONFIRM_DELETED,
     Protocol.TYPES.INFER_DELETED,
     Protocol.TYPES.RETRACT_MESSAGE,
     Protocol.TYPES.SET_HEALTH
   ]).has(type);
-  if (discordContentSender(sender)) return type === Protocol.TYPES.GET_ARCHIVE;
   if (popupSender(sender)) return new Set([
     Protocol.TYPES.GET_ARCHIVE,
     Protocol.TYPES.SET_PAUSED,

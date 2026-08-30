@@ -36,7 +36,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.7.0");
+  assert.equal(manifest.version, "2.7.1");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -72,7 +72,7 @@ test("background self-heals fresh, restored, updated, and SPA Discord documents"
   assert.match(background, /chrome\.tabs\.query\(\{ url: \[DISCORD_TAB_PATTERN\] \}\)/);
   assert.match(background, /chrome\.scripting\.executeScript/);
   assert.match(background, /files: \["src\/page-hook\.js"\][\s\S]*world: "MAIN"/);
-  assert.match(background, /PAGE_HOOK_API_VERSION = 3/);
+  assert.match(background, /PAGE_HOOK_API_VERSION = 4/);
   assert.match(background, /chrome\.storage\.session\.get\(PAGE_HOOK_RELOAD_SESSION_KEY\)/);
   assert.match(background, /if \(!await claimPageHookReload\(tabId\)\)/);
   assert.match(background, /typeof controller\.resolveMessageAuthors === "function"/);
@@ -176,7 +176,10 @@ test("content contains retraction and tombstone reconciliation hooks", () => {
   assert.match(content, /confirmRetainedDeletion/);
   assert.match(content, /message_store_preserved/);
   assert.match(content, /ldma-retained-deleted/);
-  assert.match(content, /confirmRetainedDeletion[\s\S]*snapshotRenderedMessages\(true\);[\s\S]*await flushAllRecords/);
+  assert.match(content, /confirmRetainedDeletion[\s\S]*queueLifecycleDeletions\(channelId, ids, "message_store_preserved"\)/);
+  assert.match(content, /function captureRetainedMessage/);
+  assert.match(content, /function acknowledgeDeletion/);
+  assert.match(content, /deletionResetPending/);
   assert.match(content, /findMountedTombstone/);
   assert.match(content, /Core\.chronologicalNeighborIds/);
   assert.match(content, /Core\.compareSnowflakeIds/);
@@ -188,7 +191,7 @@ test("content contains retraction and tombstone reconciliation hooks", () => {
   assert.match(content, /scheduleTombstoneSpacing/);
   assert.match(content, /Core\.balancedTombstoneShift/);
   assert.match(content, /pendingReleaseKeys/);
-  assert.match(content, /confirmRetainedDeletion[\s\S]*queueConfirmedMounts\(channelId, deletions\)/);
+  assert.match(content, /drainPendingDeletions[\s\S]*queueConfirmedMounts\(channelId, saved\)/);
   assert.match(content, /Core\.tombstoneInRenderedRange/);
   assert.match(content, /outsideRenderedRange/);
   assert.match(content, /candidate !== element/);
@@ -232,7 +235,8 @@ test("persistent replacements use a Discord-style row and hide the retained nati
   assert.match(content, /function findEmptyConfirmedRestoreList/);
   assert.match(content, /outsideActiveList/);
   assert.match(content, /active\.node\?\.contains\(element\)/);
-  assert.match(content, /retainedRow\(route\.channelId, record\.messageId, active\.node\)/);
+  assert.match(content, /const nativeRow = nativeRows\.get\(Core\.recordKey\(record\)\)/);
+  assert.match(content, /!active\.node\.contains\(nativeRow\)/);
   assert.match(content, /Core\.anchorlessRestoreAllowed/);
   assert.match(content, /outsideRenderedRange/);
   assert.match(content, /element\.dataset\.ldmaEmptyRestore = "true"/);
@@ -357,7 +361,7 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.match(content, /background independently proves/);
   assert.match(content, /function removeLiveAuthorActions/);
   assert.match(content, /removeLiveAuthorActions\(\)/);
-  assert.match(hook, /const HOOK_API_VERSION = 3/);
+  assert.match(hook, /const HOOK_API_VERSION = 4/);
   assert.match(hook, /existingController\.apiVersion !== HOOK_API_VERSION/);
   assert.equal(/window\.location\.reload\(\)/.test(hook), false);
   assert.match(hook, /onInstalled path owns the single bounded document reload/);

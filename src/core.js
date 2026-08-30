@@ -814,7 +814,16 @@
       if (!existing || itemTime >= existingTime) byKey.set(key, sanitized);
     }
 
-    const newestFirst = (a, b) => (b.updatedAt || b.capturedAt || 0) - (a.updatedAt || a.capturedAt || 0);
+    const newestFirst = (a, b) => {
+      const updateOrder = (b.updatedAt || b.capturedAt || 0) - (a.updatedAt || a.capturedAt || 0);
+      if (updateOrder) return updateOrder;
+      const captureOrder = (b.capturedAt || 0) - (a.capturedAt || 0);
+      if (captureOrder) return captureOrder;
+      // One flush gives every captured row the same updatedAt. Resolve that tie
+      // from capture time/Discord chronology, not the batch's insertion order,
+      // so a full archive's seen reserve includes a just-posted tail message.
+      return compareSnowflakeIds(b.messageId, a.messageId);
+    };
     const deleted = [...byKey.values()].filter((record) => isDeletedStatus(record.status)).sort(newestFirst);
     const edited = [...byKey.values()].filter((record) => !isDeletedStatus(record.status) && hasEdits(record)).sort(newestFirst);
     const seen = [...byKey.values()].filter((record) => !isDeletedStatus(record.status) && !hasEdits(record)).sort(newestFirst);
