@@ -36,7 +36,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.7.1");
+  assert.equal(manifest.version, "2.7.2");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -72,7 +72,7 @@ test("background self-heals fresh, restored, updated, and SPA Discord documents"
   assert.match(background, /chrome\.tabs\.query\(\{ url: \[DISCORD_TAB_PATTERN\] \}\)/);
   assert.match(background, /chrome\.scripting\.executeScript/);
   assert.match(background, /files: \["src\/page-hook\.js"\][\s\S]*world: "MAIN"/);
-  assert.match(background, /PAGE_HOOK_API_VERSION = 5/);
+  assert.match(background, /PAGE_HOOK_API_VERSION = 6/);
   assert.match(background, /chrome\.storage\.session\.get\(PAGE_HOOK_RELOAD_SESSION_KEY\)/);
   assert.match(background, /if \(!await claimPageHookReload\(tabId\)\)/);
   assert.match(background, /typeof controller\.resolveMessageAuthors === "function"/);
@@ -344,7 +344,7 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.equal(/function copyUserId/.test(content), false);
   assert.match(content, /document\.execCommand\("copy"\)/);
   assert.match(content, /window\.confirm\(`Timeout \$\{author\} \(\$\{userId\}\) for 7 days\?`\)/);
-  assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "open-profile",\s*userId: actionUserId,\s*guildId: actionGuildId/);
+  assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "open-profile",\s*userId: actionUserId,\s*guildId: actionGuildId,\s*anchor:/);
   assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "timeout-7d",\s*userId,\s*guildId: context\.guildId,\s*messageId: context\.messageId/);
   assert.match(content, /Core\.messageRowOwnsElement\(row, host, identity\.messageId\)/);
   assert.match(content, /pendingTimeoutActions\.has\(timeoutKey\)/);
@@ -361,8 +361,13 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.match(content, /background independently proves/);
   assert.match(content, /function removeLiveAuthorActions/);
   assert.match(content, /removeLiveAuthorActions\(\)/);
-  assert.match(hook, /const HOOK_API_VERSION = 5/);
+  assert.match(hook, /const HOOK_API_VERSION = 6/);
   assert.match(hook, /existingController\.apiVersion !== HOOK_API_VERSION/);
+  assert.match(hook, /function openUserProfilePopout\(normalized\)/);
+  assert.match(hook, /userProfilePopoutCandidate/);
+  assert.match(hook, /position: "left",\s*spacing: 16/);
+  assert.equal(/openUserProfileModal/.test(hook), false,
+    "deleted-row clicks must never fall back to Discord's full profile modal");
   assert.equal(/window\.location\.reload\(\)/.test(hook), false);
   assert.match(hook, /onInstalled path owns the single bounded document reload/);
   assert.match(hook, /storeInfo\.name === "UserStore" && moduleExportFunction\(value, "getUser"\)/);

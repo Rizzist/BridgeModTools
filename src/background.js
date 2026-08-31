@@ -20,7 +20,7 @@ const USER_ACTION_COMMAND = "LDMA_USER_ACTION";
 const RESOLVE_MESSAGE_AUTHORS_COMMAND = "LDMA_RESOLVE_MESSAGE_AUTHORS";
 const RESOLVE_MEMBER_TIMEOUTS_COMMAND = "LDMA_RESOLVE_MEMBER_TIMEOUTS";
 const DISCORD_TAB_PATTERN = "https://discord.com/*";
-const PAGE_HOOK_API_VERSION = 5;
+const PAGE_HOOK_API_VERSION = 6;
 const PAGE_HOOK_RELOAD_SESSION_KEY = "ldmaPageHookUpgradeReloadsV1";
 const bootstrapJobs = new Map();
 let pageHookReloadQueue = Promise.resolve();
@@ -521,6 +521,20 @@ function safeUserActionResult(value) {
   return { ok, reason: reason || (ok ? "user-action-invoked" : "user-action-rejected") };
 }
 
+function safeProfileAnchor(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const keys = Object.keys(value).sort();
+  if (keys.join(",") !== "height,left,top,width") return null;
+  const anchor = {
+    left: Number(value.left), top: Number(value.top),
+    width: Number(value.width), height: Number(value.height)
+  };
+  if (!Object.values(anchor).every(Number.isFinite) ||
+    anchor.left < -1024 || anchor.top < -1024 || anchor.left > 32768 || anchor.top > 32768 ||
+    anchor.width < 1 || anchor.height < 1 || anchor.width > 2048 || anchor.height > 2048) return null;
+  return anchor;
+}
+
 async function handleUserAction(command, sender) {
   const context = discordChannelContext(sender);
   if (!context) return { ok: false, reason: "untrusted-user-action-sender" };
@@ -530,6 +544,10 @@ async function handleUserAction(command, sender) {
   }
   if (typeof command?.userId !== "string" || !SNOWFLAKE_PATTERN.test(command.userId)) {
     return { ok: false, reason: "invalid-user-id" };
+  }
+  const profileAnchor = action === "open-profile" ? safeProfileAnchor(command.anchor) : null;
+  if (action === "open-profile" && !profileAnchor) {
+    return { ok: false, reason: "invalid-profile-anchor" };
   }
   if (action === "timeout-7d") {
     if (!context.guildId) return { ok: false, reason: "timeout-requires-guild" };
@@ -562,7 +580,8 @@ async function handleUserAction(command, sender) {
   const payload = {
     userId: command.userId,
     guildId: context.guildId,
-    messageId: action === "timeout-7d" ? command.messageId : null
+    messageId: action === "timeout-7d" ? command.messageId : null,
+    anchor: action === "open-profile" ? profileAnchor : null
   };
   const expectedRoute = { guildId: context.guildId, channelId: context.channelId };
   let execution;
@@ -585,7 +604,11 @@ async function handleUserAction(command, sender) {
           if (!controller || typeof controller.invokeUserAction !== "function") {
             return { ok: false, reason: "user-action-controller-unavailable" };
           }
-          let verifiedPayload = { userId: actionPayload.userId, guildId: actionPayload.guildId ?? null };
+          let verifiedPayload = {
+            userId: actionPayload.userId,
+            guildId: actionPayload.guildId ?? null,
+            anchor: actionPayload.anchor
+          };
           if (actionName === "timeout-7d") {
             let resolvedUserId = null;
             if (typeof controller.resolveMessageAuthors === "function") {

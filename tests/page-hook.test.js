@@ -22,6 +22,7 @@ function runHook(options) {
   const guildMembers = new Map();
   const guildMemberCalls = [];
   const userActionCalls = { profile: [], until: [] };
+  const profileRoots = [];
   const makeMessage = (id, deleted, content, editedTimestamp) => {
     const authorId = "999999999999999991";
     const author = settings.messageAuthorAsId
@@ -140,11 +141,46 @@ function runHook(options) {
   let actionGeneration = 1;
   const makeUserActionModules = () => ({
     profile: {
-      openUserProfileModal(payload) {
-        userActionCalls.profile.push({ generation: actionGeneration, payload });
-        if (settings.rejectProfileAction) return Promise.reject(new Error("profile rejected"));
+      $$typeof: Symbol.for("react.memo"),
+      type: function UserProfilePopout({ children, userId, user }) { return { children, userId, user }; }
+    },
+    react: {
+      version: "19.0.0",
+      createElement(type, props) { return { type, props }; },
+      memo(value) { return value; },
+      useState(value) { return [value, () => {}]; }
+    },
+    renderer: {
+      createRoot(anchor) {
+        const generation = actionGeneration;
+        const root = {
+          anchor, element: null, unmounted: false,
+          render(element) {
+            if (settings.rejectProfileAction) throw new Error("profile rejected");
+            this.element = element;
+            userActionCalls.profile.push({
+              generation,
+              payload: {
+                userId: element.props.userId,
+                userObjectId: element.props.user?.id,
+                guildId: element.props.guildId ?? null,
+                channelId: element.props.channelId,
+                position: element.props.position,
+                spacing: element.props.spacing,
+                fixed: element.props.fixed,
+                shouldShow: element.props.shouldShow,
+                clickTrap: element.props.clickTrap,
+                ignoreModalClicks: element.props.ignoreModalClicks,
+                anchor
+              }
+            });
+          },
+          unmount() { this.unmounted = true; }
+        };
+        profileRoots.push(root);
+        return root;
       },
-      closeUserProfileModal() {}
+      hydrateRoot() {}
     },
     until: {
       setCommunicationDisabledUntil(payload) {
@@ -158,15 +194,19 @@ function runHook(options) {
   let userActionModules = settings.noUserActionModules ? null : makeUserActionModules();
   const userActionExports = {};
   Object.defineProperties(userActionExports, {
-    openUserProfileModal: {
-      enumerable: true,
-      get() { return userActionModules?.profile.openUserProfileModal; }
-    },
-    closeUserProfileModal: {
-      enumerable: true,
-      get() { return userActionModules?.profile.closeUserProfileModal; }
-    },
     until: { enumerable: true, get() { return userActionModules?.until || {}; } }
+  });
+  const profilePopoutExports = {};
+  const reactExports = {};
+  const rendererExports = {};
+  Object.defineProperties(profilePopoutExports, {
+    A: { enumerable: true, get() { return userActionModules?.profile || {}; } }
+  });
+  Object.defineProperties(reactExports, {
+    A: { enumerable: true, get() { return userActionModules?.react || {}; } }
+  });
+  Object.defineProperties(rendererExports, {
+    A: { enumerable: true, get() { return userActionModules?.renderer || {}; } }
   });
   let storeAvailable = !settings.delayedStore;
   Object.defineProperty(moduleExports, "Z", { enumerable: true, get() { return storeAvailable ? messageStore : {}; } });
@@ -182,7 +222,10 @@ function runHook(options) {
   webpackRequire.c = {
     "0": { exports: { rejectingStore } },
     "1": { exports: { fallbackDispatcher } },
+    "20": { exports: profilePopoutExports },
     "21": { exports: userActionExports },
+    "22": { exports: reactExports },
+    "23": { exports: rendererExports },
     "42": { exports: moduleExports },
     "43": { exports: settings.noUserStore ? {} : { Z: settings.structuralUserStoreOnly ? structuralUserStore : userStore } },
     "44": { exports: settings.conflictingStructuralUserStores ? { Z: conflictingStructuralUserStore } : {} },
@@ -190,16 +233,30 @@ function runHook(options) {
     "46": { exports: settings.structuralGuildMemberStoreOnly ? { Z: structuralGuildMemberStore } : {} },
     "47": { exports: settings.wrongDispatcherGuildMemberStore ? { Z: wrongDispatcherGuildMemberStore } : {} }
   };
+  webpackRequire.m = {
+    "20": function userProfilePopoutFactory() {
+      /* withMutualGuilds disableUserProfileLink targetElementRef type:"popout" messageId */
+    }
+  };
   const chunks = [];
   chunks.push = function push(chunk) {
     if (typeof chunk[2] === "function") chunk[2](webpackRequire);
     return Array.prototype.push.call(this, chunk);
   };
   const window = {
-    location: { reload() { settings.reloads = (settings.reloads || 0) + 1; } },
+    location: {
+      pathname: settings.dmRoute ? "/channels/@me/777777777777777777" :
+        "/channels/777777777777777777/666666666666666666",
+      reload() { settings.reloads = (settings.reloads || 0) + 1; }
+    },
+    innerWidth: 1440,
+    innerHeight: 900,
     addEventListener(type, callback) {
       if (!listeners.has(type)) listeners.set(type, []);
       listeners.get(type).push(callback);
+    },
+    removeEventListener(type, callback) {
+      listeners.set(type, (listeners.get(type) || []).filter((item) => item !== callback));
     },
     dispatchEvent(event) {
       dispatched.push(event);
@@ -220,10 +277,51 @@ function runHook(options) {
   class CustomEvent {
     constructor(type, options) { this.type = type; this.detail = options?.detail; }
   }
+  const documentListeners = new Map();
+  const body = {
+    children: [],
+    append(element) {
+      element.isConnected = true;
+      element.parentElement = this;
+      this.children.push(element);
+    }
+  };
+  const document = {
+    body,
+    createElement(tagName) {
+      const attributes = new Map();
+      return {
+        tagName: String(tagName).toUpperCase(), style: {}, isConnected: false, parentElement: null,
+        setAttribute(name, value) { attributes.set(name, String(value)); },
+        getAttribute(name) { return attributes.get(name) || null; },
+        remove() {
+          this.isConnected = false;
+          if (this.parentElement?.children) {
+            this.parentElement.children = this.parentElement.children.filter((item) => item !== this);
+          }
+          this.parentElement = null;
+        }
+      };
+    },
+    addEventListener(type, callback) {
+      if (!documentListeners.has(type)) documentListeners.set(type, []);
+      documentListeners.get(type).push(callback);
+    },
+    removeEventListener(type, callback) {
+      documentListeners.set(type, (documentListeners.get(type) || []).filter((item) => item !== callback));
+    }
+  };
+  const timeouts = [];
   const context = vm.createContext({
-    window, CustomEvent,
+    window, document, CustomEvent,
     setInterval(callback) { intervals.push(callback); return intervals.length; },
-    Date, Math, Object, Array, Set, Map, WeakMap, WeakSet, String, Boolean, Symbol
+    setTimeout(callback, delay) {
+      const timer = { callback, delay, cleared: false };
+      timeouts.push(timer);
+      return timer;
+    },
+    clearTimeout(timer) { if (timer) timer.cleared = true; },
+    Date, Math, Number, Object, Array, Set, Map, WeakMap, WeakSet, String, Boolean, Symbol, Function
   });
   if (settings.readyBeforeHook) {
     window.addEventListener("message", (event) => {
@@ -243,8 +341,7 @@ function runHook(options) {
     guildMemberCalls, dispatcher, window, ready, messageStore,
     reloads: () => settings.reloads || 0,
     legacyRecoveries: () => settings.legacyRecoveries || 0,
-    userActionCalls,
-    profileExportUsesGetter: typeof Object.getOwnPropertyDescriptor(userActionExports, "openUserProfileModal").get === "function",
+    userActionCalls, profileRoots, body,
     invokeUserAction(action, payload) {
       return window[Symbol.for("BridgeModTools.pageHook.v1")].invokeUserAction(action, payload);
     },
@@ -262,6 +359,19 @@ function runHook(options) {
     emitGuildMemberUpdate(action) {
       const listener = subscriptions.get("GUILD_MEMBER_UPDATE");
       if (listener) listener(action);
+    },
+    emitDocumentEvent(type) {
+      for (const callback of documentListeners.get(type) || []) callback({ type });
+      for (const timer of timeouts.filter((item) => !item.cleared && item.delay === 0)) {
+        timer.cleared = true;
+        timer.callback();
+      }
+    },
+    flushZeroTimers() {
+      for (const timer of timeouts.filter((item) => !item.cleared && item.delay === 0)) {
+        timer.cleared = true;
+        timer.callback();
+      }
     },
     replaceUserActionModules() {
       actionGeneration += 1;
@@ -318,7 +428,7 @@ function runHook(options) {
 test("duplicate page-hook injection recovers in place without duplicate listeners, timers, wrappers, or events", () => {
   const result = runHook();
   const originalDeleteWrapper = result.handlerNode.actionHandler.MESSAGE_DELETE;
-  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 5);
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 6);
   assert.equal(result.intervalCount(), 1);
   assert.equal(result.listenerCount("message"), 1);
 
@@ -878,15 +988,18 @@ test("user actions reject unrecognized operations, malformed IDs, missing guilds
   const result = runHook();
   const userId = "888888888888888881";
   const guildId = "777777777777777777";
+  const anchor = { left: 120, top: 80, width: 48, height: 48 };
   const rejected = await Promise.all([
-    result.invokeUserAction("unknown", { userId, guildId }),
-    result.invokeUserAction("open-profile", { userId: "bad", guildId }),
-    result.invokeUserAction("open-profile", { userId, guildId: "bad" }),
+    result.invokeUserAction("unknown", { userId, guildId, anchor }),
+    result.invokeUserAction("open-profile", { userId: "bad", guildId, anchor }),
+    result.invokeUserAction("open-profile", { userId, guildId: "bad", anchor }),
     result.invokeUserAction("open-profile", { userId }),
-    result.invokeUserAction("open-profile", { userId, guildId, username: "must-not-cross" }),
+    result.invokeUserAction("open-profile", { userId, guildId, anchor, username: "must-not-cross" }),
+    result.invokeUserAction("open-profile", { userId, guildId, anchor: { left: 0, top: 0, width: 0, height: 48 } }),
     result.invokeUserAction("timeout-7d", { userId, guildId: null })
   ]);
   assert.deepEqual(rejected.map((item) => JSON.parse(JSON.stringify(item))), [
+    { ok: false, reason: "invalid-request" },
     { ok: false, reason: "invalid-request" },
     { ok: false, reason: "invalid-request" },
     { ok: false, reason: "invalid-request" },
@@ -1058,7 +1171,7 @@ test("a newer page hook never self-reloads an older controller contract", () => 
   const result = runHook(settings);
   assert.equal(result.legacyRecoveries(), 0);
   assert.equal(result.reloads(), 0);
-  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].upgradeRequired, 5);
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].upgradeRequired, 6);
   result.reinject();
   assert.equal(result.legacyRecoveries(), 0);
   assert.equal(result.reloads(), 0);
@@ -1294,15 +1407,33 @@ test("timeout resolution rediscovers replaced stores and never calls removed sta
 
 test("native profile and fixed seven-day timeout actions receive only normalized identity context", async () => {
   const result = runHook();
-  assert.equal(result.profileExportUsesGetter, true);
-  const userId = "888888888888888881";
+  const userId = "999999999999999991";
   const guildId = "777777777777777777";
-  const profile = await result.invokeUserAction("open-profile", { userId, guildId });
-  assert.deepEqual(JSON.parse(JSON.stringify(profile)), { ok: true, reason: "opened" });
-  assert.deepEqual(JSON.parse(JSON.stringify(result.userActionCalls.profile)), [{
-    generation: 1,
-    payload: { userId, guildId }
-  }]);
+  const anchor = { left: 120, top: 80, width: 48, height: 48 };
+  const profile = await result.invokeUserAction("open-profile", { userId, guildId, anchor });
+  assert.deepEqual(JSON.parse(JSON.stringify(profile)), { ok: true, reason: "opened-popout" });
+  assert.equal(result.userActionCalls.profile.length, 1);
+  const profilePayload = result.userActionCalls.profile[0].payload;
+  assert.deepEqual({
+    generation: result.userActionCalls.profile[0].generation,
+    userId: profilePayload.userId,
+    userObjectId: profilePayload.userObjectId,
+    guildId: profilePayload.guildId,
+    channelId: profilePayload.channelId,
+    position: profilePayload.position,
+    spacing: profilePayload.spacing,
+    fixed: profilePayload.fixed,
+    shouldShow: profilePayload.shouldShow,
+    clickTrap: profilePayload.clickTrap,
+    ignoreModalClicks: profilePayload.ignoreModalClicks
+  }, {
+    generation: 1, userId, userObjectId: "999999999999999991", guildId,
+    channelId: "666666666666666666", position: "left", spacing: 16,
+    fixed: true, shouldShow: true, clickTrap: true, ignoreModalClicks: true
+  });
+  assert.equal(profilePayload.anchor.getAttribute("data-ldma-profile-popout-anchor"), "true");
+  assert.equal(profilePayload.anchor.style.left, "120px");
+  assert.equal(profilePayload.anchor.style.top, "80px");
 
   const before = Date.now();
   const timeout = await result.invokeUserAction("timeout-7d", { userId, guildId });
@@ -1322,36 +1453,88 @@ test("native profile and fixed seven-day timeout actions receive only normalized
   assert.ok(deadline <= after + 604800000);
 });
 
+test("compact profile popouts replace and clean up their invisible anchors", async () => {
+  const result = runHook();
+  const payload = {
+    userId: "999999999999999991",
+    guildId: "777777777777777777",
+    anchor: { left: 120, top: 80, width: 48, height: 48 }
+  };
+  assert.equal((await result.invokeUserAction("open-profile", payload)).ok, true);
+  const firstRoot = result.profileRoots[0];
+  assert.equal(result.body.children.length, 1);
+
+  assert.equal((await result.invokeUserAction("open-profile", {
+    ...payload, anchor: { left: 300, top: 160, width: 80, height: 24 }
+  })).ok, true);
+  const secondRoot = result.profileRoots[1];
+  assert.equal(firstRoot.unmounted, true, "opening another author must unmount the previous popout");
+  assert.equal(result.body.children.length, 1);
+  assert.equal(secondRoot.anchor.style.left, "300px");
+
+  secondRoot.element.props.onRequestClose();
+  result.flushZeroTimers();
+  assert.equal(secondRoot.unmounted, true);
+  assert.equal(result.body.children.length, 0);
+
+  assert.equal((await result.invokeUserAction("open-profile", payload)).ok, true);
+  const scrollRoot = result.profileRoots[2];
+  result.emitDocumentEvent("scroll");
+  assert.equal(scrollRoot.unmounted, true, "scrolling must close an anchored popout");
+  assert.equal(result.body.children.length, 0);
+});
+
+test("compact profile popouts preserve DM context and fail closed across routes", async () => {
+  const dm = runHook({ dmRoute: true });
+  const payload = {
+    userId: "999999999999999991",
+    guildId: null,
+    anchor: { left: 120, top: 80, width: 48, height: 48 }
+  };
+  assert.deepEqual(plain(await dm.invokeUserAction("open-profile", payload)), {
+    ok: true, reason: "opened-popout"
+  });
+  assert.equal(dm.userActionCalls.profile[0].payload.guildId, null);
+  assert.equal(dm.userActionCalls.profile[0].payload.channelId, "777777777777777777");
+
+  dm.window.location.pathname = "/channels/777777777777777777/666666666666666666";
+  assert.deepEqual(plain(await dm.invokeUserAction("open-profile", payload)), {
+    ok: false, reason: "profile-popout-unavailable"
+  });
+});
+
 test("user actions fail closed when Discord's native modules are unavailable or reject", async () => {
-  const payload = { userId: "888888888888888881", guildId: "777777777777777777" };
+  const timeoutPayload = { userId: "999999999999999991", guildId: "777777777777777777" };
+  const profilePayload = Object.assign({ anchor: { left: 120, top: 80, width: 48, height: 48 } }, timeoutPayload);
   const unavailable = runHook({ noUserActionModules: true });
-  assert.deepEqual(JSON.parse(JSON.stringify(await unavailable.invokeUserAction("open-profile", payload))),
-    { ok: false, reason: "module-unavailable" });
-  assert.deepEqual(JSON.parse(JSON.stringify(await unavailable.invokeUserAction("timeout-7d", payload))),
+  assert.deepEqual(JSON.parse(JSON.stringify(await unavailable.invokeUserAction("open-profile", profilePayload))),
+    { ok: false, reason: "profile-popout-unavailable" });
+  assert.deepEqual(JSON.parse(JSON.stringify(await unavailable.invokeUserAction("timeout-7d", timeoutPayload))),
     { ok: false, reason: "module-unavailable" });
 
   const rejected = runHook({ rejectProfileAction: true, rejectTimeoutAction: true });
-  assert.deepEqual(JSON.parse(JSON.stringify(await rejected.invokeUserAction("open-profile", payload))),
-    { ok: false, reason: "action-failed" });
-  assert.deepEqual(JSON.parse(JSON.stringify(await rejected.invokeUserAction("timeout-7d", payload))),
+  assert.deepEqual(JSON.parse(JSON.stringify(await rejected.invokeUserAction("open-profile", profilePayload))),
+    { ok: false, reason: "profile-popout-failed" });
+  assert.deepEqual(JSON.parse(JSON.stringify(await rejected.invokeUserAction("timeout-7d", timeoutPayload))),
     { ok: false, reason: "action-failed" });
 });
 
 test("user actions rediscover replaced modules and never call removed stale exports", async () => {
   const result = runHook();
-  const payload = { userId: "888888888888888881", guildId: "777777777777777777" };
-  await result.invokeUserAction("open-profile", payload);
-  await result.invokeUserAction("timeout-7d", payload);
+  const timeoutPayload = { userId: "999999999999999991", guildId: "777777777777777777" };
+  const profilePayload = Object.assign({ anchor: { left: 120, top: 80, width: 48, height: 48 } }, timeoutPayload);
+  await result.invokeUserAction("open-profile", profilePayload);
+  await result.invokeUserAction("timeout-7d", timeoutPayload);
   result.replaceUserActionModules();
-  await result.invokeUserAction("open-profile", payload);
-  await result.invokeUserAction("timeout-7d", payload);
+  await result.invokeUserAction("open-profile", profilePayload);
+  await result.invokeUserAction("timeout-7d", timeoutPayload);
   assert.deepEqual(result.userActionCalls.profile.map((call) => call.generation), [1, 2]);
   assert.deepEqual(result.userActionCalls.until.map((call) => call.generation), [1, 2]);
 
   result.removeUserActionModules();
-  assert.deepEqual(JSON.parse(JSON.stringify(await result.invokeUserAction("open-profile", payload))),
-    { ok: false, reason: "module-unavailable" });
-  assert.deepEqual(JSON.parse(JSON.stringify(await result.invokeUserAction("timeout-7d", payload))),
+  assert.deepEqual(JSON.parse(JSON.stringify(await result.invokeUserAction("open-profile", profilePayload))),
+    { ok: false, reason: "profile-popout-unavailable" });
+  assert.deepEqual(JSON.parse(JSON.stringify(await result.invokeUserAction("timeout-7d", timeoutPayload))),
     { ok: false, reason: "module-unavailable" });
   assert.deepEqual(result.userActionCalls.profile.map((call) => call.generation), [1, 2]);
   assert.deepEqual(result.userActionCalls.until.map((call) => call.generation), [1, 2]);

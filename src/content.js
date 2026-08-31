@@ -2123,13 +2123,21 @@
     suppressDiscordMessageGesture(avatar);
     suppressDiscordMessageGesture(author);
 
-    async function openProfile() {
+    async function openProfile(event) {
       if (!actionUserId) return;
+      const rect = event?.currentTarget?.getBoundingClientRect?.();
+      if (!rect || ![rect.left, rect.top, rect.width, rect.height].every(Number.isFinite)) return;
       const response = await send({
         type: "LDMA_USER_ACTION",
         action: "open-profile",
         userId: actionUserId,
-        guildId: actionGuildId
+        guildId: actionGuildId,
+        anchor: {
+          left: rect.left,
+          top: rect.top,
+          width: Math.max(1, rect.width),
+          height: Math.max(1, rect.height)
+        }
       });
     }
 

@@ -1,7 +1,7 @@
 (function installLocalDiscordLifecycleHook() {
   "use strict";
 
-  const HOOK_API_VERSION = 5;
+  const HOOK_API_VERSION = 6;
   const INSTALL_KEY = Symbol.for("BridgeModTools.pageHook.v1");
   const existingController = window[INSTALL_KEY];
   if (existingController && typeof existingController.recover === "function") {
@@ -36,6 +36,7 @@
   const TIMEOUT_7D_SECONDS = 7 * 24 * 60 * 60;
   const webpackInstances = new Set();
   const scannedModules = new WeakMap();
+  const profilePopoutFactoryMatches = new WeakMap();
   const dispatchers = new Set();
   const fallbackDispatchers = new Set();
   const CORE_STORES = new Set(["MessageStore", "ChannelStore", "GuildStore", "GuildMemberStore", "ReadStateStore", "UserStore"]);
@@ -58,8 +59,11 @@
   let guildMemberStoreCandidate = null;
   let guildMemberStoreSource = null;
   const structuralUserStoreCandidates = new Set();
-  let userProfileActionsCandidate = null;
+  let reactCandidate = null;
+  let reactDomClientCandidate = null;
+  let userProfilePopoutCandidate = null;
   let timeoutUntilActionsCandidate = null;
+  let mountedUserProfilePopout = null;
   let messageStorePatched = false;
   let deletionLedgerOverflowed = false;
   let deletionResetReleaseFailed = false;
@@ -733,14 +737,43 @@
     return false;
   }
 
-  function inspectUserActionExports(value) {
+  function isUserProfilePopoutSource(sourceInfo) {
+    const requireFunction = sourceInfo?.requireFunction;
+    const moduleId = sourceInfo?.moduleId;
+    if (!requireFunction || moduleId == null) return false;
+    let matches = profilePopoutFactoryMatches.get(requireFunction);
+    if (!matches) {
+      matches = new Map();
+      profilePopoutFactoryMatches.set(requireFunction, matches);
+    }
+    if (matches.has(moduleId)) return matches.get(moduleId);
+    let source = "";
+    try {
+      const factory = requireFunction.m?.[moduleId];
+      if (typeof factory === "function") source = Function.prototype.toString.call(factory);
+    } catch (_error) {}
+    const matched = source.includes("withMutualGuilds") && source.includes("disableUserProfileLink") &&
+      source.includes("targetElementRef") && source.includes('type:"popout"') && source.includes("messageId");
+    matches.set(moduleId, matched);
+    return matched;
+  }
+
+  function inspectUserActionExports(value, sourceInfo) {
     if (!value || (typeof value !== "object" && typeof value !== "function")) return;
-    // Require the paired close method as a structural signature. A generic
-    // object with an open-like function must never become a privileged UI
-    // action target merely because one property name happens to match.
-    if (moduleExportFunction(value, "openUserProfileModal") &&
-        moduleExportFunction(value, "closeUserProfileModal")) {
-      userProfileActionsCandidate = value;
+    if (moduleExportFunction(value, "createElement") && moduleExportFunction(value, "memo") &&
+        moduleExportFunction(value, "useState") && typeof value.version === "string") {
+      reactCandidate = value;
+    }
+    if (moduleExportFunction(value, "createRoot") && moduleExportFunction(value, "hydrateRoot")) {
+      reactDomClientCandidate = value;
+    }
+    // Discord's message-author surface uses a React memo component whose
+    // module owns the native profile preloader and generic Popout wrapper.
+    // Match the factory's behavioral literals rather than its unstable module
+    // ID or minified export key, then accept only that factory's memo export.
+    if (isUserProfilePopoutSource(sourceInfo) && value.$$typeof === Symbol.for("react.memo") &&
+        typeof value.type === "function") {
+      userProfilePopoutCandidate = value;
     }
     // Accept the timeout action only when its kick/ban companions prove this
     // is Discord's native GuildMemberActions module.
@@ -760,7 +793,7 @@
       visited.add(value);
       inspected += 1;
       if (shouldIgnoreValue(value)) continue;
-      inspectUserActionExports(value);
+      inspectUserActionExports(value, sourceInfo);
       if (userStoreFunctions(value)) {
         structuralUserStoreCandidates.delete(value);
         structuralUserStoreCandidates.add(value);
@@ -910,14 +943,28 @@
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
     try {
       const keys = Object.keys(payload);
-      if (keys.length !== 2 || !keys.includes("userId") || !keys.includes("guildId")) return null;
+      const expectedKeys = action === "open-profile"
+        ? ["anchor", "guildId", "userId"] : ["guildId", "userId"];
+      if (keys.length !== expectedKeys.length || expectedKeys.some((key) => !keys.includes(key))) return null;
       const rawUserId = payload.userId;
       const rawGuildId = payload.guildId;
       const userId = cleanId(rawUserId);
       const guildId = rawGuildId == null ? null : cleanId(rawGuildId);
       if (!userId || (rawGuildId != null && !guildId)) return null;
       if (action === "timeout-7d" && !guildId) return null;
-      return { userId, guildId };
+      if (action === "timeout-7d") return { userId, guildId };
+      const anchor = payload.anchor;
+      if (!anchor || typeof anchor !== "object" || Array.isArray(anchor) ||
+        Object.keys(anchor).sort().join(",") !== "height,left,top,width") return null;
+      const normalizedAnchor = {
+        left: anchor.left, top: anchor.top, width: anchor.width, height: anchor.height
+      };
+      if (!Object.values(normalizedAnchor).every((value) => typeof value === "number" && Number.isFinite(value)) ||
+        normalizedAnchor.left < -1024 || normalizedAnchor.top < -1024 ||
+        normalizedAnchor.left > 32768 || normalizedAnchor.top > 32768 ||
+        normalizedAnchor.width < 1 || normalizedAnchor.height < 1 ||
+        normalizedAnchor.width > 2048 || normalizedAnchor.height > 2048) return null;
+      return { userId, guildId, anchor: normalizedAnchor };
     } catch (_error) {
       return null;
     }
@@ -926,9 +973,98 @@
   function rediscoverUserActionModules() {
     // Clear first so a removed/replaced Discord module cannot remain callable
     // through a stale object after Webpack swaps its cached export.
-    userProfileActionsCandidate = null;
+    reactCandidate = null;
+    reactDomClientCandidate = null;
+    userProfilePopoutCandidate = null;
     timeoutUntilActionsCandidate = null;
     for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
+  }
+
+  function disposeMountedUserProfilePopout(expectedMount) {
+    const mount = mountedUserProfilePopout;
+    if (!mount || expectedMount && mount !== expectedMount) return;
+    mountedUserProfilePopout = null;
+    try { clearTimeout(mount.expiryTimer); } catch (_error) {}
+    try { document.removeEventListener("scroll", mount.closeOnViewportChange, true); } catch (_error) {}
+    try { window.removeEventListener("resize", mount.closeOnViewportChange); } catch (_error) {}
+    try { window.removeEventListener("popstate", mount.closeOnViewportChange); } catch (_error) {}
+    try { mount.root?.unmount(); } catch (_error) {}
+    try { mount.anchor?.remove(); } catch (_error) {}
+  }
+
+  function openUserProfilePopout(normalized) {
+    const createElement = moduleExportFunction(reactCandidate, "createElement");
+    const createRoot = moduleExportFunction(reactDomClientCandidate, "createRoot");
+    const component = userProfilePopoutCandidate;
+    const user = cachedUser(normalized.userId);
+    const route = /^\/channels\/(@me|\d{15,25})\/(\d{15,25})\/?$/.exec(window.location?.pathname || "");
+    const routeGuildId = route?.[1] === "@me" ? null : route?.[1] || null;
+    if (!createElement || !createRoot || !component || !user || !route || routeGuildId !== normalized.guildId ||
+      typeof document?.createElement !== "function" || !document.body) {
+      return { ok: false, reason: "profile-popout-unavailable" };
+    }
+    const viewportWidth = Number(window.innerWidth);
+    const viewportHeight = Number(window.innerHeight);
+    if (!Number.isFinite(viewportWidth) || !Number.isFinite(viewportHeight) ||
+      viewportWidth < 1 || viewportHeight < 1) return { ok: false, reason: "profile-popout-unavailable" };
+    const requested = normalized.anchor;
+    if (requested.left + requested.width <= 0 || requested.top + requested.height <= 0 ||
+      requested.left >= viewportWidth || requested.top >= viewportHeight) {
+      return { ok: false, reason: "profile-popout-anchor-unavailable" };
+    }
+    disposeMountedUserProfilePopout();
+    const anchor = document.createElement("span");
+    anchor.setAttribute("aria-hidden", "true");
+    anchor.setAttribute("data-ldma-profile-popout-anchor", "true");
+    const left = Math.max(0, Math.min(viewportWidth - 1, requested.left));
+    const top = Math.max(0, Math.min(viewportHeight - 1, requested.top));
+    Object.assign(anchor.style, {
+      position: "fixed",
+      left: `${left}px`,
+      top: `${top}px`,
+      width: `${Math.max(1, Math.min(requested.width, viewportWidth - left))}px`,
+      height: `${Math.max(1, Math.min(requested.height, viewportHeight - top))}px`,
+      opacity: "0",
+      pointerEvents: "none"
+    });
+    document.body.append(anchor);
+    const mount = {
+      anchor, root: null, expiryTimer: null, closeOnViewportChange: null,
+      pathname: window.location.pathname
+    };
+    const close = () => setTimeout(() => disposeMountedUserProfilePopout(mount), 0);
+    mount.closeOnViewportChange = close;
+    try {
+      mount.root = createRoot.call(reactDomClientCandidate, anchor);
+      if (!mount.root || typeof mount.root.render !== "function" || typeof mount.root.unmount !== "function") {
+        throw new Error("invalid-react-root");
+      }
+      mountedUserProfilePopout = mount;
+      document.addEventListener("scroll", mount.closeOnViewportChange, true);
+      window.addEventListener("resize", mount.closeOnViewportChange);
+      window.addEventListener("popstate", mount.closeOnViewportChange);
+      mount.expiryTimer = setTimeout(close, 5 * 60 * 1000);
+      mount.root.render(createElement.call(reactCandidate, component, {
+        targetElementRef: { current: anchor },
+        user,
+        userId: normalized.userId,
+        guildId: normalized.guildId ?? undefined,
+        channelId: route[2],
+        position: "left",
+        spacing: 16,
+        fixed: true,
+        clickTrap: true,
+        ignoreModalClicks: true,
+        shouldShow: true,
+        onRequestClose: close,
+        onClosePopout: close,
+        children: () => null
+      }));
+      return { ok: true, reason: "opened-popout" };
+    } catch (_error) {
+      disposeMountedUserProfilePopout(mount);
+      return { ok: false, reason: "profile-popout-failed" };
+    }
   }
 
   function resolveMessageAuthors(channelValue, idValues, fallbackValues) {
@@ -1097,11 +1233,7 @@
     rediscoverUserActionModules();
     try {
       if (action === "open-profile") {
-        const openProfile = moduleExportFunction(userProfileActionsCandidate, "openUserProfileModal");
-        if (!openProfile) return { ok: false, reason: "module-unavailable" };
-        const profileContext = { userId: normalized.userId, guildId: normalized.guildId };
-        await Promise.resolve(openProfile.call(userProfileActionsCandidate, profileContext));
-        return { ok: true, reason: "opened" };
+        return openUserProfilePopout(normalized);
       }
       const setUntil = dataFunction(timeoutUntilActionsCandidate, "setCommunicationDisabledUntil");
       if (!setUntil) return { ok: false, reason: "module-unavailable" };
@@ -1251,6 +1383,10 @@
   if (controller.pendingRecovery) recoverHook("queued-injection");
   let recoveryTicks = 0;
   setInterval(() => {
+    if (mountedUserProfilePopout?.pathname !== undefined &&
+      mountedUserProfilePopout.pathname !== window.location.pathname) {
+      disposeMountedUserProfilePopout();
+    }
     // Once retention is healthy, reconcileMessageStore below is the cheap
     // integrity check. Enumerating Discord's full module cache every tick is
     // unnecessary and can contend with scrolling in image-heavy channels.

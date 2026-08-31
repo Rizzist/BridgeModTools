@@ -7,6 +7,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const RealCore = require("../src/core.js");
 const RealProtocol = require("../src/protocol.js");
+const PROFILE_ANCHOR = Object.freeze({ left: 120, top: 80, width: 48, height: 48 });
 
 function plain(value) {
   return JSON.parse(JSON.stringify(value));
@@ -72,7 +73,7 @@ function backgroundHarness(options) {
         if (Array.isArray(options.files) && options.files.includes("src/page-hook.js") &&
           !mainWorld[Symbol.for("BridgeModTools.pageHook.v1")]) {
           mainWorld[Symbol.for("BridgeModTools.pageHook.v1")] = pageHookFileInstallController || {
-            apiVersion: 5, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}, resolveMemberTimeouts() {}
+            apiVersion: 6, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}, resolveMemberTimeouts() {}
           };
         }
         if (typeof options.func === "function") {
@@ -288,7 +289,7 @@ test("a stale page controller gets one bounded background reload and never loops
   assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
 
   harness.calls.length = 0;
-  harness.setPageHookProbeState({ apiVersion: 5, ready: true });
+  harness.setPageHookProbeState({ apiVersion: 6, ready: true });
   const recovered = await harness.api.ensureDiscordBootstrap(12, "document-13", true);
   assert.equal(recovered.ok, true);
   assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
@@ -519,14 +520,15 @@ test("user action broker derives route context and invokes the document-bound MA
       type: "LDMA_USER_ACTION",
       action: "open-profile",
       userId: "222222222222222222",
-      guildId: "999999999999999999"
+      guildId: "999999999999999999",
+      anchor: PROFILE_ANCHOR
     }, sender, resolve);
     assert.equal(asyncResponse, true);
   });
   assert.deepEqual(plain(result), { ok: true, reason: "profile-opened" });
   assert.deepEqual(plain(invocations), [{
     action: "open-profile",
-    payload: { userId: "222222222222222222", guildId: "111111111111111111" }
+    payload: { userId: "222222222222222222", guildId: "111111111111111111", anchor: PROFILE_ANCHOR }
   }]);
   const call = harness.calls.at(-1);
   assert.equal(call.options.world, "MAIN");
@@ -538,12 +540,17 @@ test("user action broker derives route context and invokes the document-bound MA
 
 test("user action broker rejects untrusted origins, routes, actions, snowflakes, and guild spoofing", async () => {
   const harness = backgroundHarness();
-  const base = { type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222" };
+  const base = {
+    type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222",
+    anchor: PROFILE_ANCHOR
+  };
   assert.equal((await harness.api.handleUserAction(base, discordSender({ frameId: 1 }))).reason, "untrusted-user-action-sender");
   assert.equal((await harness.api.handleUserAction(base, discordSender({ origin: "https://discord.com.evil.test" }))).reason, "untrusted-user-action-sender");
   assert.equal((await harness.api.handleUserAction(base, discordSender({ tab: { id: 1, url: "https://discord.com/app" } }))).reason, "untrusted-user-action-sender");
   assert.equal((await harness.api.handleUserAction({ ...base, action: "arbitrary-call" }, discordSender())).reason, "unsupported-user-action");
   assert.equal((await harness.api.handleUserAction({ ...base, userId: "12-not-a-snowflake" }, discordSender())).reason, "invalid-user-id");
+  assert.equal((await harness.api.handleUserAction({ ...base, anchor: { left: 0, top: 0, width: 0, height: 48 } }, discordSender())).reason,
+    "invalid-profile-anchor");
 
   const dmSender = discordSender();
   assert.equal((await harness.api.handleUserAction({ ...base, action: "timeout-7d", guildId: "111111111111111111" }, dmSender)).reason, "timeout-requires-guild");
@@ -711,7 +718,7 @@ test("message author resolution repairs a missing page controller and retries th
   const pageUrl = `https://discord.com/channels/111111111111111111/${channelId}`;
   harness.setLocation(pageUrl);
   harness.setPageHookFileInstallController({
-    apiVersion: 5,
+    apiVersion: 6,
     recover() {},
     invokeUserAction() { return { ok: true }; },
     resolveMessageAuthors() {
@@ -1098,7 +1105,7 @@ test("member timeout resolution repairs a missing controller and retries the sam
     { guildId, channelId, messageId, authorId: userId, status: "confirmed_deleted" }
   ] });
   harness.setPageHookFileInstallController({
-    apiVersion: 5,
+    apiVersion: 6,
     recover() {},
     invokeUserAction() { return { ok: true }; },
     resolveMessageAuthors() { return { ok: true, authors: [] }; },
@@ -1177,14 +1184,14 @@ test("user action broker reports missing controllers and binds execution to the 
   const harness = backgroundHarness();
   const sender = discordSender();
   const missing = await harness.api.handleUserAction({
-    type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222"
+    type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222", anchor: PROFILE_ANCHOR
   }, sender);
   assert.deepEqual(plain(missing), { ok: false, reason: "user-action-controller-unavailable" });
 
   harness.setLocation("https://discord.com/channels/@me/888888888888888888");
   harness.setMainController({ invokeUserAction() { throw new Error("must not run on a changed route"); } });
   const changed = await harness.api.handleUserAction({
-    type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222"
+    type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222", anchor: PROFILE_ANCHOR
   }, sender);
   assert.deepEqual(plain(changed), { ok: false, reason: "user-action-route-changed" });
 });
@@ -1196,17 +1203,23 @@ test("DM profile actions normalize the omitted guild argument back to an exact n
     invokeUserAction(action, payload) { invoked.push({ action, payload }); return { ok: true, reason: "opened" }; }
   });
   const result = await harness.api.handleUserAction({
-    type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222"
+    type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222", anchor: PROFILE_ANCHOR
   }, discordSender());
   assert.equal(result.ok, true);
-  assert.deepEqual(plain(invoked), [{ action: "open-profile", payload: { userId: "222222222222222222", guildId: null } }]);
+  assert.deepEqual(plain(invoked), [{
+    action: "open-profile",
+    payload: { userId: "222222222222222222", guildId: null, anchor: PROFILE_ANCHOR }
+  }]);
   assert.deepEqual(harness.injectionErrors, []);
 });
 
 test("user action broker rate limits each document and keeps limiter state bounded", async () => {
   const harness = backgroundHarness();
   harness.setMainController({ invokeUserAction() { return { ok: true, reason: "profile-opened" }; } });
-  const command = { type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222" };
+  const command = {
+    type: "LDMA_USER_ACTION", action: "open-profile", userId: "222222222222222222",
+    anchor: PROFILE_ANCHOR
+  };
   const sender = discordSender();
   for (let index = 0; index < 8; index += 1) assert.equal((await harness.api.handleUserAction(command, sender)).ok, true);
   const throttled = await harness.api.handleUserAction(command, sender);
