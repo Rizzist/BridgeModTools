@@ -132,6 +132,24 @@
     return { userId: fallbackUserId, username: fallbackUsername };
   }
 
+  function sanitizeUserMentions(value, contentValue) {
+    const content = String(contentValue || "");
+    const mentions = [];
+    let previousEnd = 0;
+    for (const item of (Array.isArray(value) ? value : []).slice(0, 50)) {
+      const userId = snowflakeValue(item?.userId);
+      const start = Number(item?.start);
+      const end = Number(item?.end);
+      if (!userId || !Number.isInteger(start) || !Number.isInteger(end) ||
+        start < previousEnd || start < 0 || end <= start || end > content.length || end - start > 128) continue;
+      const label = content.slice(start, end);
+      if (!label.startsWith("@") || /[\r\n]/.test(label)) continue;
+      mentions.push({ start, end, userId });
+      previousEnd = end;
+    }
+    return mentions;
+  }
+
   function avatarAuthorId(value) {
     const safe = safeDiscordAssetUrl(value);
     if (!safe) return null;
@@ -763,6 +781,9 @@
     const authorUsername = discordUsernameValue(record.authorUsername);
     if (authorUsername) next.authorUsername = authorUsername;
     else delete next.authorUsername;
+    const mentions = sanitizeUserMentions(record.mentions, record.content);
+    if (mentions.length) next.mentions = mentions;
+    else delete next.mentions;
     next.sourceContinuation = Boolean(record.sourceContinuation);
     const groupRootMessageId = snowflakeValue(record.groupRootMessageId);
     if (groupRootMessageId) next.groupRootMessageId = groupRootMessageId;
@@ -891,6 +912,8 @@
       if (incomingAuthorId && oldAuthorId !== incomingAuthorId && !incomingAuthorUsername) {
         delete merged.authorUsername;
       }
+      if (!safeRecord.mentions?.length && Object.prototype.hasOwnProperty.call(safeRecord, "content") &&
+        String(safeRecord.content || "") !== String(old.content || "")) delete merged.mentions;
       if (isDeletedStatus(old.status) && !isDeletedStatus(record.status)) {
         merged.status = old.status;
         merged.inferredDeletedAt = old.inferredDeletedAt;
@@ -1009,6 +1032,7 @@
     snowflakeValue,
     discordUsernameValue,
     boundAuthorIdentity,
+    sanitizeUserMentions,
     avatarAuthorId,
     snowflakeTimestamp,
     sameContinuationAuthor,

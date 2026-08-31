@@ -1,6 +1,6 @@
 {
   "name": "bridge-mod-tools",
-  "version": "2.7.2",
+  "version": "2.7.3",
   "private": true,
   "description": "Dependency-free tests for the unpacked Chrome extension.",
   "scripts": {

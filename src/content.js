@@ -31,6 +31,8 @@
   const RESOLVE_MESSAGE_AUTHORS = "LDMA_RESOLVE_MESSAGE_AUTHORS";
   const RESOLVE_MEMBER_TIMEOUTS = "LDMA_RESOLVE_MEMBER_TIMEOUTS";
   const SNOWFLAKE = /^\d{15,25}$/;
+  const MAX_MENTION_TOKENS = 50;
+  const MAX_MENTION_CAPTURE_ATTEMPTS = 4;
   const SCROLL_CAPTURE_INTERVAL_MS = 250;
   const SCROLL_CAPTURE_ROWS_PER_FRAME = 4;
   const SCROLL_CAPTURE_FRAME_BUDGET_MS = 5;
@@ -574,6 +576,41 @@
     return parts.join("\n");
   }
 
+  function captureMentionSpans(node, messageId, contentValue, tokenValues) {
+    const content = String(contentValue || "");
+    const tokens = Array.isArray(tokenValues) ? tokenValues : [];
+    if (!tokens.length || tokens.length > MAX_MENTION_TOKENS) return [];
+    const exact = node.querySelector(`[id="message-content-${messageId}"]`) ||
+      document.getElementById(`message-content-${messageId}`);
+    if (!exact || !node.contains(exact)) return [];
+    const elements = [...exact.querySelectorAll("span.mention")]
+      .filter((element) => element.getAttribute("role") === "button" && String(element.textContent || "").startsWith("@"));
+    if (elements.length !== tokens.length) return [];
+    const mentions = [];
+    for (let index = 0; index < elements.length; index += 1) {
+      const element = elements[index];
+      const token = tokens[index];
+      const tokenKeys = token && typeof token === "object" ? Object.keys(token).sort().join(",") : "";
+      if (token?.kind === "user") {
+        if (tokenKeys !== "kind,userId" || !SNOWFLAKE.test(String(token.userId || ""))) return [];
+      } else if (!["role", "broadcast"].includes(token?.kind) || tokenKeys !== "kind") return [];
+      const label = String(element.textContent || "");
+      let start;
+      try {
+        const range = document.createRange();
+        range.setStart(exact, 0);
+        range.setEnd(element, 0);
+        start = range.toString().length;
+      } catch (_error) {
+        return [];
+      }
+      const end = start + label.length;
+      if (content.slice(start, end) !== label) return [];
+      if (token.kind === "user") mentions.push({ start, end, userId: token.userId });
+    }
+    return Core.sanitizeUserMentions(mentions, content);
+  }
+
   function captureMedia(node, messageId) {
     const items = [];
     const itemIndexes = new Map();
@@ -887,7 +924,7 @@
     };
   }
 
-  function recordFromNode(node, now, captureRoute) {
+  function recordFromNode(node, now, captureRoute, mentionTokens) {
     const route = captureRoute || Core.parseDiscordRoute(location.pathname);
     const identity = rowIdentity(node);
     if (!route || !identity || (identity.channelId && identity.channelId !== route.channelId)) return null;
@@ -895,6 +932,8 @@
     const media = captureMedia(node, identity.messageId);
     const attachments = media.filter((item) => item.source === "attachment").map((item) => item.name).slice(0, 12);
     const content = allContent(node, identity.messageId);
+    const mentions = mentionTokens?.length
+      ? captureMentionSpans(node, identity.messageId, content, mentionTokens) : [];
     const reply = capturedReply({ channelId: route.channelId }, captureReply(node, identity, route));
     if (!content && !attachments.length && !media.length && !reply) return null;
     const timeElement = node.querySelector("time[datetime]");
@@ -905,7 +944,7 @@
         ? visibleChannelName() : state.archiveByKey.get(`${route.channelId}:${identity.messageId}`)?.channelName || "",
       author: visibleElementText(authorNameElement(node)) || firstText(node, AUTHOR_SELECTORS) ||
         authorFromAriaLabelledBy(node) || "Unknown author",
-      content, attachments, media, messageTimestamp: timeElement?.getAttribute("datetime") || null,
+      content, mentions, attachments, media, messageTimestamp: timeElement?.getAttribute("datetime") || null,
       groupRootMessageId,
       sourceContinuation: Boolean(groupRootMessageId && groupRootMessageId !== identity.messageId),
       capturedAt: now, updatedAt: now, status: "seen",
@@ -916,6 +955,7 @@
   function recordSignature(record) {
     return JSON.stringify([
       record.author, record.content, record.messageTimestamp, record.channelName, record.attachments,
+      record.mentions,
       record.avatarUrl, record.authorId, record.authorUsername, record.authorColor, record.authorStyle, record.authorBadges,
       record.groupRootMessageId, record.sourceContinuation,
       record.displayTimestamp, Core.sanitizeReply(record.reply, record.replyPreview), record.media
@@ -1057,7 +1097,10 @@
         continue;
       }
       if (pending.source === "message_store_preserved") state.pendingRetainedKeys.add(key);
-      if (state.archiveByKey.get(key)?.status === "confirmed_deleted") acknowledgeDeletion(key, pending);
+      const archived = state.archiveByKey.get(key);
+      if (archived?.status === "confirmed_deleted" && !pendingMentionBinding(pending, archived)) {
+        acknowledgeDeletion(key, pending);
+      }
     }
     if (state.paused) removeLiveAuthorActions();
     if (wasPaused && !state.paused) state.lastMediaRecoveryAt = -Infinity;
@@ -1211,6 +1254,52 @@
     for (const eventName of ["pointerdown", "mousedown", "mouseup", "click", "dblclick", "keydown"]) {
       element.addEventListener(eventName, (event) => event.stopPropagation());
     }
+  }
+
+  async function openCompactProfile(event, userIdValue, guildIdValue) {
+    const userId = String(userIdValue || "");
+    const guildId = SNOWFLAKE.test(String(guildIdValue || "")) ? String(guildIdValue) : null;
+    if (!SNOWFLAKE.test(userId)) return;
+    const rect = event?.currentTarget?.getBoundingClientRect?.();
+    if (!rect || ![rect.left, rect.top, rect.width, rect.height].every(Number.isFinite)) return;
+    await send({
+      type: "LDMA_USER_ACTION",
+      action: "open-profile",
+      userId,
+      guildId,
+      anchor: {
+        left: rect.left,
+        top: rect.top,
+        width: Math.max(1, rect.width),
+        height: Math.max(1, rect.height)
+      }
+    });
+  }
+
+  function renderMentionedContent(element, record) {
+    const text = String(record?.content || "");
+    const mentions = Core.sanitizeUserMentions(record?.mentions, text);
+    if (!mentions.length) return replaceText(element, text);
+    const guildId = SNOWFLAKE.test(String(record?.guildId || "")) ? String(record.guildId) : null;
+    const nodes = [];
+    let cursor = 0;
+    for (const mention of mentions) {
+      if (mention.start > cursor) nodes.push(document.createTextNode(text.slice(cursor, mention.start)));
+      const label = text.slice(mention.start, mention.end);
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "content-mention";
+      button.textContent = label;
+      button.setAttribute("aria-expanded", "false");
+      button.setAttribute("aria-label", `Open ${label.slice(1) || "mentioned user"}'s profile`);
+      suppressDiscordMessageGesture(button);
+      button.addEventListener("click", (event) => { openCompactProfile(event, mention.userId, guildId); });
+      nodes.push(button);
+      cursor = mention.end;
+    }
+    if (cursor < text.length) nodes.push(document.createTextNode(text.slice(cursor)));
+    element.replaceChildren(...nodes);
+    return true;
   }
 
   function legacyCopyText(value) {
@@ -2012,6 +2101,9 @@
       .revision.edited:hover { background:rgb(240 178 50 / 11%); }
       .content-line { min-width:0; line-height:22px; }
       .content { color:#f23f42; white-space:pre-wrap; overflow-wrap:anywhere; }
+      .content-mention { display:inline; margin:-1px -2px 0; padding:0 2px; border:0; border-radius:3px; background:rgb(88 101 242 / 30%); color:#c9cdfb; font:inherit; font-weight:500; line-height:inherit; vertical-align:baseline; cursor:pointer; }
+      .content-mention:hover { background:#5865f2; color:#fff; }
+      .content-mention:focus-visible { outline:2px solid #00a8fc; outline-offset:1px; }
       .revision.edited .content { color:#f0b232; }
       .lifecycle-label,.deleted { margin-left:4px; color:#ff6b70; font-size:11px; font-weight:750; white-space:nowrap; }
       .revision.edited .lifecycle-label { color:#f5c451; }
@@ -2123,22 +2215,8 @@
     suppressDiscordMessageGesture(avatar);
     suppressDiscordMessageGesture(author);
 
-    async function openProfile(event) {
-      if (!actionUserId) return;
-      const rect = event?.currentTarget?.getBoundingClientRect?.();
-      if (!rect || ![rect.left, rect.top, rect.width, rect.height].every(Number.isFinite)) return;
-      const response = await send({
-        type: "LDMA_USER_ACTION",
-        action: "open-profile",
-        userId: actionUserId,
-        guildId: actionGuildId,
-        anchor: {
-          left: rect.left,
-          top: rect.top,
-          width: Math.max(1, rect.width),
-          height: Math.max(1, rect.height)
-        }
-      });
+    function openProfile(event) {
+      return openCompactProfile(event, actionUserId, actionGuildId);
     }
 
     avatar.addEventListener("click", openProfile);
@@ -2329,7 +2407,7 @@
         } else reply.removeAttribute("aria-label");
         scheduleTombstoneSpacing();
       }
-      replaceText(content, record.content || "");
+      renderMentionedContent(content, record);
       const revisions = Core.sanitizeEditHistory(record.editHistory);
       host.dataset.ldmaEditCount = String(revisions.length);
       const nextHistorySignature = JSON.stringify(revisions);
@@ -3186,11 +3264,43 @@
     }
   }
 
-  function captureRetainedMessage(channelId, messageId, rowIndex) {
+  function validatedLifecycleMentionMap(value, allowedMessageIds) {
+    const allowed = new Set(Array.isArray(allowedMessageIds) ? allowedMessageIds : []);
+    const result = new Map();
+    if (!Array.isArray(value) || value.length > 200) return result;
+    for (const entry of value) {
+      try {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry) ||
+          Object.keys(entry).sort().join(",") !== "messageId,tokens") continue;
+        const messageId = String(entry.messageId || "");
+        if (!SNOWFLAKE.test(messageId) || !allowed.has(messageId) || result.has(messageId) || !Array.isArray(entry.tokens) ||
+          !entry.tokens.length || entry.tokens.length > MAX_MENTION_TOKENS) continue;
+        const tokens = [];
+        let valid = true;
+        for (const token of entry.tokens) {
+          const keys = token && typeof token === "object" && !Array.isArray(token)
+            ? Object.keys(token).sort().join(",") : "";
+          if (token?.kind === "user" && keys === "kind,userId" && SNOWFLAKE.test(String(token.userId || ""))) {
+            tokens.push({ kind: "user", userId: String(token.userId) });
+          } else if (["role", "broadcast"].includes(token?.kind) && keys === "kind") {
+            tokens.push({ kind: token.kind });
+          } else {
+            valid = false;
+            break;
+          }
+        }
+        if (valid) result.set(messageId, tokens);
+      } catch (_error) {}
+    }
+    return result;
+  }
+
+  function captureRetainedMessage(channelId, messageId, rowIndex, mentionTokens) {
     const key = `${channelId}:${messageId}`;
     if (state.captureSafetySuspended || state.deletionResetPending || state.discardedDeletionKeys.has(key)) return null;
     const archived = state.archiveByKey.get(key);
-    if (archived?.status === "confirmed_deleted") return archived;
+    const needsMentionBinding = mentionTokens?.some((token) => token?.kind === "user") && !archived?.mentions?.length;
+    if (archived?.status === "confirmed_deleted" && !needsMentionBinding) return archived;
     let row = null;
     let route = null;
     if (state.route?.channelId === channelId) {
@@ -3212,7 +3322,7 @@
     // Exact lifecycle capture must not depend on viewport intersection or tab
     // visibility. This reads only an already-rendered DOM row, never store bodies.
     let record = null;
-    try { if (row && route) record = recordFromNode(row, Date.now(), route); } catch (_error) {}
+    try { if (row && route) record = recordFromNode(row, Date.now(), route, mentionTokens); } catch (_error) {}
     const snapshot = state.snapshotsByKey.get(key);
     if (record) {
       state.snapshotsByKey.set(key, Object.assign({}, snapshot || {}, {
@@ -3237,14 +3347,25 @@
   function fresherDeletionRecord(previous, candidate) {
     if (!candidate) return previous;
     if (!previous || candidate.status === "confirmed_deleted") return candidate;
-    if (previous.status === "confirmed_deleted") return previous;
+    if (previous.status === "confirmed_deleted") {
+      if (!previous.mentions?.length && candidate.mentions?.length &&
+        String(previous.content || "") === String(candidate.content || "")) {
+        return Object.assign({}, previous, { mentions: candidate.mentions });
+      }
+      return previous;
+    }
     if (previous.captureSessionId && previous.captureSessionId === candidate.captureSessionId) {
       return Number(candidate.captureSequence || 0) >= Number(previous.captureSequence || 0) ? candidate : previous;
     }
     return Number(candidate.capturedAt || 0) >= Number(previous.capturedAt || 0) ? candidate : previous;
   }
 
-  function queueLifecycleDeletions(channelId, ids, source) {
+  function pendingMentionBinding(pending, archivedRecord) {
+    return Boolean(pending?.needsCapture && !archivedRecord?.mentions?.length &&
+      pending.mentionTokens?.some((token) => token?.kind === "user"));
+  }
+
+  function queueLifecycleDeletions(channelId, ids, source, mentionTokensByMessage) {
     if (!SNOWFLAKE.test(channelId) || !Array.isArray(ids) || state.deletionResetPending) return;
     const cleanIds = [...new Set(ids.slice(0, 200).map(String).filter((id) => SNOWFLAKE.test(id)))];
     if (state.captureSafetySuspended || state.paused && state.archiveInitialized) {
@@ -3259,6 +3380,7 @@
         continue;
       }
       const previous = state.pendingDeletions.get(key);
+      const mentionTokens = mentionTokensByMessage?.get(messageId) || null;
       const retained = source === "message_store_preserved" || previous?.source === "message_store_preserved";
       const promoted = retained && previous?.source !== "message_store_preserved";
       const pending = previous || {
@@ -3266,6 +3388,12 @@
         record: null, attempts: 0, nextAttemptAt: 0, removalObserved: false, needsCapture: true
       };
       pending.source = retained ? "message_store_preserved" : "discord_lifecycle";
+      const mentionsChanged = Boolean(mentionTokens &&
+        JSON.stringify(mentionTokens) !== JSON.stringify(pending.mentionTokens || []));
+      if (mentionTokens) {
+        pending.mentionTokens = mentionTokens;
+        if (mentionsChanged) pending.mentionCaptureAttempts = 0;
+      }
       if (startupRows?.has(key) && state.route?.channelId === channelId) {
         pending.nativeRow = startupRows.get(key);
         pending.captureRoute = state.route;
@@ -3280,10 +3408,13 @@
       if (removedAt !== undefined && performance.now() - removedAt < 1800 && !liveMessageExists(channelId, messageId)) {
         pending.removalObserved = true;
       }
-      if (!previous || promoted || becameCapturable) pending.nextAttemptAt = 0;
-      if (promoted) pending.needsCapture = true;
+      if (!previous || promoted || becameCapturable || mentionsChanged) pending.nextAttemptAt = 0;
+      if (promoted || mentionsChanged) pending.needsCapture = true;
       state.pendingDeletions.set(key, pending);
-      if (state.archiveByKey.get(key)?.status === "confirmed_deleted") acknowledgeDeletion(key, pending);
+      const archived = state.archiveByKey.get(key);
+      if (archived?.status === "confirmed_deleted" && !pendingMentionBinding(pending, archived)) {
+        acknowledgeDeletion(key, pending);
+      }
     }
     // The MAIN-world ledger retains unacknowledged IDs for later replay if this
     // bounded work queue fills. Never ACK an entry merely to make room.
@@ -3322,14 +3453,21 @@
       for (const [key, pending] of state.pendingDeletions) {
         if (pending.generation !== generation || pending.nextAttemptAt > now) continue;
         if (examined++ >= 200) break;
-        if (state.archiveByKey.get(key)?.status === "confirmed_deleted") {
+        const archived = state.archiveByKey.get(key);
+        const hasNativeRow = nativeRows.has(key);
+        if (pendingMentionBinding(pending, archived) && !hasNativeRow) {
+          pending.mentionCaptureAttempts = Number(pending.mentionCaptureAttempts || 0) + 1;
+          if (pending.mentionCaptureAttempts >= MAX_MENTION_CAPTURE_ATTEMPTS) pending.needsCapture = false;
+        }
+        if (archived?.status === "confirmed_deleted" && !pendingMentionBinding(pending, archived)) {
           acknowledgeDeletion(key, pending);
           continue;
         }
-        if (nativeRows.has(key) && (pending.needsCapture || !pending.record)) {
+        if (hasNativeRow && (pending.needsCapture || !pending.record)) {
           if (richCaptures >= SCROLL_CAPTURE_ROWS_PER_FRAME || richCaptures > 0 && performance.now() - now >= SCROLL_CAPTURE_FRAME_BUDGET_MS) break;
           richCaptures += 1;
-          pending.record = fresherDeletionRecord(pending.record, captureRetainedMessage(pending.channelId, pending.messageId, nativeRows));
+          pending.record = fresherDeletionRecord(pending.record,
+            captureRetainedMessage(pending.channelId, pending.messageId, nativeRows, pending.mentionTokens));
           if (pending.record) {
             pending.needsCapture = false;
             delete pending.nativeRow;
@@ -3388,8 +3526,8 @@
     await drainPendingDeletions();
   }
 
-  async function confirmRetainedDeletion(channelId, ids) {
-    queueLifecycleDeletions(channelId, ids, "message_store_preserved");
+  async function confirmRetainedDeletion(channelId, ids, mentionTokensByMessage) {
+    queueLifecycleDeletions(channelId, ids, "message_store_preserved", mentionTokensByMessage);
     await drainPendingDeletions();
   }
 
@@ -3710,7 +3848,8 @@
       // so the first edit/delete is never rejected as belonging to the old page.
       checkRoute();
       if (message.kind === "retained") {
-        confirmRetainedDeletion(String(message.channelId), ids).catch(() => {});
+        const mentions = validatedLifecycleMentionMap(message.mentions, ids);
+        confirmRetainedDeletion(String(message.channelId), ids, mentions).catch(() => {});
       } else if (message.kind === "delete") {
         confirmLifecycleDeletion(String(message.channelId), ids).catch(() => {});
       }

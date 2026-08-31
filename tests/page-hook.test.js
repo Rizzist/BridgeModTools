@@ -428,7 +428,7 @@ function runHook(options) {
 test("duplicate page-hook injection recovers in place without duplicate listeners, timers, wrappers, or events", () => {
   const result = runHook();
   const originalDeleteWrapper = result.handlerNode.actionHandler.MESSAGE_DELETE;
-  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 6);
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 7);
   assert.equal(result.intervalCount(), 1);
   assert.equal(result.listenerCount("message"), 1);
 
@@ -546,6 +546,40 @@ test("MessageStore delete handlers retain the current user's native cached messa
     bulk: false
   }]);
   assert.equal(JSON.stringify(retained).includes("must not cross"), false);
+});
+
+test("retained deletions expose only bounded verified mention tokens and replay them until acknowledgment", () => {
+  const result = runHook({ deferReady: true });
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const firstUserId = "111111111111111111";
+  const secondUserId = "222222222222222222";
+  const roleId = "333333333333333333";
+  const message = result.messages.get(messageId);
+  message.content = `ban <@${firstUserId}> and <@&${roleId}> @everyone then <@!${secondUserId}>`;
+  message.mentions = [{ id: firstUserId }, { id: secondUserId }];
+  message.mentionRoles = [roleId];
+  message.mentionEveryone = true;
+  result.handlerNode.actionHandler.MESSAGE_DELETE({ channelId, id: messageId });
+  assert.equal(result.posted.some((item) => item.kind === "retained"), false);
+  result.ready();
+  const retained = plain(result.posted.filter((item) => item.kind === "retained").at(-1));
+  assert.deepEqual(retained, {
+    bridge: "LDMA_BRIDGE_V1", kind: "retained", channelId, ids: [messageId], bulk: false,
+    mentions: [{
+      messageId,
+      tokens: [
+        { kind: "user", userId: firstUserId },
+        { kind: "role" },
+        { kind: "broadcast" },
+        { kind: "user", userId: secondUserId }
+      ]
+    }]
+  });
+  assert.equal(JSON.stringify(retained).includes(roleId), false, "role identity does not cross the page bridge");
+  assert.equal(JSON.stringify(retained).includes("ban "), false, "message content never crosses the page bridge");
+  result.ready();
+  assert.deepEqual(plain(result.posted.filter((item) => item.kind === "retained").at(-1).mentions), retained.mentions);
 });
 
 test("MessageStore bulk deletes retain every cached native message", () => {
@@ -1171,7 +1205,7 @@ test("a newer page hook never self-reloads an older controller contract", () => 
   const result = runHook(settings);
   assert.equal(result.legacyRecoveries(), 0);
   assert.equal(result.reloads(), 0);
-  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].upgradeRequired, 6);
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].upgradeRequired, 7);
   result.reinject();
   assert.equal(result.legacyRecoveries(), 0);
   assert.equal(result.reloads(), 0);

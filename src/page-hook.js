@@ -1,7 +1,7 @@
 (function installLocalDiscordLifecycleHook() {
   "use strict";
 
-  const HOOK_API_VERSION = 6;
+  const HOOK_API_VERSION = 7;
   const INSTALL_KEY = Symbol.for("BridgeModTools.pageHook.v1");
   const existingController = window[INSTALL_KEY];
   if (existingController && typeof existingController.recover === "function") {
@@ -33,6 +33,7 @@
   const MAX_BULK_IDS = 200;
   const MAX_RETAINED_KEYS = 5000;
   const MAX_PENDING_DELETIONS = 5000;
+  const MAX_MENTION_TOKENS = 50;
   const TIMEOUT_7D_SECONDS = 7 * 24 * 60 * 60;
   const webpackInstances = new Set();
   const scannedModules = new WeakMap();
@@ -105,6 +106,46 @@
     return /^[a-z0-9._]{1,32}$/i.test(username) ? username : null;
   }
 
+  function messageMentionTokens(message) {
+    if (!message || typeof message !== "object" || typeof message.content !== "string") return [];
+    const values = (value) => {
+      try {
+        if (Array.isArray(value)) return value;
+        if (value && typeof value.toArray === "function") return value.toArray();
+      } catch (_error) {}
+      return [];
+    };
+    const userIds = new Set(values(message.mentions).slice(0, MAX_MENTION_TOKENS * 2)
+      .map((item) => cleanId(item?.id || item?.user?.id || item)).filter(Boolean));
+    const roleIds = new Set(values(message.mentionRoles || message.mention_roles).slice(0, MAX_MENTION_TOKENS * 2)
+      .map((item) => cleanId(item?.id || item)).filter(Boolean));
+    const mentionsEveryone = message.mentionEveryone === true || message.mention_everyone === true;
+    const tokens = [];
+    const pattern = /<@([!&]?)(\d{15,25})>|@(everyone|here)/g;
+    for (const match of message.content.matchAll(pattern)) {
+      if (tokens.length >= MAX_MENTION_TOKENS) break;
+      if (match[3]) {
+        if (mentionsEveryone) tokens.push({ kind: "broadcast" });
+        continue;
+      }
+      const id = cleanId(match[2]);
+      if (!id) continue;
+      if (match[1] === "&") {
+        if (roleIds.has(id)) tokens.push({ kind: "role" });
+      } else if (userIds.has(id)) tokens.push({ kind: "user", userId: id });
+    }
+    return tokens;
+  }
+
+  function retainedMentionPayload(channelId, ids) {
+    const mentions = [];
+    for (const id of ids) {
+      const entry = pendingRetainedDeletes.get(`${channelId}:${id}`);
+      if (entry?.mentionTokens?.length) mentions.push({ messageId: id, tokens: entry.mentionTokens });
+    }
+    return mentions;
+  }
+
   function emitDelete(channelValue, idValues, bulk) {
     const channelId = cleanId(channelValue);
     const ids = [...new Set((Array.isArray(idValues) ? idValues : [idValues]).map(cleanId).filter(Boolean))]
@@ -131,11 +172,19 @@
         deletionLedgerOverflowed = true;
         continue;
       }
-      pendingRetainedDeletes.set(key, { channelId, id, bulk: Boolean(bulk) });
+      const existing = pendingRetainedDeletes.get(key);
+      pendingRetainedDeletes.set(key, {
+        channelId, id, bulk: Boolean(bulk), mentionTokens: existing?.mentionTokens || []
+      });
       admittedIds.push(id);
     }
     if (deletionLedgerOverflowed) report("active", "");
-    if (isolatedReady && admittedIds.length) bridgeMessage("retained", { channelId, ids: admittedIds, bulk: Boolean(bulk) });
+    if (isolatedReady && admittedIds.length) {
+      const payload = { channelId, ids: admittedIds, bulk: Boolean(bulk) };
+      const mentions = retainedMentionPayload(channelId, admittedIds);
+      if (mentions.length) payload.mentions = mentions;
+      bridgeMessage("retained", payload);
+    }
   }
 
   function replayRetainedDeletes(channelValue) {
@@ -151,11 +200,15 @@
     }
     for (const group of groups.values()) {
       for (let offset = 0; offset < group.ids.length; offset += MAX_BULK_IDS) {
-        bridgeMessage("retained", {
+        const ids = group.ids.slice(offset, offset + MAX_BULK_IDS);
+        const payload = {
           channelId: group.channelId,
-          ids: group.ids.slice(offset, offset + MAX_BULK_IDS),
+          ids,
           bulk: group.bulk
-        });
+        };
+        const mentions = retainedMentionPayload(group.channelId, ids);
+        if (mentions.length) payload.mentions = mentions;
+        bridgeMessage("retained", payload);
       }
     }
   }
@@ -526,7 +579,9 @@
         if (store.getMessage(channelId, entry.id)?.deleted !== true) continue;
         // Register each success immediately so the next item in this same bulk
         // batch observes the remaining capacity, before emitRetained runs.
-        pendingRetainedDeletes.set(key, { channelId, id: entry.id, bulk: Boolean(isBulk) });
+        pendingRetainedDeletes.set(key, {
+          channelId, id: entry.id, bulk: Boolean(isBulk), mentionTokens: entry.mentionTokens
+        });
         result.retainedIds.push(entry.id);
         retainedKeys.add(key);
         while (retainedKeys.size > MAX_RETAINED_KEYS) {
@@ -550,7 +605,7 @@
       for (const id of ids) {
         try {
           const message = store.getMessage(channelId, id);
-          if (message) captured.push({ id, message });
+          if (message) captured.push({ id, message, mentionTokens: messageMentionTokens(message) });
         } catch (_error) {}
       }
     }

@@ -204,6 +204,14 @@
               maxBytes: Number.MAX_SAFE_INTEGER
             })[0] || existingRecord;
           }
+          if (existingRecord?.status === "confirmed_deleted" && incomingRecord.mentions?.length &&
+            String(existingRecord.content || "") === String(incomingRecord.content || "")) {
+            // A retained MessageStore event can race an ordinary delete
+            // confirmation. Permit one exact-body enrichment with the
+            // deletion-time mention bindings without reopening the body,
+            // edit history, reply, or lifecycle truth.
+            observedRecord = Object.assign({}, observedRecord, { mentions: incomingRecord.mentions });
+          }
           const reply = existingRecord?.status === "confirmed_deleted" ? existingRecord.reply
             : newerSnapshot ? Core.mergeReplySnapshots(existingRecord?.reply, incomingRecord?.reply)
               : existingRecord?.reply || incomingRecord?.reply;

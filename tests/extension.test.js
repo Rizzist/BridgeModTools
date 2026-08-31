@@ -36,7 +36,7 @@ test("manifest is MV3 with bounded media access and route-safe Discord bootstrap
   assert.equal(manifest.content_scripts[0].run_at, "document_start");
   assert.deepEqual(manifest.content_scripts[1].matches, ["https://discord.com/*"]);
   assert.equal("css" in manifest.content_scripts[1], false);
-  assert.equal(manifest.version, "2.7.2");
+  assert.equal(manifest.version, "2.7.3");
   assert.equal(manifest.web_accessible_resources.length, 1);
   assert.deepEqual(manifest.web_accessible_resources[0].matches, ["https://discord.com/*"]);
   assert.equal(manifest.web_accessible_resources[0].use_dynamic_url, true);
@@ -72,7 +72,7 @@ test("background self-heals fresh, restored, updated, and SPA Discord documents"
   assert.match(background, /chrome\.tabs\.query\(\{ url: \[DISCORD_TAB_PATTERN\] \}\)/);
   assert.match(background, /chrome\.scripting\.executeScript/);
   assert.match(background, /files: \["src\/page-hook\.js"\][\s\S]*world: "MAIN"/);
-  assert.match(background, /PAGE_HOOK_API_VERSION = 6/);
+  assert.match(background, /PAGE_HOOK_API_VERSION = 7/);
   assert.match(background, /chrome\.storage\.session\.get\(PAGE_HOOK_RELOAD_SESSION_KEY\)/);
   assert.match(background, /if \(!await claimPageHookReload\(tabId\)\)/);
   assert.match(background, /typeof controller\.resolveMessageAuthors === "function"/);
@@ -176,7 +176,7 @@ test("content contains retraction and tombstone reconciliation hooks", () => {
   assert.match(content, /confirmRetainedDeletion/);
   assert.match(content, /message_store_preserved/);
   assert.match(content, /ldma-retained-deleted/);
-  assert.match(content, /confirmRetainedDeletion[\s\S]*queueLifecycleDeletions\(channelId, ids, "message_store_preserved"\)/);
+  assert.match(content, /confirmRetainedDeletion[\s\S]*queueLifecycleDeletions\(channelId, ids, "message_store_preserved", mentionTokensByMessage\)/);
   assert.match(content, /function captureRetainedMessage/);
   assert.match(content, /function acknowledgeDeletion/);
   assert.match(content, /deletionResetPending/);
@@ -344,7 +344,7 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.equal(/function copyUserId/.test(content), false);
   assert.match(content, /document\.execCommand\("copy"\)/);
   assert.match(content, /window\.confirm\(`Timeout \$\{author\} \(\$\{userId\}\) for 7 days\?`\)/);
-  assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "open-profile",\s*userId: actionUserId,\s*guildId: actionGuildId,\s*anchor:/);
+  assert.match(content, /function openCompactProfile[\s\S]*type: "LDMA_USER_ACTION",\s*action: "open-profile",\s*userId,\s*guildId,\s*anchor:/);
   assert.match(content, /type: "LDMA_USER_ACTION",\s*action: "timeout-7d",\s*userId,\s*guildId: context\.guildId,\s*messageId: context\.messageId/);
   assert.match(content, /Core\.messageRowOwnsElement\(row, host, identity\.messageId\)/);
   assert.match(content, /pendingTimeoutActions\.has\(timeoutKey\)/);
@@ -361,7 +361,7 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.match(content, /background independently proves/);
   assert.match(content, /function removeLiveAuthorActions/);
   assert.match(content, /removeLiveAuthorActions\(\)/);
-  assert.match(hook, /const HOOK_API_VERSION = 6/);
+  assert.match(hook, /const HOOK_API_VERSION = 7/);
   assert.match(hook, /existingController\.apiVersion !== HOOK_API_VERSION/);
   assert.match(hook, /function openUserProfilePopout\(normalized\)/);
   assert.match(hook, /userProfilePopoutCandidate/);

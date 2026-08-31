@@ -352,6 +352,29 @@ test("same-session stale captures cannot roll the current payload backward", () 
   assert.equal(merged[0].captureSequence, 3);
 });
 
+test("archived user mentions are range-bound, sanitized, and invalidated with changed content", () => {
+  const content = "ban @MauveXD then @Clay";
+  const mentions = Core.sanitizeUserMentions([
+    { start: 4, end: 12, userId: "111111111111111111" },
+    { start: 18, end: 23, userId: "222222222222222222" },
+    { start: 0, end: 3, userId: "333333333333333333" },
+    { start: 10, end: 15, userId: "444444444444444444" },
+    { start: 18, end: 999, userId: "555555555555555555" }
+  ], content);
+  assert.deepEqual(mentions, [
+    { start: 4, end: 12, userId: "111111111111111111" },
+    { start: 18, end: 23, userId: "222222222222222222" }
+  ]);
+  const current = Core.sanitizeRecordPresentation({
+    messageId: "888888888888888881", channelId: "777777777777777777", content, mentions, status: "seen"
+  });
+  assert.deepEqual(current.mentions, mentions);
+  const sameBody = Core.mergeRecords([current], [{ ...current, mentions: undefined }], { now: 2 })[0];
+  assert.deepEqual(sameBody.mentions, mentions, "presentation-only recapture may retain the exact bound ranges");
+  const changedBody = Core.mergeRecords([current], [{ ...current, content: "mention removed", mentions: undefined }], { now: 3 })[0];
+  assert.equal(changedBody.mentions, undefined, "a changed body cannot inherit stale mention targets");
+});
+
 test("prunes deterministically by record and byte caps", () => {
   const records = Array.from({ length: 6 }, (_, index) => ({
     messageId: String(index), channelId: "1", content: "x", updatedAt: index

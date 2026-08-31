@@ -73,7 +73,7 @@ function backgroundHarness(options) {
         if (Array.isArray(options.files) && options.files.includes("src/page-hook.js") &&
           !mainWorld[Symbol.for("BridgeModTools.pageHook.v1")]) {
           mainWorld[Symbol.for("BridgeModTools.pageHook.v1")] = pageHookFileInstallController || {
-            apiVersion: 6, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}, resolveMemberTimeouts() {}
+            apiVersion: 7, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}, resolveMemberTimeouts() {}
           };
         }
         if (typeof options.func === "function") {
@@ -289,7 +289,7 @@ test("a stale page controller gets one bounded background reload and never loops
   assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
 
   harness.calls.length = 0;
-  harness.setPageHookProbeState({ apiVersion: 6, ready: true });
+  harness.setPageHookProbeState({ apiVersion: 7, ready: true });
   const recovered = await harness.api.ensureDiscordBootstrap(12, "document-13", true);
   assert.equal(recovered.ok, true);
   assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
@@ -718,7 +718,7 @@ test("message author resolution repairs a missing page controller and retries th
   const pageUrl = `https://discord.com/channels/111111111111111111/${channelId}`;
   harness.setLocation(pageUrl);
   harness.setPageHookFileInstallController({
-    apiVersion: 6,
+    apiVersion: 7,
     recover() {},
     invokeUserAction() { return { ok: true }; },
     resolveMessageAuthors() {
@@ -1105,7 +1105,7 @@ test("member timeout resolution repairs a missing controller and retries the sam
     { guildId, channelId, messageId, authorId: userId, status: "confirmed_deleted" }
   ] });
   harness.setPageHookFileInstallController({
-    apiVersion: 6,
+    apiVersion: 7,
     recover() {},
     invokeUserAction() { return { ok: true }; },
     resolveMessageAuthors() { return { ok: true, authors: [] }; },

@@ -153,6 +153,8 @@ function createHarness(options = {}) {
     SNOWFLAKE: /^\d{15,25}$/,
     BRIDGE: "LDMA_BRIDGE_V1", EDIT_EVENT: "LDMA_EDIT_BEFORE_V1", LIVE_HEALTH: "LDMA_REPORT_LIVE_HEALTH",
     MESSAGE_SELECTOR: "li[id^='chat-messages-'], [data-list-item-id^='chat-messages___']",
+    MAX_MENTION_TOKENS: 50,
+    MAX_MENTION_CAPTURE_ATTEMPTS: 4,
     SCROLL_CAPTURE_INTERVAL_MS: 250, SCROLL_CAPTURE_ROWS_PER_FRAME: 4, SCROLL_CAPTURE_FRAME_BUDGET_MS: 5,
     captureSessionId: "test-capture-session", captureSequence: 0,
     Node: { ELEMENT_NODE: 1 }, performance: { now: () => now }, innerHeight: 800,
@@ -184,6 +186,8 @@ function createHarness(options = {}) {
     extensionManagedNode: () => false,
     captureMedia: () => [],
     allContent: (row) => row.content,
+    captureMentionSpans: (row, _messageId, _content, tokens) => Array.isArray(tokens) && tokens[0]?.kind === "user"
+      ? (row.mentions || [{ start: 4, end: 12, userId: tokens[0].userId }]) : [],
     captureReply: () => null,
     capturedReply: (_record, reply) => reply,
     groupRootFromNode: (_row, messageId) => messageId,
@@ -218,7 +222,7 @@ function createHarness(options = {}) {
     "retainedRowsByKey", "scheduleRetainedStyles", "applyRetainedStyles", "snapshotRenderedMessages", "captureScrollMessageNode", "capturePendingScrollRows",
     "scheduleScrollingCapture", "collectScrollCaptureRows", "rememberRecentRemovedMessages", "trimPendingScrollRows",
     "findMessage", "evaluateCandidate", "discardPendingEdit", "commitPendingEdit", "verifyPendingEdit", "editLifecycleIdentity",
-    "knownDeletion", "acknowledgeDeletion", "discardDeletionKey", "fresherDeletionRecord", "captureRetainedMessage", "scheduleDeletionDrain", "queueLifecycleDeletions", "drainPendingDeletions",
+    "knownDeletion", "acknowledgeDeletion", "discardDeletionKey", "fresherDeletionRecord", "pendingMentionBinding", "validatedLifecycleMentionMap", "captureRetainedMessage", "scheduleDeletionDrain", "queueLifecycleDeletions", "drainPendingDeletions",
     "confirmLifecycleDeletion", "confirmRetainedDeletion", "installPageBridge", "signalPageBridgeReady", "checkRoute"
   ];
   vm.runInContext(functions.map(productionFunction).join("\n"), context);
@@ -284,6 +288,79 @@ test("retained deletion captures an exact hidden native row before acknowledging
   assert.equal(archived?.status, "confirmed_deleted");
   assert.equal(harness.state.pendingDeletions.size, 0);
   assert.equal(harness.posts.filter((message) => message.kind === "deletion-ack").length, 1);
+});
+
+test("retained deletion binds a verified user mention to the durable archived body", async () => {
+  const harness = createHarness({ hidden: true });
+  const userId = "111111111111111111";
+  harness.addRow({
+    content: "ban @MauveXD bot",
+    mentions: [{ start: 4, end: 12, userId }]
+  });
+  await harness.dispatchBridge({
+    kind: "retained", channelId: CHANNEL_ID, ids: [MESSAGE_ID],
+    mentions: [{ messageId: MESSAGE_ID, tokens: [{ kind: "user", userId }] }]
+  });
+  await harness.drain();
+  const archived = harness.archive.records.find((item) => item.messageId === MESSAGE_ID);
+  assert.equal(archived?.status, "confirmed_deleted");
+  assert.equal(archived?.content, "ban @MauveXD bot");
+  assert.deepEqual(archived?.mentions, [{ start: 4, end: 12, userId }]);
+  assert.equal(harness.posts.filter((message) => message.kind === "deletion-ack").length, 1);
+});
+
+test("a later retained event enriches an already-confirmed exact body before acknowledgment", async () => {
+  const harness = createHarness({ hidden: true });
+  const userId = "111111111111111111";
+  const confirmed = harness.record({
+    content: "ban @MauveXD bot",
+    status: "confirmed_deleted",
+    confirmedDeletedAt: Date.now(),
+    deletionSource: "discord_lifecycle"
+  });
+  harness.setArchive({ ...Protocol.emptyArchive(), revision: 1, records: [confirmed] });
+  harness.addRow({
+    content: confirmed.content,
+    mentions: [{ start: 4, end: 12, userId }],
+    captureSequence: 2
+  });
+  await harness.dispatchBridge({
+    kind: "retained", channelId: CHANNEL_ID, ids: [MESSAGE_ID],
+    mentions: [{ messageId: MESSAGE_ID, tokens: [{ kind: "user", userId }] }]
+  });
+  await harness.drain();
+  const archived = harness.archive.records.find((item) => item.messageId === MESSAGE_ID);
+  assert.deepEqual(archived?.mentions, [{ start: 4, end: 12, userId }]);
+  assert.equal(archived?.status, "confirmed_deleted");
+  assert.equal(archived?.content, confirmed.content);
+  assert.equal(harness.posts.filter((message) => message.kind === "deletion-ack").length, 1);
+});
+
+test("mention enrichment gives up cleanly when the exact native row is already unavailable", async () => {
+  const harness = createHarness({ hidden: true });
+  const confirmed = harness.record({
+    content: "ban @MauveXD bot",
+    status: "confirmed_deleted",
+    confirmedDeletedAt: Date.now(),
+    deletionSource: "discord_lifecycle"
+  });
+  harness.setArchive({ ...Protocol.emptyArchive(), revision: 1, records: [confirmed] });
+  await harness.dispatchBridge({
+    kind: "retained", channelId: CHANNEL_ID, ids: [MESSAGE_ID],
+    mentions: [{
+      messageId: MESSAGE_ID,
+      tokens: [{ kind: "user", userId: "111111111111111111" }]
+    }]
+  });
+  await harness.tick(10000);
+  const archived = harness.archive.records.find((item) => item.messageId === MESSAGE_ID);
+  assert.equal(archived?.status, "confirmed_deleted");
+  assert.equal(archived?.content, confirmed.content);
+  assert.equal(archived?.mentions, undefined, "an unavailable label must never be guessed from its text");
+  assert.equal(harness.state.pendingDeletions.size, 0);
+  assert.equal(harness.posts.filter((message) => message.kind === "deletion-ack").length, 1);
+  assert.ok(harness.requests.filter((command) => command.type === T.CONFIRM_DELETED).length <= 4,
+    "the retained bridge replay remains bounded while exact mention binding is unavailable");
 });
 
 test("a retained event before initial archive loading binds to the first known generation", async () => {
