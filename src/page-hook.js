@@ -1,7 +1,7 @@
 (function installLocalDiscordLifecycleHook() {
   "use strict";
 
-  const HOOK_API_VERSION = 4;
+  const HOOK_API_VERSION = 5;
   const INSTALL_KEY = Symbol.for("BridgeModTools.pageHook.v1");
   const existingController = window[INSTALL_KEY];
   if (existingController && typeof existingController.recover === "function") {
@@ -38,7 +38,7 @@
   const scannedModules = new WeakMap();
   const dispatchers = new Set();
   const fallbackDispatchers = new Set();
-  const CORE_STORES = new Set(["MessageStore", "ChannelStore", "GuildStore", "ReadStateStore", "UserStore"]);
+  const CORE_STORES = new Set(["MessageStore", "ChannelStore", "GuildStore", "GuildMemberStore", "ReadStateStore", "UserStore"]);
   const bufferedEvents = [];
   const patchedHandlerNodes = new WeakMap();
   const patchedRetentionDispatchers = new WeakMap();
@@ -55,6 +55,8 @@
   let fallbackDispatcher = null;
   let messageStoreCandidate = null;
   let userStoreCandidate = null;
+  let guildMemberStoreCandidate = null;
+  let guildMemberStoreSource = null;
   const structuralUserStoreCandidates = new Set();
   let userProfileActionsCandidate = null;
   let timeoutUntilActionsCandidate = null;
@@ -278,6 +280,17 @@
     emitDelete(action && (action.channelId || action.channel_id), action && action.ids, true);
   }
 
+  function onGuildMemberUpdate(action) {
+    let guildId = null;
+    let userId = null;
+    try {
+      guildId = cleanId(action && (action.guildId || action.guild_id));
+      const member = action && (action.member || action);
+      userId = cleanId(member && (member.userId || member.user_id || member.user?.id));
+    } catch (_error) {}
+    if (guildId && userId) bridgeMessage("timeout-state-dirty", { guildId, userId });
+  }
+
   function dataFunction(value, property) {
     let current = value;
     for (let depth = 0; current && depth < 4; depth += 1) {
@@ -389,6 +402,7 @@
     try { dispatcher.unsubscribe("MESSAGE_DELETE_BULK", onBulkDelete); } catch (_error) {}
     try { dispatcher.unsubscribe("MESSAGE_START_EDIT", onEditStart); } catch (_error) {}
     try { dispatcher.unsubscribe("MESSAGE_END_EDIT", onEditEnd); } catch (_error) {}
+    try { dispatcher.unsubscribe("GUILD_MEMBER_UPDATE", onGuildMemberUpdate); } catch (_error) {}
     dispatchers.delete(dispatcher);
     if (coreDispatcher === dispatcher) coreDispatcher = null;
     if (fallbackDispatcher === dispatcher) fallbackDispatcher = null;
@@ -408,11 +422,13 @@
         dispatcher.subscribe("MESSAGE_DELETE_BULK", onBulkDelete);
         dispatcher.subscribe("MESSAGE_START_EDIT", onEditStart);
         dispatcher.subscribe("MESSAGE_END_EDIT", onEditEnd);
+        dispatcher.subscribe("GUILD_MEMBER_UPDATE", onGuildMemberUpdate);
       } catch (_error) {
         try { dispatcher.unsubscribe("MESSAGE_DELETE", onDelete); } catch (_ignored) {}
         try { dispatcher.unsubscribe("MESSAGE_DELETE_BULK", onBulkDelete); } catch (_ignored) {}
         try { dispatcher.unsubscribe("MESSAGE_START_EDIT", onEditStart); } catch (_ignored) {}
         try { dispatcher.unsubscribe("MESSAGE_END_EDIT", onEditEnd); } catch (_ignored) {}
+        try { dispatcher.unsubscribe("GUILD_MEMBER_UPDATE", onGuildMemberUpdate); } catch (_ignored) {}
         return false;
       }
       dispatchers.add(dispatcher);
@@ -734,7 +750,7 @@
     }
   }
 
-  function inspectExports(rootValue) {
+  function inspectExports(rootValue, sourceInfo) {
     const queue = [{ value: rootValue, depth: 0 }];
     const visited = new WeakSet();
     let inspected = 0;
@@ -761,14 +777,20 @@
         // getCurrentUser is unrelated to resolving another message author and
         // has disappeared from some builds.
         const usableUserStore = storeInfo.name === "UserStore" && moduleExportFunction(value, "getUser");
+        const usableGuildMemberStore = storeInfo.name === "GuildMemberStore" &&
+          moduleExportFunction(value, "getMember") && moduleExportFunction(value, "getMembers");
         if (usableUserStore) userStoreCandidate = value;
+        if (usableGuildMemberStore && (!coreDispatcher || storeInfo.dispatcher === coreDispatcher)) {
+          guildMemberStoreCandidate = value;
+          guildMemberStoreSource = sourceInfo || null;
+        }
         // Do not let a decoy/partial named store claim global hook health. Its
         // dispatcher must first pass subscription and become the accepted core
         // dispatcher, and the store must expose the cache reads retention needs.
         if (usableMessageStore) {
           messageStoreCandidate = value;
           reconcileMessageStore("module-discovery");
-        } else if (!usableUserStore) subscribeDispatcher(storeInfo.dispatcher, true, false);
+        } else if (!usableUserStore && !usableGuildMemberStore) subscribeDispatcher(storeInfo.dispatcher, true, false);
       }
       else if (fallbackDispatchers.size < 4 && isDispatcher(value)) fallbackDispatchers.add(value);
       if (depth >= 2) continue;
@@ -801,7 +823,7 @@
     for (const [moduleId, module] of Object.entries(cache)) {
       if (!force && seen.has(moduleId)) continue;
       seen.add(moduleId);
-      try { inspectExports(module && module.exports); } catch (_error) {}
+      try { inspectExports(module && module.exports, { requireFunction, moduleId }); } catch (_error) {}
     }
     if (!coreDispatcher && !fallbackDispatcher && fallbackDispatchers.size) {
       for (const dispatcher of fallbackDispatchers) {
@@ -981,6 +1003,94 @@
     return { ok: true, reason: usernamesMissing ? "resolved-author-ids-only" : "resolved", authors };
   }
 
+  function memberTimeoutUntil(member, expectedGuildId) {
+    if (!member || typeof member !== "object") return { known: false, timeoutUntil: null };
+    let memberUserId;
+    let memberGuildId;
+    let memberGuildProvided = false;
+    try {
+      const rawMemberUserId = member.userId || member.user_id || member.user?.id;
+      const rawMemberGuildId = member.guildId || member.guild_id;
+      memberGuildProvided = rawMemberGuildId != null;
+      if (typeof rawMemberUserId !== "string" ||
+          rawMemberGuildId != null && typeof rawMemberGuildId !== "string") {
+        return { known: false, timeoutUntil: null };
+      }
+      memberUserId = cleanId(rawMemberUserId);
+      memberGuildId = rawMemberGuildId == null ? null : cleanId(rawMemberGuildId);
+    }
+    catch (_error) { return { known: false, timeoutUntil: null }; }
+    if (!memberUserId || memberGuildProvided && (!memberGuildId || memberGuildId !== expectedGuildId)) {
+      return { known: false, timeoutUntil: null };
+    }
+    let raw;
+    try {
+      raw = member.communicationDisabledUntil ?? member.communication_disabled_until ??
+        member.communicationDisabledUntilTimestamp ?? member.communication_disabled_until_timestamp;
+    } catch (_error) {
+      return { known: false, timeoutUntil: null };
+    }
+    if (raw == null || raw === "") return { known: true, userId: memberUserId, timeoutUntil: null };
+    let timestamp;
+    try {
+      if (raw instanceof Date) timestamp = raw.valueOf();
+      else if (typeof raw === "number") timestamp = raw > 0 && raw < 100000000000 ? raw * 1000 : raw;
+      else timestamp = Date.parse(String(raw));
+    } catch (_error) {
+      return { known: false, timeoutUntil: null };
+    }
+    if (!Number.isFinite(timestamp) || Math.abs(timestamp) > 8640000000000000) {
+      return { known: false, timeoutUntil: null };
+    }
+    return {
+      known: true,
+      userId: memberUserId,
+      timeoutUntil: timestamp > Date.now() ? new Date(timestamp).toISOString() : null
+    };
+  }
+
+  function resolveMemberTimeouts(guildValue, userValues) {
+    if (typeof guildValue !== "string" || !Array.isArray(userValues) ||
+        userValues.some((value) => typeof value !== "string")) {
+      return { ok: false, reason: "invalid-request", statuses: [] };
+    }
+    const guildId = cleanId(guildValue);
+    if (!guildId || !Array.isArray(userValues) || userValues.length < 1 || userValues.length > MAX_BULK_IDS) {
+      return { ok: false, reason: "invalid-request", statuses: [] };
+    }
+    const userIds = [...new Set(userValues.map(cleanId).filter(Boolean))];
+    if (!userIds.length || userIds.length !== userValues.length) {
+      return { ok: false, reason: "invalid-request", statuses: [] };
+    }
+    // Re-read the one module that produced the accepted store before each
+    // bounded UI query. This catches replaced exports without repeatedly
+    // walking Discord's entire Webpack cache (which can contend with scrolling).
+    const source = guildMemberStoreSource;
+    guildMemberStoreCandidate = null;
+    guildMemberStoreSource = null;
+    let sourceModule = null;
+    try { sourceModule = source?.requireFunction?.c?.[source.moduleId] || null; } catch (_error) {}
+    if (sourceModule) try { inspectExports(sourceModule.exports, source); } catch (_error) {}
+    if (!guildMemberStoreCandidate) {
+      for (const requireFunction of webpackInstances) scanWebpack(requireFunction, true);
+    }
+    const getMember = moduleExportFunction(guildMemberStoreCandidate, "getMember");
+    const getMembers = moduleExportFunction(guildMemberStoreCandidate, "getMembers");
+    const refreshedInfo = coreStoreInfo(guildMemberStoreCandidate);
+    if (!getMember || !getMembers || refreshedInfo?.name !== "GuildMemberStore" || refreshedInfo.dispatcher !== coreDispatcher) {
+      return { ok: false, reason: "guild-member-store-unavailable", statuses: [] };
+    }
+    const statuses = [];
+    for (const userId of userIds) {
+      let member = null;
+      try { member = getMember.call(guildMemberStoreCandidate, guildId, userId); } catch (_error) {}
+      const normalized = memberTimeoutUntil(member, guildId);
+      if (!normalized.known || normalized.userId !== userId) continue;
+      statuses.push({ userId, timeoutUntil: normalized.timeoutUntil });
+    }
+    return { ok: true, reason: "member-timeouts-resolved", statuses };
+  }
+
   async function invokeUserAction(action, payload) {
     const normalized = validUserActionPayload(action, payload);
     if (!normalized) return { ok: false, reason: "invalid-request" };
@@ -1002,6 +1112,7 @@
         duration: TIMEOUT_7D_SECONDS,
         reason: ""
       }));
+      bridgeMessage("timeout-state-dirty", { guildId: normalized.guildId, userId: normalized.userId });
       return { ok: true, reason: "timed-out-7d" };
     } catch (_error) {
       return { ok: false, reason: "action-failed" };
@@ -1136,6 +1247,7 @@
   controller.recover = recoverHook;
   controller.invokeUserAction = invokeUserAction;
   controller.resolveMessageAuthors = resolveMessageAuthors;
+  controller.resolveMemberTimeouts = resolveMemberTimeouts;
   if (controller.pendingRecovery) recoverHook("queued-injection");
   let recoveryTicks = 0;
   setInterval(() => {

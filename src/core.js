@@ -694,6 +694,10 @@
     return (Array.isArray(value) ? value : []).slice(0, 4).map((badge) => {
       if (!badge || typeof badge !== "object") return null;
       const label = normalizeText(badge.label).slice(0, 120);
+      // Discord's timeout marker is current guild-member state, not durable
+      // author presentation. Older captures may contain its SVG; discard it so
+      // an expired or manually removed timeout can never remain archived.
+      if (/\b(?:timed[ -]?out|timeout)\b/i.test(label)) return null;
       if (badge.kind === "app") {
         return { kind: "app", label: normalizeText(badge.label || "APP").slice(0, 12) || "APP", verified: Boolean(badge.verified) };
       }

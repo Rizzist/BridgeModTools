@@ -72,7 +72,7 @@ test("background self-heals fresh, restored, updated, and SPA Discord documents"
   assert.match(background, /chrome\.tabs\.query\(\{ url: \[DISCORD_TAB_PATTERN\] \}\)/);
   assert.match(background, /chrome\.scripting\.executeScript/);
   assert.match(background, /files: \["src\/page-hook\.js"\][\s\S]*world: "MAIN"/);
-  assert.match(background, /PAGE_HOOK_API_VERSION = 4/);
+  assert.match(background, /PAGE_HOOK_API_VERSION = 5/);
   assert.match(background, /chrome\.storage\.session\.get\(PAGE_HOOK_RELOAD_SESSION_KEY\)/);
   assert.match(background, /if \(!await claimPageHookReload\(tabId\)\)/);
   assert.match(background, /typeof controller\.resolveMessageAuthors === "function"/);
@@ -361,7 +361,7 @@ test("live and deleted rows expose exactly two header-adjacent hover actions", (
   assert.match(content, /background independently proves/);
   assert.match(content, /function removeLiveAuthorActions/);
   assert.match(content, /removeLiveAuthorActions\(\)/);
-  assert.match(hook, /const HOOK_API_VERSION = 4/);
+  assert.match(hook, /const HOOK_API_VERSION = 5/);
   assert.match(hook, /existingController\.apiVersion !== HOOK_API_VERSION/);
   assert.equal(/window\.location\.reload\(\)/.test(hook), false);
   assert.match(hook, /onInstalled path owns the single bounded document reload/);

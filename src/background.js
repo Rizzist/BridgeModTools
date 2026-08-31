@@ -18,8 +18,9 @@ const REPORT_LIVE_HEALTH = "LDMA_REPORT_LIVE_HEALTH";
 const GET_LIVE_HEALTH = "LDMA_GET_LIVE_HEALTH";
 const USER_ACTION_COMMAND = "LDMA_USER_ACTION";
 const RESOLVE_MESSAGE_AUTHORS_COMMAND = "LDMA_RESOLVE_MESSAGE_AUTHORS";
+const RESOLVE_MEMBER_TIMEOUTS_COMMAND = "LDMA_RESOLVE_MEMBER_TIMEOUTS";
 const DISCORD_TAB_PATTERN = "https://discord.com/*";
-const PAGE_HOOK_API_VERSION = 4;
+const PAGE_HOOK_API_VERSION = 5;
 const PAGE_HOOK_RELOAD_SESSION_KEY = "ldmaPageHookUpgradeReloadsV1";
 const bootstrapJobs = new Map();
 let pageHookReloadQueue = Promise.resolve();
@@ -102,6 +103,7 @@ async function ensureDiscordBootstrap(tabId, documentId, full) {
           ready: Boolean(controller && controller.apiVersion === expectedApiVersion &&
             typeof controller.recover === "function" &&
             typeof controller.resolveMessageAuthors === "function" &&
+            typeof controller.resolveMemberTimeouts === "function" &&
             typeof controller.invokeUserAction === "function")
         };
       },
@@ -742,6 +744,139 @@ async function handleResolveMessageAuthors(command, sender) {
   return safeResolvedAuthors(result, messageIds);
 }
 
+function safeResolvedMemberTimeouts(value, bindings) {
+  if (value?.ok === true && !Array.isArray(value.statuses)) {
+    return { ok: false, reason: "member-timeout-result-unavailable", timeouts: [] };
+  }
+  if (value?.ok !== true) {
+    const safeReasons = new Set([
+      "guild-member-store-unavailable", "member-timeout-route-changed",
+      "member-timeout-controller-unavailable", "member-timeout-controller-error"
+    ]);
+    return {
+      ok: false,
+      reason: safeReasons.has(value?.reason) ? value.reason : "member-timeout-resolution-failed",
+      timeouts: []
+    };
+  }
+  const requestedUsers = new Set(bindings.map((item) => item.userId));
+  const byUser = new Map();
+  for (const item of Array.isArray(value?.statuses) ? value.statuses.slice(0, 200) : []) {
+    const userId = typeof item?.userId === "string" && SNOWFLAKE_PATTERN.test(item.userId)
+      ? item.userId : null;
+    if (!userId || !requestedUsers.has(userId) || byUser.has(userId)) continue;
+    let timeoutUntil = null;
+    if (item.timeoutUntil != null) {
+      const parsed = Date.parse(String(item.timeoutUntil));
+      const now = Date.now();
+      if (!Number.isFinite(parsed) || parsed <= now || parsed > now + 32 * 24 * 60 * 60 * 1000) continue;
+      timeoutUntil = new Date(parsed).toISOString();
+    }
+    byUser.set(userId, timeoutUntil);
+  }
+  const timeouts = bindings.map((binding) => {
+    if (!byUser.has(binding.userId)) return null;
+    return {
+      messageId: binding.messageId,
+      userId: binding.userId,
+      timeoutUntil: byUser.get(binding.userId)
+    };
+  }).filter(Boolean);
+  const safeReasons = new Map([
+    ["member-timeouts-resolved", "member-timeouts-resolved"],
+    ["guild-member-store-unavailable", "guild-member-store-unavailable"],
+    ["member-timeout-route-changed", "member-timeout-route-changed"],
+    ["member-timeout-controller-unavailable", "member-timeout-controller-unavailable"],
+    ["member-timeout-controller-error", "member-timeout-controller-error"]
+  ]);
+  return {
+    ok: value?.ok === true,
+    reason: value?.ok === true
+      ? safeReasons.get(value?.reason) || "member-timeouts-resolved"
+      : safeReasons.get(value?.reason) || "member-timeout-resolution-failed",
+    timeouts
+  };
+}
+
+async function handleResolveMemberTimeouts(command, sender) {
+  const context = discordChannelContext(sender);
+  if (!context || !context.guildId) {
+    return { ok: false, reason: "member-timeout-requires-guild", timeouts: [] };
+  }
+  if (!Array.isArray(command?.messageIds) || command.messageIds.length < 1 || command.messageIds.length > 200) {
+    return { ok: false, reason: "invalid-message-ids", timeouts: [] };
+  }
+  const messageIds = [...new Set(command.messageIds.map((value) =>
+    typeof value === "string" && SNOWFLAKE_PATTERN.test(value) ? value : null).filter(Boolean))];
+  if (!messageIds.length || messageIds.length !== command.messageIds.length) {
+    return { ok: false, reason: "invalid-message-ids", timeouts: [] };
+  }
+  const requested = new Set(messageIds);
+  let bindings = [];
+  try {
+    const archive = await readArchive();
+    bindings = archive.records.map((record) => {
+      if (!Core.isDeletedStatus(record.status) || record.channelId !== context.channelId ||
+        !requested.has(record.messageId) || record.guildId && String(record.guildId) !== context.guildId) return null;
+      const userId = Core.snowflakeValue(record.authorId);
+      return userId ? { messageId: record.messageId, userId } : null;
+    }).filter(Boolean);
+  } catch (_error) {}
+  const expectedRoute = { guildId: context.guildId, channelId: context.channelId };
+  const userIds = [...new Set(bindings.map((item) => item.userId))];
+  if (!userIds.length) return { ok: true, reason: "member-timeouts-resolved", timeouts: [] };
+  async function resolveInMain() {
+    return chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id, documentIds: [sender.documentId] },
+      world: "MAIN",
+      func: (ids, route) => {
+        try {
+          const current = new URL(globalThis.location.href);
+          const match = /^\/channels\/(\d{15,25})\/(\d{15,25})\/?$/.exec(current.pathname);
+          if (current.protocol !== "https:" || current.hostname !== "discord.com" || current.port !== "" ||
+            !match || match[1] !== route.guildId || match[2] !== route.channelId) {
+            return { ok: false, reason: "member-timeout-route-changed", statuses: [] };
+          }
+          const controller = globalThis[Symbol.for("BridgeModTools.pageHook.v1")];
+          if (!controller || typeof controller.resolveMemberTimeouts !== "function") {
+            return { ok: false, reason: "member-timeout-controller-unavailable", statuses: [] };
+          }
+          return Promise.resolve(controller.resolveMemberTimeouts(route.guildId, ids)).then(
+            (result) => result,
+            () => ({ ok: false, reason: "member-timeout-controller-error", statuses: [] })
+          );
+        } catch (_error) {
+          return { ok: false, reason: "member-timeout-controller-error", statuses: [] };
+        }
+      },
+      args: [userIds, expectedRoute]
+    });
+  }
+  let execution;
+  try {
+    execution = await resolveInMain();
+  } catch (_error) {
+    return { ok: false, reason: "member-timeout-injection-failed", timeouts: [] };
+  }
+  let result = Array.isArray(execution)
+    ? execution.find((item) => item && Object.prototype.hasOwnProperty.call(item, "result"))?.result
+    : null;
+  if (result?.reason === "member-timeout-controller-unavailable") {
+    const recovery = await ensureDiscordBootstrap(sender.tab.id, sender.documentId, true);
+    if (recovery.ok) {
+      try {
+        execution = await resolveInMain();
+        result = Array.isArray(execution)
+          ? execution.find((item) => item && Object.prototype.hasOwnProperty.call(item, "result"))?.result
+          : null;
+      } catch (_error) {
+        return { ok: false, reason: "member-timeout-injection-failed", timeouts: [] };
+      }
+    }
+  }
+  return safeResolvedMemberTimeouts(result, bindings);
+}
+
 function documentHealthKey(sender) {
   return discordContentSender(sender) ? `${sender.tab.id}:${sender.documentId}` : null;
 }
@@ -965,6 +1100,8 @@ chrome.runtime.onMessage.addListener((command, sender, sendResponse) => {
     operation = handleUserAction(command, sender);
   } else if (command?.type === RESOLVE_MESSAGE_AUTHORS_COMMAND) {
     operation = handleResolveMessageAuthors(command, sender);
+  } else if (command?.type === RESOLVE_MEMBER_TIMEOUTS_COMMAND) {
+    operation = handleResolveMemberTimeouts(command, sender);
   } else if (command?.type === BOOTSTRAP_COMMAND && discordContentSender(sender)) {
     operation = ensureDiscordBootstrap(sender.tab.id, sender.documentId || null, true);
   } else if (playbackTypes.has(command && command.type)) operation = handlePlaybackCommand(command, sender);

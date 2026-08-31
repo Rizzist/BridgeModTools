@@ -29,6 +29,7 @@
   const LIVE_HEALTH = "LDMA_REPORT_LIVE_HEALTH";
   const EDIT_EVENT = "LDMA_EDIT_BEFORE_V1";
   const RESOLVE_MESSAGE_AUTHORS = "LDMA_RESOLVE_MESSAGE_AUTHORS";
+  const RESOLVE_MEMBER_TIMEOUTS = "LDMA_RESOLVE_MEMBER_TIMEOUTS";
   const SNOWFLAKE = /^\d{15,25}$/;
   const SCROLL_CAPTURE_INTERVAL_MS = 250;
   const SCROLL_CAPTURE_ROWS_PER_FRAME = 4;
@@ -50,6 +51,9 @@
     pendingConfirmedMounts: new Map(), pendingEdits: new Map(), stagedSelfEdits: new Map(),
     resolvedAuthorIds: new Map(), resolvedAuthorUsernames: new Map(),
     pendingTimeoutActions: new Set(), snapshotScheduler: null,
+    memberTimeoutsByMessage: new Map(), pendingTimeoutMessageIds: new Set(),
+    memberTimeoutTimer: null, memberTimeoutPromise: null, memberTimeoutExpiryTimer: null,
+    lastTimeoutInvalidationByUser: new Map(),
     scrollCaptureFrameScheduler: null, scrollCaptureLimiter: null, scrollSettleTimer: null,
     pendingScrollRows: new Set(), priorityScrollRows: new Set(), scrollCaptureContexts: new WeakMap(), mediaFrameWindows: new Map(),
     lastMediaRecoveryAt: -Infinity,
@@ -765,6 +769,8 @@
   function describedLabel(element) {
     const direct = Core.normalizeText(element.getAttribute("aria-label"));
     if (direct) return direct.slice(0, 120);
+    const titled = Core.normalizeText(element.getAttribute("title"));
+    if (titled) return titled.slice(0, 120);
     const id = (element.getAttribute("aria-describedby") || "").split(/\s+/).find(Boolean);
     return Core.normalizeText(id && document.getElementById(id)?.textContent).slice(0, 120);
   }
@@ -804,6 +810,7 @@
     for (const child of candidates) {
       if (child === authorElement || child.contains(authorElement) || child.matches("[class*='hiddenVisually_'], [aria-hidden='true'], [data-ldma-author-actions]")) continue;
       const label = describedLabel(child);
+      if (/\b(?:timed[ -]?out|timeout)\b/i.test(label)) continue;
       const appText = Core.normalizeText((child.matches("[class*='botText_']") ? child : child.querySelector("[class*='botText_']"))?.textContent);
       if (/\bapp\b/i.test(label) || appText) {
         badges.push({ kind: "app", label: (appText || "APP").slice(0, 12), verified: Boolean(child.matches("svg") || child.querySelector("svg")) });
@@ -1088,6 +1095,9 @@
     const renderer = state.tombstoneRenderers.get(key);
     if (renderer?.dispose) renderer.dispose();
     state.tombstoneRenderers.delete(key);
+    state.memberTimeoutsByMessage.delete(key);
+    const separator = String(key || "").lastIndexOf(":");
+    if (separator >= 0) state.pendingTimeoutMessageIds.delete(String(key).slice(separator + 1));
   }
 
   function removeTombstone(key) {
@@ -1290,6 +1300,133 @@
     return Object.prototype.hasOwnProperty.call(titles, reason) ? titles[reason] : "Discord username unavailable";
   }
 
+  function refreshTombstoneTimeoutBadges() {
+    for (const renderer of state.tombstoneRenderers.values()) renderer.refreshTimeoutStatus?.();
+  }
+
+  function scheduleMemberTimeoutExpiry() {
+    clearTimeout(state.memberTimeoutExpiryTimer);
+    state.memberTimeoutExpiryTimer = null;
+    const now = Date.now();
+    let earliest = Infinity;
+    for (const item of state.memberTimeoutsByMessage.values()) {
+      const timestamp = Date.parse(String(item?.timeoutUntil || ""));
+      if (Number.isFinite(timestamp) && timestamp > now) earliest = Math.min(earliest, timestamp);
+    }
+    if (!Number.isFinite(earliest)) return;
+    state.memberTimeoutExpiryTimer = setTimeout(() => {
+      state.memberTimeoutExpiryTimer = null;
+      refreshTombstoneTimeoutBadges();
+      scheduleMountedTimeoutRefresh(true);
+    }, Math.min(2147483000, Math.max(0, earliest - now + 25)));
+  }
+
+  function scheduleMemberTimeoutFlush(delayMs) {
+    if (!state.pendingTimeoutMessageIds.size || state.memberTimeoutPromise || !state.route?.guildId) return;
+    clearTimeout(state.memberTimeoutTimer);
+    state.memberTimeoutTimer = setTimeout(() => {
+      state.memberTimeoutTimer = null;
+      flushMemberTimeouts().catch(() => {});
+    }, Math.max(0, Number(delayMs) || 0));
+  }
+
+  function queueTombstoneTimeoutResolution(record, force) {
+    const route = state.route;
+    const key = Core.recordKey(record || {});
+    const userId = Core.snowflakeValue(record?.authorId);
+    if (!route?.guildId || (record?.guildId && record.guildId !== route.guildId) || record?.channelId !== route.channelId ||
+      !SNOWFLAKE.test(String(record?.messageId || "")) || !userId || !state.tombstoneRenderers.has(key)) return;
+    const cached = state.memberTimeoutsByMessage.get(key);
+    if (!force && cached?.userId === userId && Date.now() - cached.checkedAt < 30000) {
+      refreshTombstoneTimeoutBadges();
+      return;
+    }
+    state.pendingTimeoutMessageIds.add(record.messageId);
+    scheduleMemberTimeoutFlush(50);
+  }
+
+  function scheduleMountedTimeoutRefresh(force, userId) {
+    const route = state.route;
+    if (!route?.guildId) return;
+    for (const key of state.tombstoneRenderers.keys()) {
+      const record = state.archiveByKey.get(key);
+      if (record && (!userId || Core.snowflakeValue(record.authorId) === userId)) {
+        queueTombstoneTimeoutResolution(record, force);
+      }
+    }
+  }
+
+  async function flushMemberTimeouts() {
+    if (state.memberTimeoutPromise || !state.route?.guildId || !state.pendingTimeoutMessageIds.size) return state.memberTimeoutPromise;
+    const route = state.route;
+    const routeKey = route.routeKey;
+    const messageIds = [];
+    for (const messageId of state.pendingTimeoutMessageIds) {
+      const key = `${route.channelId}:${messageId}`;
+      if (!state.tombstoneRenderers.has(key) || !state.archiveByKey.has(key)) {
+        state.pendingTimeoutMessageIds.delete(messageId);
+      } else if (messageIds.length < 200) {
+        messageIds.push(messageId);
+        state.pendingTimeoutMessageIds.delete(messageId);
+      }
+    }
+    if (!messageIds.length) return;
+    const operation = (async () => {
+      const response = await send({ type: RESOLVE_MEMBER_TIMEOUTS, messageIds });
+      if (state.route?.routeKey !== routeKey) return;
+      const now = Date.now();
+      const requested = new Set(messageIds);
+      const byMessage = new Map((Array.isArray(response?.timeouts) ? response.timeouts : []).map((item) =>
+        [String(item?.messageId || ""), item]));
+      for (const messageId of requested) {
+        const key = `${route.channelId}:${messageId}`;
+        if (!state.tombstoneRenderers.has(key)) {
+          state.memberTimeoutsByMessage.delete(key);
+          continue;
+        }
+        const record = state.archiveByKey.get(key);
+        const userId = Core.snowflakeValue(record?.authorId);
+        if (!userId) {
+          state.memberTimeoutsByMessage.delete(key);
+          continue;
+        }
+        const item = byMessage.get(messageId);
+        const exact = response?.ok && item?.userId === userId;
+        let timeoutUntil = null;
+        if (exact && item.timeoutUntil != null) {
+          const parsed = Date.parse(String(item.timeoutUntil));
+          if (Number.isFinite(parsed) && parsed > now) timeoutUntil = new Date(parsed).toISOString();
+        }
+        state.memberTimeoutsByMessage.set(key, {
+          userId, known: Boolean(exact), timeoutUntil, checkedAt: now
+        });
+      }
+      while (state.memberTimeoutsByMessage.size > 5000) {
+        state.memberTimeoutsByMessage.delete(state.memberTimeoutsByMessage.keys().next().value);
+      }
+      refreshTombstoneTimeoutBadges();
+      scheduleMemberTimeoutExpiry();
+    })();
+    state.memberTimeoutPromise = operation.finally(() => {
+      state.memberTimeoutPromise = null;
+      if (state.pendingTimeoutMessageIds.size) scheduleMemberTimeoutFlush(50);
+    });
+    return state.memberTimeoutPromise;
+  }
+
+  function rememberSuccessfulTimeout(guildId, userId) {
+    if (state.route?.guildId !== guildId || !SNOWFLAKE.test(String(userId || ""))) return;
+    const timeoutUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    for (const [key, renderer] of state.tombstoneRenderers) {
+      const record = state.archiveByKey.get(key);
+      if (record?.guildId !== guildId || Core.snowflakeValue(record.authorId) !== userId) continue;
+      state.memberTimeoutsByMessage.set(key, { userId, known: true, timeoutUntil, checkedAt: Date.now() });
+      renderer.refreshTimeoutStatus?.();
+    }
+    scheduleMemberTimeoutExpiry();
+    setTimeout(() => scheduleMountedTimeoutRefresh(true, userId), 1000);
+  }
+
   function createAuthorActionControls(label, getContext) {
     const actions = document.createElement("span");
     actions.className = "author-actions";
@@ -1397,6 +1534,7 @@
           guildId: context.guildId,
           messageId: context.messageId
         });
+        if (response?.ok) rememberSuccessfulTimeout(context.guildId, userId);
         feedback(timeoutAction, response?.ok ? "✓" : "!", response?.ok ? `Timed out ${author} for 7 days` : "Timeout unavailable", !response?.ok);
       } finally {
         state.pendingTimeoutActions.delete(timeoutKey);
@@ -1860,6 +1998,8 @@
       .author-group { display:inline-flex; align-items:center; min-width:0; gap:4px; }
       .author { display:inline-block; min-width:0; margin:0; padding:0; overflow:hidden; background:transparent; color:#f2f3f5; font-size:16px; font-weight:400; line-height:inherit; text-align:left; text-overflow:ellipsis; white-space:nowrap; }
       .author:not(:disabled):hover { text-decoration:underline; }
+      .timeout-badge { display:inline-flex; align-items:center; flex:0 0 auto; width:18px; height:18px; color:#b5bac1; }
+      .timeout-badge svg { display:block; width:18px; height:18px; }
       .badges { display:inline-flex; align-items:center; flex:0 0 auto; gap:3px; }
       .author-icon,.author-vector { display:block; flex:0 0 auto; object-fit:contain; }
       .app-badge,.text-badge { display:inline-flex; align-items:center; height:16px; padding:0 4px; border-radius:3px; font-size:10px; font-weight:750; line-height:16px; white-space:nowrap; }
@@ -1931,9 +2071,23 @@
     author.type = "button";
     author.className = "author";
     author.classList.add("profile-trigger");
+    const timeoutBadge = document.createElement("span");
+    timeoutBadge.className = "timeout-badge";
+    timeoutBadge.hidden = true;
+    timeoutBadge.setAttribute("role", "img");
+    timeoutBadge.dataset.ldmaMemberTimeout = "true";
+    const timeoutSvg = document.createElementNS("http:" + "//www.w3.org/2000/svg", "svg");
+    timeoutSvg.setAttribute("viewBox", "0 0 24 24");
+    timeoutSvg.setAttribute("aria-hidden", "true");
+    const timeoutCircle = document.createElementNS("http:" + "//www.w3.org/2000/svg", "path");
+    timeoutCircle.setAttribute("fill", "currentColor");
+    timeoutCircle.setAttribute("fill-rule", "evenodd");
+    timeoutCircle.setAttribute("d", "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm0 3a1 1 0 0 1 1 1v5.38l3.45 1.99a1 1 0 1 1-1 1.73l-3.95-2.28A1 1 0 0 1 11 12V6a1 1 0 0 1 1-1Z");
+    timeoutSvg.append(timeoutCircle);
+    timeoutBadge.append(timeoutSvg);
     const badges = document.createElement("span");
     badges.className = "badges";
-    authorGroup.append(author, badges);
+    authorGroup.append(author, timeoutBadge, badges);
     const timestamp = document.createElement("time");
     timestamp.className = "timestamp";
     let actionContext = null;
@@ -2128,8 +2282,12 @@
           state.route?.channelId === record.channelId
       };
       controls.update(actionContext);
+      render.timeoutMessageKey = key;
+      render.timeoutUserId = nextUserId;
       replaceText(author, name);
       applyAuthorPresentation(record);
+      render.refreshTimeoutStatus();
+      queueTombstoneTimeoutResolution(record, false);
       const time = storedTime(record);
       replaceText(timestamp, time.display);
       timestamp.dateTime = time.dateTime;
@@ -2191,6 +2349,21 @@
       if (avatarUrl) avatarImage.src = avatarUrl;
       else avatarImage.removeAttribute("src");
       article.setAttribute("aria-label", `${name}, ${revisions.length ? `${revisions.length} earlier edited version${revisions.length === 1 ? "" : "s"}, ` : ""}deleted message preserved locally`);
+    };
+    render.refreshTimeoutStatus = () => {
+      const item = state.memberTimeoutsByMessage.get(render.timeoutMessageKey);
+      const timestamp = Date.parse(String(item?.timeoutUntil || ""));
+      const visible = Boolean(item?.known && item.userId === render.timeoutUserId &&
+        Number.isFinite(timestamp) && timestamp > Date.now());
+      timeoutBadge.hidden = !visible;
+      if (visible) {
+        const label = `Timed out until ${new Date(timestamp).toLocaleString()}`;
+        timeoutBadge.setAttribute("aria-label", label);
+        timeoutBadge.title = label;
+      } else {
+        timeoutBadge.removeAttribute("aria-label");
+        timeoutBadge.removeAttribute("title");
+      }
     };
     render.setContinuation = (value) => {
       const next = Boolean(value) && !Core.sanitizeReply(lastRecord?.reply, lastRecord?.replyPreview);
@@ -3500,6 +3673,21 @@
         reportCombinedHealth(state.activeList && { node: state.activeList });
         return;
       }
+      if (message.kind === "timeout-state-dirty") {
+        checkRoute();
+        const now = performance.now();
+        const userId = String(message.userId || "");
+        const lastInvalidationAt = state.lastTimeoutInvalidationByUser.get(userId) ?? -Infinity;
+        if (state.route?.guildId === String(message.guildId || "") && SNOWFLAKE.test(userId) &&
+          now - lastInvalidationAt >= 1000) {
+          state.lastTimeoutInvalidationByUser.set(userId, now);
+          while (state.lastTimeoutInvalidationByUser.size > 5000) {
+            state.lastTimeoutInvalidationByUser.delete(state.lastTimeoutInvalidationByUser.keys().next().value);
+          }
+          scheduleMountedTimeoutRefresh(true, userId);
+        }
+        return;
+      }
       if (["edit-stage", "edit-before", "edit-cancel"].includes(message.kind)) {
         checkRoute();
         if (message.kind === "edit-stage") stageSelfEditLifecycle(message);
@@ -3538,6 +3726,13 @@
       // detached rows or deletion facts merely because the view changed.
       clearTimeout(state.scrollSettleTimer);
       state.scrollSettleTimer = null;
+      clearTimeout(state.memberTimeoutTimer);
+      clearTimeout(state.memberTimeoutExpiryTimer);
+      state.memberTimeoutTimer = null;
+      state.memberTimeoutExpiryTimer = null;
+      state.pendingTimeoutMessageIds.clear();
+      state.memberTimeoutsByMessage.clear();
+      state.lastTimeoutInvalidationByUser.clear();
       state.pendingReleaseKeys.clear();
       state.pendingConfirmedMounts.clear();
       state.stagedSelfEdits.clear();
@@ -3580,6 +3775,12 @@
     document.addEventListener("focusin", handleLiveAuthorActionInterest, true);
     window.addEventListener("message", handleMediaFrameSize);
     window.addEventListener("resize", scheduleTombstoneSpacing, { passive: true });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") {
+        refreshTombstoneTimeoutBadges();
+        scheduleMountedTimeoutRefresh(true);
+      }
+    });
     window.addEventListener("pagehide", () => {
       // Send already-captured records before document teardown; never claim a
       // successful save without the broker's persisted archive response.
@@ -3603,6 +3804,7 @@
     setInterval(() => {
       if (state.route) reportCombinedHealth(state.activeList && { node: state.activeList }, true);
     }, 15000);
+    setInterval(() => scheduleMountedTimeoutRefresh(true), 30000);
     // Also heals missed change notifications if Chrome suspended the MV3 worker.
     setInterval(() => refreshArchive().catch(() => {}), 10000);
     snapshotRenderedMessages(true);

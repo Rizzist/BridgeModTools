@@ -72,7 +72,7 @@ function backgroundHarness(options) {
         if (Array.isArray(options.files) && options.files.includes("src/page-hook.js") &&
           !mainWorld[Symbol.for("BridgeModTools.pageHook.v1")]) {
           mainWorld[Symbol.for("BridgeModTools.pageHook.v1")] = pageHookFileInstallController || {
-            apiVersion: 4, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}
+            apiVersion: 5, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}, resolveMemberTimeouts() {}
           };
         }
         if (typeof options.func === "function") {
@@ -161,7 +161,7 @@ function backgroundHarness(options) {
     }
   });
   const source = fs.readFileSync(path.resolve(__dirname, "../src/background.js"), "utf8");
-  vm.runInContext(`${source}\n;globalThis.__testApi = { ensureDiscordBootstrap, discordContentSender, discordChannelContentSender, discordChannelContext, archiveCommandAllowed, extensionSenderPath, reportLiveHealth, bestLiveHealth, pruneLiveHealth, liveHealthByDocument, handleUserAction, handleResolveMessageAuthors, handleMediaCommand, handlePlaybackCommand, mediaRefs, playbackCapabilities, userActionRateLimits, timeoutActionsInFlight };`, context);
+  vm.runInContext(`${source}\n;globalThis.__testApi = { ensureDiscordBootstrap, discordContentSender, discordChannelContentSender, discordChannelContext, archiveCommandAllowed, extensionSenderPath, reportLiveHealth, bestLiveHealth, pruneLiveHealth, liveHealthByDocument, handleUserAction, handleResolveMessageAuthors, handleResolveMemberTimeouts, safeResolvedMemberTimeouts, handleMediaCommand, handlePlaybackCommand, mediaRefs, playbackCapabilities, userActionRateLimits, timeoutActionsInFlight };`, context);
   return {
     api: context.__testApi,
     calls,
@@ -188,7 +188,7 @@ function backgroundHarness(options) {
     setMediaStats(value) { mediaStats = value; },
     setPageHookProbeState(value) {
       mainWorld[Symbol.for("BridgeModTools.pageHook.v1")] = value.ready
-        ? { apiVersion: value.apiVersion, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {} }
+        ? { apiVersion: value.apiVersion, recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}, resolveMemberTimeouts() {} }
         : { apiVersion: value.apiVersion, recover() {} };
     },
     setPageHookFileInstallController(value) { pageHookFileInstallController = value; },
@@ -252,7 +252,7 @@ test("an unparseable or failed page probe never masquerades as a stale controlle
   const harness = backgroundHarness();
   harness.setMainController({
     get apiVersion() { throw new Error("page-probe-failure"); },
-    recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}
+    recover() {}, invokeUserAction() {}, resolveMessageAuthors() {}, resolveMemberTimeouts() {}
   });
   const result = await harness.api.ensureDiscordBootstrap(1, "document-1", true);
   assert.deepEqual(plain(result), { ok: false, reason: "page-hook-probe-unavailable" });
@@ -288,7 +288,7 @@ test("a stale page controller gets one bounded background reload and never loops
   assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
 
   harness.calls.length = 0;
-  harness.setPageHookProbeState({ apiVersion: 4, ready: true });
+  harness.setPageHookProbeState({ apiVersion: 5, ready: true });
   const recovered = await harness.api.ensureDiscordBootstrap(12, "document-13", true);
   assert.equal(recovered.ok, true);
   assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
@@ -711,12 +711,13 @@ test("message author resolution repairs a missing page controller and retries th
   const pageUrl = `https://discord.com/channels/111111111111111111/${channelId}`;
   harness.setLocation(pageUrl);
   harness.setPageHookFileInstallController({
-    apiVersion: 4,
+    apiVersion: 5,
     recover() {},
     invokeUserAction() { return { ok: true }; },
     resolveMessageAuthors() {
       return { ok: true, reason: "resolved", authors: [{ messageId, userId, username: "curiousbro" }] };
-    }
+    },
+    resolveMemberTimeouts() { return { ok: true, statuses: [] }; }
   });
   const result = await harness.api.handleResolveMessageAuthors({
     type: "LDMA_RESOLVE_MESSAGE_AUTHORS",
@@ -906,6 +907,270 @@ test("author diagnostics distinguish absent results, exceptions, and missing con
     assert.equal(harness.calls.some((call) => call.kind === "reload"),
       reason === "author-resolution-controller-unavailable");
   }
+});
+
+test("member timeout resolution binds exact deleted archive authors to the current guild, channel, and document", async () => {
+  const harness = backgroundHarness();
+  const guildId = "111111111111111111";
+  const conflictingGuildId = "111111111111111112";
+  const channelId = "777777777777777777";
+  const otherChannelId = "777777777777777778";
+  const firstMessageId = "888888888888888881";
+  const secondMessageId = "888888888888888882";
+  const seenMessageId = "888888888888888883";
+  const wrongChannelMessageId = "888888888888888884";
+  const wrongGuildMessageId = "888888888888888885";
+  const missingAuthorMessageId = "888888888888888886";
+  const userId = "999999999999999991";
+  const timeoutUntil = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  harness.setStoredArchive({
+    generation: 4,
+    records: [
+      { guildId, channelId, messageId: firstMessageId, authorId: userId, status: "confirmed_deleted" },
+      { guildId, channelId, messageId: secondMessageId, authorId: userId, status: "inferred_deleted" },
+      { guildId, channelId, messageId: seenMessageId, authorId: "999999999999999992", status: "seen" },
+      { guildId, channelId: otherChannelId, messageId: wrongChannelMessageId, authorId: "999999999999999993", status: "confirmed_deleted" },
+      { guildId: conflictingGuildId, channelId, messageId: wrongGuildMessageId, authorId: "999999999999999994", status: "confirmed_deleted" },
+      { guildId, channelId, messageId: missingAuthorMessageId, status: "confirmed_deleted" }
+    ]
+  });
+  const pageUrl = `https://discord.com/channels/${guildId}/${channelId}`;
+  harness.setLocation(pageUrl);
+  const received = [];
+  harness.setMainController({
+    resolveMemberTimeouts(receivedGuildId, userIds) {
+      received.push({ receivedGuildId, userIds });
+      return {
+        ok: true,
+        reason: "member-timeouts-resolved",
+        statuses: [{ userId, timeoutUntil, roles: ["must-not-cross"] }],
+        secret: "must-not-cross"
+      };
+    }
+  });
+  const sender = discordSender({
+    tab: { id: 23, url: pageUrl },
+    documentId: "document-23"
+  });
+  const result = await new Promise((resolve) => {
+    const asyncResponse = harness.events.message.listener({
+      type: "LDMA_RESOLVE_MEMBER_TIMEOUTS",
+      // An untrusted payload guild cannot override the sender-derived route.
+      guildId: conflictingGuildId,
+      messageIds: [
+        firstMessageId, secondMessageId, seenMessageId, wrongChannelMessageId,
+        wrongGuildMessageId, missingAuthorMessageId
+      ]
+    }, sender, resolve);
+    assert.equal(asyncResponse, true);
+  });
+  assert.deepEqual(plain(result), {
+    ok: true,
+    reason: "member-timeouts-resolved",
+    timeouts: [
+      { messageId: firstMessageId, userId, timeoutUntil },
+      { messageId: secondMessageId, userId, timeoutUntil }
+    ]
+  });
+  assert.deepEqual(plain(received), [{ receivedGuildId: guildId, userIds: [userId] }]);
+  const call = harness.calls.at(-1);
+  assert.equal(call.options.world, "MAIN");
+  assert.deepEqual(Array.from(call.options.target.documentIds), ["document-23"]);
+  assert.equal("frameIds" in call.options.target, false);
+  assert.deepEqual(plain(call.options.args), [[userId], { guildId, channelId }]);
+  assert.deepEqual(harness.injectionErrors, []);
+  assert.equal(harness.storageWrites.length, 0);
+  assert.equal(harness.networkCalls.length, 0);
+});
+
+test("member timeout resolution rejects DMs, untrusted senders, malformed IDs, and stale routes before exposing status", async () => {
+  const harness = backgroundHarness();
+  const guildId = "111111111111111111";
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const userId = "999999999999999991";
+  const command = { type: "LDMA_RESOLVE_MEMBER_TIMEOUTS", messageIds: [messageId] };
+  const dm = await harness.api.handleResolveMemberTimeouts(command, discordSender());
+  assert.deepEqual(plain(dm), { ok: false, reason: "member-timeout-requires-guild", timeouts: [] });
+  for (const sender of [
+    discordSender({ frameId: 1, tab: { id: 1, url: `https://discord.com/channels/${guildId}/${channelId}` } }),
+    discordSender({ origin: "https://discord.com.evil.test", tab: { id: 1, url: `https://discord.com/channels/${guildId}/${channelId}` } }),
+    discordSender({ documentId: "", tab: { id: 1, url: `https://discord.com/channels/${guildId}/${channelId}` } }),
+    discordSender({ tab: { id: 1, url: "https://discord.com/app" } })
+  ]) {
+    const result = await harness.api.handleResolveMemberTimeouts(command, sender);
+    assert.deepEqual(plain(result), { ok: false, reason: "member-timeout-requires-guild", timeouts: [] });
+  }
+  for (const messageIds of [
+    [], ["bad"], [messageId, messageId], Array.from({ length: 201 }, (_, index) => String(10 ** 14 + index))
+  ]) {
+    const result = await harness.api.handleResolveMemberTimeouts({ ...command, messageIds }, discordSender({
+      tab: { id: 1, url: `https://discord.com/channels/${guildId}/${channelId}` }
+    }));
+    assert.deepEqual(plain(result), { ok: false, reason: "invalid-message-ids", timeouts: [] });
+  }
+  assert.equal(harness.calls.length, 0);
+
+  harness.setStoredArchive({ generation: 0, records: [
+    { guildId, channelId, messageId, authorId: userId, status: "confirmed_deleted" }
+  ] });
+  harness.setLocation(`https://discord.com/channels/${guildId}/777777777777777778`);
+  harness.setMainController({ resolveMemberTimeouts() { throw new Error("must not run after route change"); } });
+  const stale = await harness.api.handleResolveMemberTimeouts(command, discordSender({
+    tab: { id: 7, url: `https://discord.com/channels/${guildId}/${channelId}` },
+    documentId: "document-7"
+  }));
+  assert.deepEqual(plain(stale), { ok: false, reason: "member-timeout-route-changed", timeouts: [] });
+  assert.equal(harness.calls.length, 1);
+  assert.deepEqual(harness.injectionErrors, []);
+  assert.equal(harness.storageWrites.length, 0);
+  assert.equal(harness.networkCalls.length, 0);
+});
+
+test("member timeout result sanitization preserves only exact null and bounded future statuses", () => {
+  const harness = backgroundHarness();
+  const nullUserId = "999999999999999991";
+  const futureUserId = "999999999999999992";
+  const farFutureUserId = "999999999999999993";
+  const malformedUserId = "999999999999999994";
+  const expiredUserId = "999999999999999995";
+  const bindings = [
+    { messageId: "888888888888888881", userId: nullUserId },
+    { messageId: "888888888888888882", userId: futureUserId },
+    { messageId: "888888888888888883", userId: futureUserId },
+    { messageId: "888888888888888884", userId: farFutureUserId },
+    { messageId: "888888888888888885", userId: malformedUserId },
+    { messageId: "888888888888888886", userId: expiredUserId }
+  ];
+  const future = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  const farFuture = new Date(Date.now() + 40 * 24 * 60 * 60 * 1000).toISOString();
+  const expired = new Date(Date.now() - 60 * 1000).toISOString();
+  const result = harness.api.safeResolvedMemberTimeouts({
+    ok: true,
+    reason: "private-reason-must-not-cross",
+    statuses: [
+      { userId: nullUserId, timeoutUntil: null, member: { private: true } },
+      { userId: futureUserId, timeoutUntil: future, nickname: "must-not-cross" },
+      { userId: futureUserId, timeoutUntil: null },
+      { userId: farFutureUserId, timeoutUntil: farFuture },
+      { userId: malformedUserId, timeoutUntil: "tomorrow-ish" },
+      { userId: expiredUserId, timeoutUntil: expired },
+      { userId: "999999999999999999", timeoutUntil: future },
+      { userId: "bad", timeoutUntil: future }
+    ],
+    secret: "must-not-cross"
+  }, bindings);
+  assert.deepEqual(plain(result), {
+    ok: true,
+    reason: "member-timeouts-resolved",
+    timeouts: [
+      { messageId: "888888888888888881", userId: nullUserId, timeoutUntil: null },
+      { messageId: "888888888888888882", userId: futureUserId, timeoutUntil: future },
+      { messageId: "888888888888888883", userId: futureUserId, timeoutUntil: future }
+    ]
+  });
+  for (const value of [{ ok: true }, { ok: true, statuses: "not-an-array" }]) {
+    assert.deepEqual(plain(harness.api.safeResolvedMemberTimeouts(value, bindings)), {
+      ok: false,
+      reason: "member-timeout-result-unavailable",
+      timeouts: []
+    });
+  }
+  for (const value of [null, {}, { ok: false, statuses: [] }]) {
+    assert.deepEqual(plain(harness.api.safeResolvedMemberTimeouts(value, bindings)), {
+      ok: false,
+      reason: "member-timeout-resolution-failed",
+      timeouts: []
+    });
+  }
+});
+
+test("member timeout resolution repairs a missing controller and retries the same document-bound request", async () => {
+  const harness = backgroundHarness();
+  const guildId = "111111111111111111";
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const userId = "999999999999999991";
+  const timeoutUntil = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const pageUrl = `https://discord.com/channels/${guildId}/${channelId}`;
+  harness.setLocation(pageUrl);
+  harness.setStoredArchive({ generation: 0, records: [
+    { guildId, channelId, messageId, authorId: userId, status: "confirmed_deleted" }
+  ] });
+  harness.setPageHookFileInstallController({
+    apiVersion: 5,
+    recover() {},
+    invokeUserAction() { return { ok: true }; },
+    resolveMessageAuthors() { return { ok: true, authors: [] }; },
+    resolveMemberTimeouts(receivedGuildId, userIds) {
+      return receivedGuildId === guildId && userIds[0] === userId
+        ? { ok: true, reason: "member-timeouts-resolved", statuses: [{ userId, timeoutUntil }] }
+        : { ok: false, reason: "invalid-request", statuses: [] };
+    }
+  });
+  const result = await harness.api.handleResolveMemberTimeouts({
+    type: "LDMA_RESOLVE_MEMBER_TIMEOUTS", messageIds: [messageId]
+  }, discordSender({ tab: { id: 24, url: pageUrl }, documentId: "document-24" }));
+  assert.deepEqual(plain(result), {
+    ok: true,
+    reason: "member-timeouts-resolved",
+    timeouts: [{ messageId, userId, timeoutUntil }]
+  });
+  const resolverCalls = harness.calls.filter((call) =>
+    typeof call.options.func === "function" && /member-timeout-controller-unavailable/.test(String(call.options.func)));
+  assert.equal(resolverCalls.length, 2);
+  assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
+  assert.deepEqual(harness.injectionErrors, []);
+  assert.equal(harness.storageWrites.length, 0);
+  assert.equal(harness.networkCalls.length, 0);
+});
+
+test("serialized member-timeout broker callback reaches the real page hook and leaks no member metadata", async () => {
+  const harness = backgroundHarness();
+  const guildId = "111111111111111111";
+  const channelId = "777777777777777777";
+  const messageId = "888888888888888881";
+  const userId = "999999999999999991";
+  const timeoutUntil = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const pageUrl = `https://discord.com/channels/${guildId}/${channelId}`;
+  harness.setLocation(pageUrl);
+  const dispatcher = { dispatch() {}, subscribe() {}, unsubscribe() {} };
+  const messageStore = {
+    _dispatcher: dispatcher,
+    getName() { return "MessageStore"; },
+    getMessage() { return null; },
+    getMessages() { return []; }
+  };
+  const guildMemberStore = {
+    _dispatcher: dispatcher,
+    getName() { return "GuildMemberStore"; },
+    getMember(receivedGuildId, receivedUserId) {
+      return receivedGuildId === guildId && receivedUserId === userId
+        ? { userId, communicationDisabledUntil: timeoutUntil, roles: ["must-not-cross"], nick: "must-not-cross" }
+        : null;
+    },
+    getMembers() { return {}; }
+  };
+  harness.installRealPageHook({
+    messageStore: { exports: messageStore },
+    guildMemberStore: { exports: guildMemberStore }
+  });
+  harness.setStoredArchive({ generation: 0, records: [
+    { guildId, channelId, messageId, authorId: userId, status: "confirmed_deleted" }
+  ] });
+  assert.equal((await harness.api.ensureDiscordBootstrap(25, "document-25", true)).ok, true);
+  const result = await harness.api.handleResolveMemberTimeouts({
+    type: "LDMA_RESOLVE_MEMBER_TIMEOUTS", messageIds: [messageId]
+  }, discordSender({ tab: { id: 25, url: pageUrl }, documentId: "document-25" }));
+  assert.deepEqual(plain(result), {
+    ok: true,
+    reason: "member-timeouts-resolved",
+    timeouts: [{ messageId, userId, timeoutUntil }]
+  });
+  assert.deepEqual(harness.injectionErrors, []);
+  assert.equal(harness.calls.some((call) => call.kind === "reload"), false);
+  assert.equal(harness.storageWrites.length, 0);
+  assert.equal(harness.networkCalls.length, 0);
 });
 
 test("user action broker reports missing controllers and binds execution to the still-current route", async () => {

@@ -6,6 +6,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
+function plain(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
 function runHook(options) {
   const settings = options || {};
   const listeners = new Map();
@@ -15,6 +19,8 @@ function runHook(options) {
   const intervals = [];
   const messages = new Map();
   const users = new Map();
+  const guildMembers = new Map();
+  const guildMemberCalls = [];
   const userActionCalls = { profile: [], until: [] };
   const makeMessage = (id, deleted, content, editedTimestamp) => {
     const authorId = "999999999999999991";
@@ -90,6 +96,24 @@ function runHook(options) {
     getUsers() { return Object.fromEntries(users); },
     getCurrentUser() { return users.get("999999999999999991"); }
   };
+  let guildMemberStoreGeneration = 1;
+  const makeGuildMemberStore = (storeDispatcher) => {
+    const generation = guildMemberStoreGeneration;
+    return {
+      _dispatcher: storeDispatcher,
+      getName() { return "GuildMemberStore"; },
+      getDispatchToken() { return "guild_member_store_token"; },
+      getMember(guildId, userId) {
+        guildMemberCalls.push({ generation, guildId, userId });
+        if (settings.throwGuildMemberLookup) throw new Error("member lookup failed");
+        return guildMembers.get(`${guildId}:${userId}`) || null;
+      },
+      getMembers(guildId) {
+        return [...guildMembers.entries()].filter(([key]) => key.startsWith(`${guildId}:`)).map(([, member]) => member);
+      }
+    };
+  };
+  let guildMemberStore = makeGuildMemberStore(dispatcher);
   const structuralUserStore = {};
   Object.defineProperties(structuralUserStore, {
     getUser: { enumerable: true, get() { return (id) => users.get(id); } },
@@ -100,6 +124,10 @@ function runHook(options) {
     getUser(id) { return id === "999999999999999991" ? { id, username: "conflicting_name" } : null; },
     getUsers() { return {}; },
     getCurrentUser() { return null; }
+  };
+  const structuralGuildMemberStore = {
+    getMember(guildId, userId) { return guildMembers.get(`${guildId}:${userId}`) || null; },
+    getMembers() { return [...guildMembers.values()]; }
   };
   const rejectingDispatcher = {
     dispatch() {},
@@ -142,13 +170,25 @@ function runHook(options) {
   });
   let storeAvailable = !settings.delayedStore;
   Object.defineProperty(moduleExports, "Z", { enumerable: true, get() { return storeAvailable ? messageStore : {}; } });
+  const guildMemberExports = {};
+  Object.defineProperty(guildMemberExports, "Z", {
+    enumerable: true,
+    get() { return settings.noGuildMemberStore ? {} : guildMemberStore; }
+  });
+  const wrongGuildMemberDispatcher = {
+    dispatch() {}, subscribe() {}, unsubscribe() {}
+  };
+  const wrongDispatcherGuildMemberStore = makeGuildMemberStore(wrongGuildMemberDispatcher);
   webpackRequire.c = {
     "0": { exports: { rejectingStore } },
     "1": { exports: { fallbackDispatcher } },
     "21": { exports: userActionExports },
     "42": { exports: moduleExports },
     "43": { exports: settings.noUserStore ? {} : { Z: settings.structuralUserStoreOnly ? structuralUserStore : userStore } },
-    "44": { exports: settings.conflictingStructuralUserStores ? { Z: conflictingStructuralUserStore } : {} }
+    "44": { exports: settings.conflictingStructuralUserStores ? { Z: conflictingStructuralUserStore } : {} },
+    "45": { exports: guildMemberExports },
+    "46": { exports: settings.structuralGuildMemberStoreOnly ? { Z: structuralGuildMemberStore } : {} },
+    "47": { exports: settings.wrongDispatcherGuildMemberStore ? { Z: wrongDispatcherGuildMemberStore } : {} }
   };
   const chunks = [];
   chunks.push = function push(chunk) {
@@ -199,7 +239,8 @@ function runHook(options) {
   const ready = () => window.postMessage({ bridge: "LDMA_BRIDGE_V1", kind: "isolated-ready" }, "*");
   if (!settings.deferReady && !settings.readyBeforeHook) ready();
   return {
-    posted, dispatched, subscriptions, fallbackSubscriptions, handlerNode, messages, users, dispatcher, window, ready, messageStore,
+    posted, dispatched, subscriptions, fallbackSubscriptions, handlerNode, messages, users, guildMembers,
+    guildMemberCalls, dispatcher, window, ready, messageStore,
     reloads: () => settings.reloads || 0,
     legacyRecoveries: () => settings.legacyRecoveries || 0,
     userActionCalls,
@@ -210,12 +251,33 @@ function runHook(options) {
     resolveMessageAuthors(channelId, ids, fallbacks) {
       return window[Symbol.for("BridgeModTools.pageHook.v1")].resolveMessageAuthors(channelId, ids, fallbacks);
     },
+    resolveMemberTimeouts(guildId, userIds) {
+      return window[Symbol.for("BridgeModTools.pageHook.v1")].resolveMemberTimeouts(guildId, userIds);
+    },
+    setGuildMember(guildId, userId, member) {
+      const key = `${guildId}:${userId}`;
+      if (member == null) guildMembers.delete(key);
+      else guildMembers.set(key, member);
+    },
+    emitGuildMemberUpdate(action) {
+      const listener = subscriptions.get("GUILD_MEMBER_UPDATE");
+      if (listener) listener(action);
+    },
     replaceUserActionModules() {
       actionGeneration += 1;
       userActionModules = makeUserActionModules();
       return actionGeneration;
     },
     removeUserActionModules() { userActionModules = null; },
+    replaceGuildMemberStore() {
+      guildMemberStoreGeneration += 1;
+      guildMemberStore = makeGuildMemberStore(dispatcher);
+      return guildMemberStoreGeneration;
+    },
+    removeGuildMemberStore() {
+      settings.noGuildMemberStore = true;
+      guildMemberStoreGeneration += 1;
+    },
     reinject() { vm.runInContext(source, context); },
     makeStoreAvailable() { storeAvailable = true; },
     replaceStoreDispatcher() {
@@ -256,7 +318,7 @@ function runHook(options) {
 test("duplicate page-hook injection recovers in place without duplicate listeners, timers, wrappers, or events", () => {
   const result = runHook();
   const originalDeleteWrapper = result.handlerNode.actionHandler.MESSAGE_DELETE;
-  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 4);
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].apiVersion, 5);
   assert.equal(result.intervalCount(), 1);
   assert.equal(result.listenerCount("message"), 1);
 
@@ -996,10 +1058,238 @@ test("a newer page hook never self-reloads an older controller contract", () => 
   const result = runHook(settings);
   assert.equal(result.legacyRecoveries(), 0);
   assert.equal(result.reloads(), 0);
-  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].upgradeRequired, 4);
+  assert.equal(result.window[Symbol.for("BridgeModTools.pageHook.v1")].upgradeRequired, 5);
   result.reinject();
   assert.equal(result.legacyRecoveries(), 0);
   assert.equal(result.reloads(), 0);
+});
+
+test("GuildMemberStore timeout resolution normalizes current production field shapes", () => {
+  const result = runHook();
+  const guildId = "777777777777777777";
+  const isoUserId = "999999999999999991";
+  const millisecondsUserId = "999999999999999992";
+  const secondsUserId = "999999999999999993";
+  const snakeUserId = "999999999999999994";
+  const timestampUserId = "999999999999999995";
+  const now = Date.now();
+  const iso = new Date(now + 60_000).toISOString();
+  const milliseconds = now + 120_000;
+  const seconds = Math.floor((now + 180_000) / 1000);
+  const snake = new Date(now + 240_000).toISOString();
+  const timestamp = new Date(now + 300_000).toISOString();
+  result.setGuildMember(guildId, isoUserId, { guildId, userId: isoUserId, communicationDisabledUntil: iso });
+  result.setGuildMember(guildId, millisecondsUserId,
+    { guildId, userId: millisecondsUserId, communicationDisabledUntil: milliseconds });
+  result.setGuildMember(guildId, secondsUserId,
+    { guildId, userId: secondsUserId, communicationDisabledUntil: seconds });
+  result.setGuildMember(guildId, snakeUserId,
+    { guild_id: guildId, user_id: snakeUserId, communication_disabled_until: snake });
+  result.setGuildMember(guildId, timestampUserId,
+    { guildId, user: { id: timestampUserId }, communicationDisabledUntilTimestamp: timestamp });
+
+  assert.deepEqual(plain(result.resolveMemberTimeouts(guildId, [
+    isoUserId, millisecondsUserId, secondsUserId, snakeUserId, timestampUserId
+  ])), {
+    ok: true,
+    reason: "member-timeouts-resolved",
+    statuses: [
+      { userId: isoUserId, timeoutUntil: iso },
+      { userId: millisecondsUserId, timeoutUntil: new Date(milliseconds).toISOString() },
+      { userId: secondsUserId, timeoutUntil: new Date(seconds * 1000).toISOString() },
+      { userId: snakeUserId, timeoutUntil: snake },
+      { userId: timestampUserId, timeoutUntil: timestamp }
+    ]
+  });
+  assert.deepEqual(result.guildMemberCalls.map(({ guildId: calledGuildId, userId }) => ({ guildId: calledGuildId, userId })), [
+    { guildId, userId: isoUserId },
+    { guildId, userId: millisecondsUserId },
+    { guildId, userId: secondsUserId },
+    { guildId, userId: snakeUserId },
+    { guildId, userId: timestampUserId }
+  ]);
+});
+
+test("GuildMemberStore timeout resolution distinguishes known inactive members from malformed or unavailable state", () => {
+  const result = runHook();
+  const guildId = "777777777777777777";
+  const nullUserId = "999999999999999991";
+  const expiredUserId = "999999999999999992";
+  const emptyUserId = "999999999999999993";
+  const malformedUserId = "999999999999999994";
+  const throwingFieldUserId = "999999999999999995";
+  const throwingIdentityUserId = "999999999999999996";
+  const hugeNumericUserId = "999999999999999997";
+  const throwingValueUserId = "999999999999999998";
+  const missingUserId = "999999999999999999";
+  result.setGuildMember(guildId, nullUserId, { guildId, userId: nullUserId, communicationDisabledUntil: null });
+  result.setGuildMember(guildId, expiredUserId, {
+    guildId, userId: expiredUserId, communication_disabled_until: new Date(Date.now() - 60_000).toISOString()
+  });
+  result.setGuildMember(guildId, emptyUserId, { guildId, userId: emptyUserId, communicationDisabledUntil: "" });
+  result.setGuildMember(guildId, malformedUserId,
+    { guildId, userId: malformedUserId, communicationDisabledUntil: "not-a-date" });
+  const throwingField = { guildId, userId: throwingFieldUserId };
+  Object.defineProperty(throwingField, "communicationDisabledUntil", { get() { throw new Error("blocked field"); } });
+  result.setGuildMember(guildId, throwingFieldUserId, throwingField);
+  const throwingIdentity = { guildId, communicationDisabledUntil: new Date(Date.now() + 60_000).toISOString() };
+  Object.defineProperty(throwingIdentity, "userId", { get() { throw new Error("blocked identity"); } });
+  result.setGuildMember(guildId, throwingIdentityUserId, throwingIdentity);
+  result.setGuildMember(guildId, hugeNumericUserId,
+    { guildId, userId: hugeNumericUserId, communicationDisabledUntil: 1e20 });
+  result.setGuildMember(guildId, throwingValueUserId, {
+    guildId,
+    userId: throwingValueUserId,
+    communicationDisabledUntil: { toString() { throw new Error("blocked timestamp coercion"); } }
+  });
+
+  assert.doesNotThrow(() => result.resolveMemberTimeouts(guildId, [throwingIdentityUserId]));
+  assert.deepEqual(plain(result.resolveMemberTimeouts(guildId, [
+    nullUserId, expiredUserId, emptyUserId, malformedUserId,
+    throwingFieldUserId, throwingIdentityUserId, hugeNumericUserId, throwingValueUserId, missingUserId
+  ])), {
+    ok: true,
+    reason: "member-timeouts-resolved",
+    statuses: [
+      { userId: nullUserId, timeoutUntil: null },
+      { userId: expiredUserId, timeoutUntil: null },
+      { userId: emptyUserId, timeoutUntil: null }
+    ]
+  });
+
+  const throwingLookup = runHook({ throwGuildMemberLookup: true });
+  assert.deepEqual(plain(throwingLookup.resolveMemberTimeouts(guildId, [nullUserId])), {
+    ok: true, reason: "member-timeouts-resolved", statuses: []
+  });
+});
+
+test("timeout resolution uses only the exact GuildMemberStore on the accepted core dispatcher", () => {
+  const guildId = "777777777777777777";
+  const userId = "999999999999999991";
+  const timeoutUntil = new Date(Date.now() + 60_000).toISOString();
+
+  const missing = runHook({ noGuildMemberStore: true });
+  assert.deepEqual(plain(missing.resolveMemberTimeouts(guildId, [userId])), {
+    ok: false, reason: "guild-member-store-unavailable", statuses: []
+  });
+
+  const structural = runHook({ noGuildMemberStore: true, structuralGuildMemberStoreOnly: true });
+  structural.setGuildMember(guildId, userId, { guildId, userId, communicationDisabledUntil: timeoutUntil });
+  assert.deepEqual(plain(structural.resolveMemberTimeouts(guildId, [userId])), {
+    ok: false, reason: "guild-member-store-unavailable", statuses: []
+  });
+
+  const withWrongDispatcherDecoy = runHook({ wrongDispatcherGuildMemberStore: true });
+  withWrongDispatcherDecoy.setGuildMember(guildId, userId,
+    { guildId, userId, communicationDisabledUntil: timeoutUntil });
+  assert.deepEqual(plain(withWrongDispatcherDecoy.resolveMemberTimeouts(guildId, [userId])), {
+    ok: true,
+    reason: "member-timeouts-resolved",
+    statuses: [{ userId, timeoutUntil }]
+  });
+  assert.equal(withWrongDispatcherDecoy.guildMemberCalls.at(-1).generation, 1);
+});
+
+test("timeout resolution rejects missing, mismatched, and cross-guild member identities", () => {
+  const result = runHook();
+  const guildId = "777777777777777777";
+  const otherGuildId = "777777777777777778";
+  const missingUserId = "999999999999999991";
+  const mismatchedUserId = "999999999999999992";
+  const crossGuildUserId = "999999999999999993";
+  const nestedUserId = "999999999999999994";
+  const timeoutUntil = new Date(Date.now() + 60_000).toISOString();
+  result.setGuildMember(guildId, mismatchedUserId,
+    { guildId, userId: "999999999999999999", communicationDisabledUntil: timeoutUntil });
+  result.setGuildMember(guildId, crossGuildUserId,
+    { guildId: otherGuildId, userId: crossGuildUserId, communicationDisabledUntil: timeoutUntil });
+  result.setGuildMember(guildId, nestedUserId,
+    { guild_id: guildId, user: { id: nestedUserId }, communication_disabled_until: timeoutUntil });
+
+  assert.deepEqual(plain(result.resolveMemberTimeouts(guildId, [
+    missingUserId, mismatchedUserId, crossGuildUserId, nestedUserId
+  ])), {
+    ok: true,
+    reason: "member-timeouts-resolved",
+    statuses: [{ userId: nestedUserId, timeoutUntil }]
+  });
+});
+
+test("timeout resolution validates bounded unique string batches before touching Discord stores", () => {
+  const result = runHook();
+  const guildId = "777777777777777777";
+  const ids = Array.from({ length: 200 }, (_value, index) => String(100000000000000 + index));
+  for (const userId of ids) result.setGuildMember(guildId, userId, { guildId, userId, communicationDisabledUntil: null });
+  assert.equal(result.resolveMemberTimeouts(guildId, ids).statuses.length, 200);
+  assert.equal(result.guildMemberCalls.length, 200);
+
+  const invalidRequests = [
+    ["bad", [ids[0]]],
+    [guildId, null],
+    [guildId, []],
+    [guildId, [...ids, "100000000000999"]],
+    [guildId, [ids[0], ids[0]]],
+    [guildId, [ids[0], "bad"]],
+    [guildId, [Number(ids[0])]]
+  ];
+  for (const [receivedGuildId, userIds] of invalidRequests) {
+    assert.deepEqual(plain(result.resolveMemberTimeouts(receivedGuildId, userIds)), {
+      ok: false, reason: "invalid-request", statuses: []
+    });
+  }
+  assert.equal(result.guildMemberCalls.length, 200, "invalid batches must not reach GuildMemberStore");
+});
+
+test("guild member updates and successful timeout actions emit normalized state invalidations", async () => {
+  const result = runHook();
+  const guildId = "777777777777777777";
+  const firstUserId = "999999999999999991";
+  const secondUserId = "999999999999999992";
+  const dirtyEvents = () => result.posted.filter((message) => message.kind === "timeout-state-dirty");
+  const before = dirtyEvents().length;
+  result.emitGuildMemberUpdate({ guild_id: guildId, user: { id: firstUserId } });
+  result.emitGuildMemberUpdate({ guildId, member: { userId: secondUserId } });
+  result.emitGuildMemberUpdate({ guildId: "bad", userId: firstUserId });
+  result.emitGuildMemberUpdate({ guildId, userId: "bad" });
+  const throwingUpdate = {};
+  Object.defineProperty(throwingUpdate, "guildId", { get() { throw new Error("blocked update identity"); } });
+  assert.doesNotThrow(() => result.emitGuildMemberUpdate(throwingUpdate),
+    "Discord's dispatcher must not be disrupted by an unexpected update object");
+  assert.deepEqual(plain(dirtyEvents().slice(before)), [
+    { bridge: "LDMA_BRIDGE_V1", kind: "timeout-state-dirty", guildId, userId: firstUserId },
+    { bridge: "LDMA_BRIDGE_V1", kind: "timeout-state-dirty", guildId, userId: secondUserId }
+  ]);
+
+  const actionBefore = dirtyEvents().length;
+  assert.equal((await result.invokeUserAction("timeout-7d", { guildId, userId: firstUserId })).ok, true);
+  assert.deepEqual(plain(dirtyEvents().slice(actionBefore)), [
+    { bridge: "LDMA_BRIDGE_V1", kind: "timeout-state-dirty", guildId, userId: firstUserId }
+  ]);
+
+  const rejected = runHook({ rejectTimeoutAction: true });
+  const rejectedBefore = rejected.posted.filter((message) => message.kind === "timeout-state-dirty").length;
+  assert.equal((await rejected.invokeUserAction("timeout-7d", { guildId, userId: firstUserId })).ok, false);
+  assert.equal(rejected.posted.filter((message) => message.kind === "timeout-state-dirty").length, rejectedBefore);
+});
+
+test("timeout resolution rediscovers replaced stores and never calls removed stale exports", () => {
+  const result = runHook();
+  const guildId = "777777777777777777";
+  const userId = "999999999999999991";
+  result.setGuildMember(guildId, userId, { guildId, userId, communicationDisabledUntil: null });
+  assert.equal(result.resolveMemberTimeouts(guildId, [userId]).ok, true);
+  assert.equal(result.guildMemberCalls.at(-1).generation, 1);
+
+  result.replaceGuildMemberStore();
+  assert.equal(result.resolveMemberTimeouts(guildId, [userId]).ok, true);
+  assert.equal(result.guildMemberCalls.at(-1).generation, 2,
+    "the first post-replacement query must not call the stale store");
+
+  result.removeGuildMemberStore();
+  assert.deepEqual(plain(result.resolveMemberTimeouts(guildId, [userId])), {
+    ok: false, reason: "guild-member-store-unavailable", statuses: []
+  });
+  assert.equal(result.guildMemberCalls.at(-1).generation, 2, "removed store must not be called again");
 });
 
 test("native profile and fixed seven-day timeout actions receive only normalized identity context", async () => {
